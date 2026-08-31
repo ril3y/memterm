@@ -76,6 +76,11 @@ enum Adapters {
 
     /// FR-30 hard denylist — checked before any offer, no override exists.
     static func isDenylisted(_ command: String) -> Bool {
+        // Multiline unknowns are denylisted outright (FR-30); a newline would
+        // also defeat the ⌘R types-without-newline guarantee (FR-29).
+        if command.contains("\n") || command.contains("\r") {
+            return true
+        }
         let tokens = command.split(separator: " ").map(String.init)
         guard let first = tokens.first else { return true }
         let base = (first as NSString).lastPathComponent
