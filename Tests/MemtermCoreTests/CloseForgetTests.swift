@@ -222,6 +222,62 @@ final class CloseForgetTests: XCTestCase {
         XCTAssertEqual(fresh.loadState()[0].tabs[0].panes["p9"]?.cwd, "/tmp")
     }
 
+    // MARK: FR-56/57 — per-tab shell history dies with the same gestures
+
+    /// Every forget granularity must delete the pane's .hist file exactly like
+    /// its scrollback file: forgetPanes, forgetTabs, forgetWorkspace, the
+    /// orphan sweep, and purgeAll.
+    func testForgetFlowsDeleteShellHistoryFiles() throws {
+        let historyDir = tempDir.appendingPathComponent("history")
+        try FileManager.default.createDirectory(at: historyDir,
+                                                withIntermediateDirectories: true)
+        func writeHist(_ paneId: String) throws {
+            try ": 1700000000:0;cmd-\(paneId)\n".write(
+                to: ShellIntegration.histFileURL(dir: historyDir, paneId: paneId),
+                atomically: true, encoding: .utf8)
+        }
+        func histExists(_ paneId: String) -> Bool {
+            FileManager.default.fileExists(
+                atPath: ShellIntegration.histFileURL(dir: historyDir, paneId: paneId).path)
+        }
+        var store: StateStore? = StateStore(url: dbURL)
+        try populate(store!)
+        for paneId in ["p1", "p2", "p3", "p4"] { try writeHist(paneId) }
+
+        // Forget pane: exactly p1's .hist dies.
+        store!.forgetPanes(["p1"], scrollbackDir: scrollbackDir, historyDir: historyDir)
+        store!.barrier()
+        XCTAssertFalse(histExists("p1"), "forgetPanes must delete the pane's .hist")
+        XCTAssertTrue(histExists("p2")); XCTAssertTrue(histExists("p3")); XCTAssertTrue(histExists("p4"))
+
+        // Close tab: t2's pane p3 dies.
+        store!.forgetTabs(["t2"], scrollbackDir: scrollbackDir, historyDir: historyDir)
+        store!.barrier()
+        XCTAssertFalse(histExists("p3"), "forgetTabs must delete its panes' .hist")
+        XCTAssertTrue(histExists("p2")); XCTAssertTrue(histExists("p4"))
+
+        // Forget workspace: wsB's pane p4 dies.
+        store!.forgetWorkspace("wsB", scrollbackDir: scrollbackDir, historyDir: historyDir)
+        store!.barrier()
+        XCTAssertFalse(histExists("p4"), "forgetWorkspace must delete its panes' .hist")
+        XCTAssertTrue(histExists("p2"))
+
+        // Orphan sweep: a .hist with no pane row (as the zsh hook would name
+        // it, ASCII-sanitized) dies; the live pane's survives.
+        try writeHist("gone-pane")
+        store!.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir)
+        store!.barrier()
+        XCTAssertFalse(histExists("gone-pane"), "orphan .hist must be swept")
+        XCTAssertTrue(histExists("p2"), "live pane's .hist must survive the sweep")
+
+        // Forget everything: nothing left in the history dir.
+        store = nil
+        StateStore.purgeAll(dbURL: dbURL, scrollbackDir: scrollbackDir,
+                            historyDir: historyDir)
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: historyDir.path)
+        XCTAssertTrue(leftovers.isEmpty, "purgeAll left history bytes: \(leftovers)")
+    }
+
     /// forgetPanes/forgetTabs with ids that have no rows (a pane closed before
     /// its first capture) must not throw, delete other rows, or leave the
     /// store degraded.

@@ -591,9 +591,15 @@ public final class StateStore {
         writer.async { [self] in
             guard db != nil else { return }
             var live = Set<String>()
+            var liveHist = Set<String>()
             query("SELECT id FROM panes", []) { stmt in
-                // Compare in file-name space: fileURL sanitizes ids on write.
-                if let id = column(stmt, 0) { live.insert(ScrollbackText.safePaneId(id)) }
+                // Compare in file-name space: each writer sanitizes ids on
+                // write, and the two schemes differ outside ASCII (the .hist
+                // name is chosen by the zsh hook), so each gets its own set.
+                if let id = column(stmt, 0) {
+                    live.insert(ScrollbackText.safePaneId(id))
+                    liveHist.insert(ShellIntegration.histSafePaneId(id))
+                }
             }
             let fm = FileManager.default
             if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
@@ -609,7 +615,7 @@ public final class StateStore {
                                                        includingPropertiesForKeys: nil) {
                 for file in files where file.pathExtension == "hist" {
                     let paneId = file.deletingPathExtension().lastPathComponent
-                    if !live.contains(paneId) {
+                    if !liveHist.contains(paneId) {
                         try? fm.removeItem(at: file)
                     }
                 }

@@ -173,6 +173,7 @@ final class ShellIntegrationZshTests: XCTestCase {
         HISTSIZE=1000
         SAVEHIST=1000
         autoload -Uz add-zsh-hook
+        autoload -Uz compinit && compinit -u -d "$HOME/.zcompdump"
         PROMPT='%F{blue}%n@%m%f %F{green}%~%f ❯ '
         precmd() { print -u2 "USER-PRECMD-RAN" }
         preexec() { print -u2 "USER-PREEXEC-RAN:$1" }
@@ -189,6 +190,99 @@ final class ShellIntegrationZshTests: XCTestCase {
         XCTAssertTrue(out.contains("\u{1b}]133;A"), "OSC 133 A missing")
         XCTAssertTrue(out.contains("\u{1b}]133;C"), "OSC 133 C missing")
         XCTAssertTrue(out.contains("\u{1b}]7;file://"), "OSC 7 missing")
+    }
+
+    // MARK: /etc/zshrc HISTFILE hijack repair (wrapper v2)
+
+    /// Whether this machine's /etc/zshrc applies the stock macOS default
+    /// (HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history) that the wrapper must undo.
+    private var etcZshrcSetsHistfile: Bool {
+        (try? String(contentsOf: URL(fileURLWithPath: "/etc/zshrc"),
+                     encoding: .utf8))?.contains("HISTFILE=${ZDOTDIR") ?? false
+    }
+
+    func testGlobalHistfileNotHijackedIntoIntegrationDir() throws {
+        try XCTSkipUnless(etcZshrcSetsHistfile, "/etc/zshrc has no ZDOTDIR HISTFILE default")
+        // No user rc files at all — the default macOS setup, where HISTFILE
+        // comes solely from /etc/zshrc. (Also hostile-rc matrix case (d):
+        // shell must come up with no rc files, hooks alive.)
+        let out = try runZsh(input: ": no-rc-cmd\necho \"HF=<$HISTFILE>\"\nexit\n")
+        XCTAssertTrue(out.contains("HF=<\(home.path)/.zsh_history>"),
+                      "HISTFILE not repaired to the user's own: \(out)")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: integrationDir.appendingPathComponent(".zsh_history").path),
+            "global history leaked into the integration dir")
+        // Hooks alive with no rc files: the command landed in the pane file.
+        let hist = try String(contentsOf: histFile(), encoding: .utf8)
+        XCTAssertTrue(hist.contains("no-rc-cmd"), "hist: \(hist)")
+        // ...and the user's real global history file gained the session.
+        let global = (try? String(contentsOf: home.appendingPathComponent(".zsh_history"),
+                                  encoding: .utf8)) ?? ""
+        XCTAssertTrue(global.contains("no-rc-cmd"),
+                      "session not saved to the user's global history: \(global)")
+    }
+
+    func testOmzConditionalHistfileGetsRepairedValue() throws {
+        try XCTSkipUnless(etcZshrcSetsHistfile, "/etc/zshrc has no ZDOTDIR HISTFILE default")
+        // The founder shape: oh-my-zsh sets HISTFILE only when it is UNSET —
+        // /etc/zshrc's ZDOTDIR-based value used to survive that and hijack
+        // global history into the state dir.
+        try write(".zshrc", "[[ -z \"$HISTFILE\" ]] && HISTFILE=\"$HOME/.zsh_history\"\n")
+        let out = try runZsh(input: "echo \"HF=<$HISTFILE>\"\nexit\n")
+        XCTAssertTrue(out.contains("HF=<\(home.path)/.zsh_history>"),
+                      "omz-conditional setup still hijacked: \(out)")
+    }
+
+    func testUserSetHistfileWinsOverRepair() throws {
+        try write(".zshrc", "HISTFILE=$HOME/.custom_history\nHISTSIZE=50\nSAVEHIST=50\n")
+        let out = try runZsh(input: "echo \"HF=<$HISTFILE>\"\nexit\n")
+        XCTAssertTrue(out.contains("HF=<\(home.path)/.custom_history>"),
+                      "user's explicit HISTFILE was not honored: \(out)")
+    }
+
+    // MARK: seed-time injection safety (fc -R only LOADS, never runs)
+
+    func testMaliciousHistoryLinesNeverExecuteAtSeedTime() throws {
+        try write(".zshrc", "HISTFILE=$HOME/.zsh_history\nHISTSIZE=1000\nSAVEHIST=1000\n")
+        let bomb = home.appendingPathComponent("EXPLODED").path
+        // Hostile pane file, as an attacker with state-dir access could leave
+        // it: command substitution, backticks, quotes, %, unicode, a line
+        // that is not even extended-history shaped.
+        let hostile = """
+        : 1700000000:0;touch \(bomb)-plain
+        : 1700000001:0;$(touch \(bomb)-subst)
+        : 1700000002:0;`touch \(bomb)-tick`
+        : 1700000003:0;echo "100%" 'q' ünïcode-漢字
+        touch \(bomb)-bare
+        """
+        try (hostile + "\n").write(to: histFile(), atomically: true, encoding: .utf8)
+        let out = try runZsh(input: "echo SEED-ALIVE\nfc -l 1\nexit\n")
+        XCTAssertTrue(out.contains("SEED-ALIVE"), "shell died seeding hostile file: \(out)")
+        for suffix in ["-plain", "-subst", "-tick", "-bare"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: bomb + suffix),
+                           "fc -R EXECUTED a history line (\(suffix))")
+        }
+        // The entries are recallable text (that is the feature)...
+        XCTAssertTrue(out.contains("ünïcode-漢字"), "unicode entry lost: \(out)")
+        // ...and the file itself was not corrupted by the seed.
+        let after = try String(contentsOf: histFile(), encoding: .utf8)
+        XCTAssertTrue(after.hasPrefix(": 1700000000:0;touch"), "pane file corrupted: \(after)")
+    }
+
+    func testTypedSpecialCharactersRoundTripThroughPreexec() throws {
+        try write(".zshrc", "HISTFILE=$HOME/.zsh_history\nHISTSIZE=1000\nSAVEHIST=1000\n")
+        // Typed via the REAL preexec path: quoting keeps the payloads inert
+        // in shell 1; the recorded line must carry them verbatim, one line
+        // per command, including a multi-line command flattened.
+        let cmd = ": 'q1' \"q2\" '$(not-run)' '`not-run`' '100%' 'ünïcode-漢字'"
+        try runZsh(input: cmd + "\necho 'l1\nl2'\nexit\n")
+        let hist = try String(contentsOf: histFile(), encoding: .utf8)
+        XCTAssertTrue(hist.contains(";\(cmd)"), "special chars mangled: \(hist)")
+        XCTAssertTrue(hist.contains(";echo 'l1 l2'"), "newline not flattened: \(hist)")
+        for line in hist.split(separator: "\n") {
+            XCTAssertNotNil(line.range(of: #"^: \d+:0;"#, options: .regularExpression),
+                            "malformed line: \(line)")
+        }
     }
 
     // MARK: start-of-shell trim

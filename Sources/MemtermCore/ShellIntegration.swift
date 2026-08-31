@@ -44,7 +44,13 @@ public enum ShellIntegration {
     /// Bumped whenever the integration file contents change; stamped into
     /// every generated file. The app rewrites the files at each launch so
     /// they are always current.
-    public static let version = 1
+    /// v2: repair the /etc/zshrc HISTFILE default — macOS's /etc/zshrc sets
+    /// HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history, and with ZDOTDIR pointed at
+    /// the integration dir that silently redirected the user's GLOBAL history
+    /// into the state dir for any setup that doesn't set HISTFILE itself
+    /// (oh-my-zsh only sets it when unset, so the default macOS + omz setup
+    /// was affected).
+    public static let version = 2
 
     /// Cap semantics (mirrored in the .zshrc trim): when the .hist file
     /// exceeds `trimThreshold` lines at shell start, it is rewritten to the
@@ -57,13 +63,28 @@ public enum ShellIntegration {
         (shellPath as NSString).lastPathComponent == "zsh"
     }
 
+    /// EXACT Swift mirror of the .zshrc hook's filename sanitization
+    /// (`${MEMTERM_PANE_ID//[^A-Za-z0-9-]/_}`): ASCII letters, digits, and
+    /// '-' pass; every other code point becomes '_'. This must match zsh
+    /// byte-for-byte — the shell WRITES the file and Swift DELETES it
+    /// (FR-56/57), so any divergence (e.g. ScrollbackText.safePaneId keeps
+    /// all unicode alphanumerics, zsh does not) would leave a .hist file the
+    /// forget flows never remove. Containment holds: '/' and '.' can never
+    /// survive, so traversal shapes cannot escape the history dir.
+    public static func histSafePaneId(_ paneId: String) -> String {
+        let mapped = String(paneId.unicodeScalars.map { s -> Character in
+            let v = s.value
+            let ok = (v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A)
+                  || (v >= 0x30 && v <= 0x39) || v == 0x2D // A-Z a-z 0-9 -
+            return ok ? Character(s) : "_"
+        })
+        return mapped.isEmpty ? "_invalid" : mapped
+    }
+
     /// On-disk location of one pane's shell-history file. Same containment
-    /// rule as scrollback files: the pane id is sanitized so it can never
-    /// escape the history dir (ScrollbackText.safePaneId). The .zshrc hook
-    /// applies the equivalent substitution (`${MEMTERM_PANE_ID//[^A-Za-z0-9-]/_}`)
-    /// — identical for the UUID ids memterm generates.
+    /// guarantee as scrollback files, via the zsh-parity sanitizer above.
     public static func histFileURL(dir: URL, paneId: String) -> URL {
-        dir.appendingPathComponent("\(ScrollbackText.safePaneId(paneId)).hist")
+        dir.appendingPathComponent("\(histSafePaneId(paneId)).hist")
     }
 
     // MARK: - History-line formatting (mirror of the preexec hook, for tests)
@@ -149,6 +170,15 @@ public enum ShellIntegration {
     /// install the memterm hooks via add-zsh-hook.
     public static var zshrcContent: String { """
     \(header)
+    # /etc/zshrc (which ran just before this file) defaults
+    # HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history — with ZDOTDIR still pointing at
+    # the integration dir here, that would hijack the user's GLOBAL history
+    # into memterm's state dir. Repair it to what a wrapper-less shell would
+    # have gotten; anything the user's own files set (before or after) wins
+    # untouched, because only the exact hijacked value is rewritten.
+    if [[ "${HISTFILE:-}" == "$ZDOTDIR/.zsh_history" ]]; then
+      HISTFILE="${MEMTERM_USER_ZDOTDIR:-$HOME}/.zsh_history"
+    fi
     ZDOTDIR="${MEMTERM_USER_ZDOTDIR:-$HOME}"
     [[ -f "$ZDOTDIR/.zshrc" ]] && builtin source "$ZDOTDIR/.zshrc"
     if [[ "$ZDOTDIR" == "$HOME" ]]; then unset ZDOTDIR; fi
@@ -212,6 +242,13 @@ public enum ShellIntegration {
                 try file.content.write(to: url, atomically: true, encoding: .utf8)
                 try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             }
+            // v1 wrote no HISTFILE repair, so shells hijacked by /etc/zshrc
+            // saved GLOBAL history into this dir. Remove the stray file: its
+            // entries all came from memterm panes (only they use this
+            // ZDOTDIR), so each is already captured in that pane's .hist —
+            // and an untracked history file in the state dir would outlive
+            // every FR-56/57 forget gesture.
+            try? fm.removeItem(at: dir.appendingPathComponent(".zsh_history"))
             return true
         } catch {
             return false

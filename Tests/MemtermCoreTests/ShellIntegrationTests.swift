@@ -67,16 +67,27 @@ final class ShellIntegrationTests: XCTestCase {
                        "\(uuid).hist")
     }
 
-    func testSwiftAndZshSanitizationAgreeForUUIDs() {
-        // The .zshrc hook sanitizes with ${MEMTERM_PANE_ID//[^A-Za-z0-9-]/_};
-        // Swift uses ScrollbackText.safePaneId. For the UUID ids memterm
-        // generates (and simple ASCII), both must yield the same name.
-        for id in ["ABC-123", UUID().uuidString, "weird id!"] {
-            let zshStyle = String(id.map { ch in
-                ch.isASCII && (ch.isLetter || ch.isNumber || ch == "-") ? ch : "_"
+    func testSwiftAndZshSanitizationAgreeForAllIds() {
+        // The .zshrc hook sanitizes with ${MEMTERM_PANE_ID//[^A-Za-z0-9-]/_}
+        // (ASCII only); histSafePaneId must agree for EVERY id, not just the
+        // UUIDs memterm generates — pane ids round-trip through the
+        // user-editable journal/JSON, and the shell writes the file that the
+        // forget flows must later delete. Unicode alphanumerics in particular
+        // must map to '_' (ScrollbackText.safePaneId keeps them, zsh doesn't).
+        for id in ["ABC-123", UUID().uuidString, "weird id!", "p\u{00E9}x",
+                   "\u{6F22}\u{5B57}", "e\u{0301}mixed", "..", "a/b"] {
+            let zshStyle = String(id.unicodeScalars.map { s -> Character in
+                let v = s.value
+                let ok = (v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A)
+                      || (v >= 0x30 && v <= 0x39) || v == 0x2D
+                return ok ? Character(s) : "_"
             })
-            XCTAssertEqual(ScrollbackText.safePaneId(id), zshStyle)
+            XCTAssertEqual(ShellIntegration.histSafePaneId(id), zshStyle, "id: \(id)")
         }
+        // For the ids memterm actually generates, both sanitizers agree, so
+        // .txt and .hist files share a stem.
+        let uuid = UUID().uuidString
+        XCTAssertEqual(ShellIntegration.histSafePaneId(uuid), ScrollbackText.safePaneId(uuid))
     }
 
     // MARK: - Environment composition
@@ -121,6 +132,17 @@ final class ShellIntegrationTests: XCTestCase {
         }
         let dirPerms = try FileManager.default.attributesOfItem(atPath: dir.path)[.posixPermissions] as? Int
         XCTAssertEqual(dirPerms, 0o700)
+        // The wrapper must repair the /etc/zshrc HISTFILE hijack before the
+        // user's rc runs (v2) — losing this line silently redirects the
+        // user's global history into the state dir.
+        XCTAssertTrue(ShellIntegration.zshrcContent
+            .contains(#"[[ "${HISTFILE:-}" == "$ZDOTDIR/.zsh_history" ]]"#))
+        // ...and a re-install sweeps the stray v1 hijack artifact.
+        let stray = dir.appendingPathComponent(".zsh_history")
+        try "polluted".write(to: stray, atomically: true, encoding: .utf8)
+        XCTAssertTrue(ShellIntegration.install(into: dir))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stray.path),
+                       "v1 hijacked .zsh_history not cleaned up by install")
         // The trim constants must be baked into the rc verbatim.
         XCTAssertTrue(ShellIntegration.zshrcContent.contains("> \(ShellIntegration.trimThreshold)"))
         XCTAssertTrue(ShellIntegration.zshrcContent.contains("tail -n \(ShellIntegration.trimKeep)"))
