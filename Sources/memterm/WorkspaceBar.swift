@@ -165,6 +165,11 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     private let label = NSTextField(labelWithString: "")
     private let dot = NSView()
     private let ring = NSView()
+    /// Founder 2026-08-31: quick close on hover — ✕ parks a live workspace
+    /// (memory kept, reversible); on an already-parked chip it forgets, with
+    /// one confirmation since that deletes memory. Space is always reserved so
+    /// chips don't jump on hover; the glyph fades in.
+    private let closeButton = NSButton()
     private var editor: NSTextField?
     private var renameCancelled = false
     private(set) var isActive = false
@@ -194,6 +199,17 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         label.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingTail
         addSubview(label)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.isBordered = false
+        closeButton.setButtonType(.momentaryChange)
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill",
+                                    accessibilityDescription: "Close Workspace")?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
+        closeButton.contentTintColor = .tertiaryLabelColor
+        closeButton.alphaValue = 0  // revealed on hover
+        closeButton.target = self
+        closeButton.action = #selector(closeTapped(_:))
+        addSubview(closeButton)
         NSLayoutConstraint.activate([
             dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -204,12 +220,54 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             ring.widthAnchor.constraint(equalToConstant: 12),
             ring.heightAnchor.constraint(equalToConstant: 12),
             label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
+            label.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -2),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
             label.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 13),
+            closeButton.heightAnchor.constraint(equalToConstant: 13),
             heightAnchor.constraint(equalToConstant: 19),
         ])
         setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        closeButton.animator().alphaValue = 1
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        closeButton.animator().alphaValue = 0
+    }
+
+    @objc private func closeTapped(_ sender: Any?) {
+        let id = workspaceId
+        if isParked {
+            // Forget deletes memory — one confirmation, then gone.
+            let alert = NSAlert()
+            alert.messageText = "Forget “\(name)”?"
+            alert.informativeText = "Deletes this workspace's memory — layouts, scrollback, session records."
+            alert.addButton(withTitle: "Forget")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            DispatchQueue.main.async { [weak app = self.app] in
+                app?.forgetWorkspace(id)
+            }
+        } else {
+            // Park = close but keep memory (FR-51); reversible from the chip.
+            // Deferred: parking hides/closes this chip's own window path.
+            DispatchQueue.main.async { [weak app = self.app] in
+                app?.parkWorkspace(id)
+            }
+        }
     }
 
     @available(*, unavailable)
@@ -248,6 +306,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         applyActivity(isActive ? .idle : activity)
         toolTip = isParked ? "\(name) — parked. Click to reopen."
             : isActive ? "Click to rename" : "Switch to \(name)"
+        closeButton.toolTip = isParked ? "Forget \(name)…" : "Park \(name) (keeps its memory)"
     }
 
     /// Dot pulse while output flows in this (hidden) workspace; a persistent
@@ -295,6 +354,8 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     override func hitTest(_ point: NSPoint) -> NSView? {
         let hit = super.hitTest(point)
         if editor != nil { return hit }
+        // The hover ✕ keeps its own click; everything else is the chip.
+        if let hit, hit === closeButton || hit.isDescendant(of: closeButton) { return hit }
         return hit == nil ? nil : self
     }
 
