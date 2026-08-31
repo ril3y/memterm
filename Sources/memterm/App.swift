@@ -1,8 +1,9 @@
 import AppKit
 import SwiftTerm
 
-// M0 spike shell: one NSWindow, one LocalProcessTerminalView running the
-// user's login shell. Instrumented modes:
+// M0 probe harness, kept intact per REQUIREMENTS.md M0 exit criteria. The
+// interactive app lives in MemtermApp.swift; these modes keep a single bare
+// pane so measurements stay comparable across milestones.
 //   --latency  measure draw latency (feed -> displayed frame) and pty echo
 //              round trip, print p50/p95, then quit.
 //   --flood    feed 32 MB of `yes`-style output through the view on the main
@@ -24,7 +25,7 @@ final class ProbeTerminalView: LocalProcessTerminalView {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelegate {
+final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelegate {
     let mode: RunMode
     var window: NSWindow!
     var termView: ProbeTerminalView!
@@ -170,9 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, LocalProcessTerminalVi
         window?.title = title.isEmpty ? "memterm" : title
     }
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-    func processTerminated(source: TerminalView, exitCode: Int32?) {
-        if mode == .interactive { NSApp.terminate(nil) }
-    }
+    func processTerminated(source: TerminalView, exitCode: Int32?) {}
 }
 
 enum RunMode {
@@ -182,7 +181,9 @@ enum RunMode {
 func runApp(mode: RunMode) {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
-    let delegate = AppDelegate(mode: mode)
+    let delegate: NSApplicationDelegate = mode == .interactive
+        ? MemtermAppDelegate()
+        : ProbeAppDelegate(mode: mode)
     app.delegate = delegate
     app.run()
 }
