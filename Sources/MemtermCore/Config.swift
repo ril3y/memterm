@@ -109,6 +109,52 @@ public struct Config {
         return ConfigRGB(red: (v >> 16) & 0xff, green: (v >> 8) & 0xff, blue: v & 0xff)
     }
 
+    // MARK: - Serialization (Settings UI writes through here; FR-44 keeps the
+    // TOML file the on-disk source of truth)
+
+    private static func hex(_ c: ConfigRGB) -> String {
+        String(format: "#%02x%02x%02x", c.red, c.green, c.blue)
+    }
+
+    /// Regenerates the config file body from the current values. Unset
+    /// optionals stay as commented guidance so the file remains self-teaching.
+    public func serialize() -> String {
+        var lines: [String] = [
+            "# memterm configuration — edited by Settings (⌘,) and by hand.",
+            "",
+        ]
+        if let fontFamily {
+            lines.append("font_family = \"\(fontFamily)\"")
+        } else {
+            lines.append("# font_family = \"MesloLGS NF\"  # default: first installed nerd font")
+        }
+        lines.append("font_size = \(fontSize == fontSize.rounded() ? String(Int(fontSize)) : String(fontSize))")
+        lines.append("copy_on_select = \(copyOnSelect)")
+        lines.append("scrollback_lines = \(scrollbackLines)")
+        if let shell {
+            lines.append("shell = \"\(shell)\"")
+        } else {
+            lines.append("# shell = \"/bin/zsh\"  # default: $SHELL, run as a login shell")
+        }
+        lines.append("")
+        lines.append("[theme]")
+        if let themeBackground { lines.append("background = \"\(Self.hex(themeBackground))\"") }
+        if let themeForeground { lines.append("foreground = \"\(Self.hex(themeForeground))\"") }
+        if let themeCursor { lines.append("cursor = \"\(Self.hex(themeCursor))\"") }
+        if let ansiColors, ansiColors.count == 16 {
+            for (i, c) in ansiColors.enumerated() { lines.append("ansi\(i) = \"\(Self.hex(c))\"") }
+        } else {
+            lines.append("# ansi0 ... ansi15 override the 16 ANSI colors (all 16 required)")
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    public func save(to url: URL = configURL) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        try? serialize().write(to: url, atomically: true, encoding: .utf8)
+    }
+
     public static func createDefaultFileIfMissing(at url: URL = configURL) {
         let fm = FileManager.default
         guard !fm.fileExists(atPath: url.path) else { return }

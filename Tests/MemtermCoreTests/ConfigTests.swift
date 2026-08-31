@@ -17,6 +17,41 @@ final class ConfigTests: XCTestCase {
 
     // MARK: Defaults file
 
+    func testSerializeRoundTripsAllValues() {
+        var c = Config()
+        c.fontFamily = "MesloLGS NF"
+        c.fontSize = 15
+        c.copyOnSelect = false
+        c.scrollbackLines = 4321
+        c.shell = "/opt/homebrew/bin/fish"
+        c.themeBackground = ConfigRGB(red: 0x1d, green: 0x1f, blue: 0x21)
+        c.themeForeground = ConfigRGB(red: 0xc5, green: 0xc8, blue: 0xc6)
+        c.themeCursor = ConfigRGB(red: 0xff, green: 0x00, blue: 0x7f)
+        c.ansiColors = (0..<16).map { ConfigRGB(red: $0 * 15, green: $0, blue: 255 - $0 * 15) }
+
+        let parsed = Config.parse(c.serialize())
+        XCTAssertEqual(parsed.fontFamily, c.fontFamily)
+        XCTAssertEqual(parsed.fontSize, c.fontSize)
+        XCTAssertEqual(parsed.copyOnSelect, c.copyOnSelect)
+        XCTAssertEqual(parsed.scrollbackLines, c.scrollbackLines)
+        XCTAssertEqual(parsed.shell, c.shell)
+        XCTAssertEqual(parsed.themeBackground, c.themeBackground)
+        XCTAssertEqual(parsed.themeForeground, c.themeForeground)
+        XCTAssertEqual(parsed.themeCursor, c.themeCursor)
+        XCTAssertEqual(parsed.ansiColors, c.ansiColors)
+    }
+
+    func testSerializeDefaultsRoundTripToDefaults() {
+        let parsed = Config.parse(Config().serialize())
+        XCTAssertNil(parsed.fontFamily)
+        XCTAssertEqual(parsed.fontSize, 13)
+        XCTAssertTrue(parsed.copyOnSelect)
+        XCTAssertEqual(parsed.scrollbackLines, 10_000)
+        XCTAssertNil(parsed.shell)
+        XCTAssertNil(parsed.themeBackground)
+        XCTAssertNil(parsed.ansiColors)
+    }
+
     func testLoadCreatesAndParsesDefaultsFile() {
         let url = tempDir.appendingPathComponent("config.toml")
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))

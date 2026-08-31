@@ -6,7 +6,9 @@ import MemtermCore
 // in App.swift.
 
 final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
-    let config = Config.load()
+    private(set) var config = Config.load()
+    private var settingsController: SettingsWindowController?
+    private var tabRenameClickMonitor: Any?
     private(set) var controllers: [TerminalWindowController] = []
     private var fontSize: CGFloat
     private(set) var memory: MemoryEngine?
@@ -92,6 +94,26 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(workspaceWillPowerOff(_:)),
             name: NSWorkspace.willPowerOffNotification, object: nil)
+
+        // Double-click on a tab in the native tab bar renames it. The tab bar
+        // is private AppKit, so the gesture is caught with a local monitor:
+        // the first click of the double-click already selected the clicked
+        // tab (making it the key window), so renaming the key controller
+        // renames the tab the user double-clicked. Clicks in the titlebar
+        // proper (above the tab strip) keep the system zoom behavior.
+        tabRenameClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) {
+            [weak self] event in
+            guard let self, event.clickCount == 2,
+                  let window = event.window,
+                  window.tabGroup?.isTabBarVisible == true,
+                  self.controllers.contains(where: { $0.window === window }) else { return event }
+            let y = event.locationInWindow.y
+            let tabStripBottom = window.contentLayoutRect.maxY
+            let titlebarBottom = window.frame.height - 28
+            guard y >= tabStripBottom, y <= titlebarBottom else { return event }
+            DispatchQueue.main.async { self.keyController()?.promptRenameTab() }
+            return nil  // swallow: nothing else should react to this gesture
+        }
 
         NSApp.activate(ignoringOtherApps: true)
         if smokeMode { runSmoke(restoredAnything: restoredAnything) }
@@ -279,6 +301,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         refreshWorkspaceChips()
     }
 
+    @objc func renameTab(_ sender: Any?) {
+        keyController()?.promptRenameTab()
+    }
+
     @objc func splitRight(_ sender: Any?) {
         keyController()?.splitCurrentPane(vertical: true)
     }
@@ -296,8 +322,31 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     @objc func focusPaneUp(_ sender: Any?) { keyController()?.moveFocus(.up) }
     @objc func focusPaneDown(_ sender: Any?) { keyController()?.moveFocus(.down) }
 
+    /// ⌘, — the real settings UI (FR-44/48). The config file stays the source
+    /// of truth; the window reads it and writes through Config.save.
     @objc func openPreferences(_ sender: Any?) {
+        if settingsController == nil {
+            settingsController = SettingsWindowController(app: self)
+        }
+        settingsController?.show()
+    }
+
+    @objc func openConfigFile(_ sender: Any?) {
         NSWorkspace.shared.open(Config.configURL)
+    }
+
+    /// Settings changes land here: adopt, apply to every open pane, persist.
+    /// Font/colors/copy-on-select take effect immediately; scrollback and
+    /// shell only shape panes created from now on.
+    func applyConfigLive(_ newConfig: Config) {
+        config = newConfig
+        fontSize = CGFloat(newConfig.fontSize)
+        let font = currentFont()
+        for controller in controllers {
+            controller.applyFont(font)
+            controller.applyTheme(config)
+        }
+        config.save()
     }
 
     @objc func increaseFontSize(_ sender: Any?) { changeFontSize(by: 1) }

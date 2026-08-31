@@ -26,8 +26,10 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("About memterm", to: appMenu,
         #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "", modifiers: [])
     appMenu.addItem(.separator())
-    add("Preferences…", to: appMenu, #selector(MemtermAppDelegate.openPreferences(_:)), ",",
+    add("Settings…", to: appMenu, #selector(MemtermAppDelegate.openPreferences(_:)), ",",
         target: app)
+    add("Edit Config File…", to: appMenu, #selector(MemtermAppDelegate.openConfigFile(_:)), "",
+        modifiers: [], target: app)
     appMenu.addItem(.separator())
     // FR-45/57: the global wipe, confirmation-gated in the action.
     add("Forget Everything…", to: appMenu,
@@ -158,6 +160,8 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     nextTabAlias.keyEquivalentModifierMask = [.control]
     nextTabAlias.isHidden = true
     windowMenu.addItem(nextTabAlias)
+    add("Rename Tab…", to: windowMenu, #selector(MemtermAppDelegate.renameTab(_:)),
+        "", modifiers: [], target: app)
     add("Move Tab to New Window", to: windowMenu, #selector(NSWindow.moveTabToNewWindow(_:)),
         "", modifiers: [])
     add("Merge All Windows", to: windowMenu, #selector(NSWindow.mergeAllWindows(_:)),

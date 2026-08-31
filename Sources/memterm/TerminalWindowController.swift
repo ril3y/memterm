@@ -26,6 +26,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     func setWorkspace(_ id: String) {
         workspaceId = id
     }
+    /// User-chosen tab name (double-click the tab to set). While set, it
+    /// pins the window/tab title — the automatic pane-title/cwd updates stop
+    /// overwriting it. Persisted in the journal and restored (empty = auto).
+    var customTitle: String? {
+        didSet { refreshTitle() }
+    }
     private weak var focusedPane: PaneView?
     // SwiftTerm's becomeFirstResponder is not open, so focus changes are
     // tracked by observing the window's firstResponder instead.
@@ -77,6 +83,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             root = makePane(frame: content.bounds, cwd: nil)
         }
         content.addSubview(root)
+        if let restoredTab, !restoredTab.title.isEmpty {
+            // Only custom names are journaled (auto titles regenerate live).
+            customTitle = restoredTab.title
+        }
         if let first = allPanes().first {
             window.makeFirstResponder(first)
         }
@@ -306,7 +316,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             PaneSnap(id: $0.paneId, shell: $0.shellPath, cwd: $0.lastKnownCwd,
                      cwdSource: $0.cwdSource)
         }
-        return TabSnap(id: tabId, title: window?.title ?? "", tree: tree, panes: panes)
+        // Custom names only: a stored auto title would freeze as custom on
+        // restore. Auto titles regenerate from pane title/cwd anyway.
+        return TabSnap(id: tabId, title: customTitle ?? "", tree: tree, panes: panes)
     }
 
     private func snapshotNode(_ view: NSView) -> SplitNode? {
@@ -457,8 +469,37 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         for pane in allPanes() { pane.font = font }
     }
 
+    /// Live theme application from the Settings window. Explicit defaults are
+    /// pushed when the theme is cleared so panes don't keep stale colors.
+    func applyTheme(_ config: Config) {
+        let bg = config.themeBackgroundColor ?? .black
+        let fg = config.themeForegroundColor
+            ?? NSColor(srgbRed: 0.77, green: 0.78, blue: 0.78, alpha: 1)
+        window?.backgroundColor = bg
+        for pane in allPanes() {
+            pane.copyOnSelect = config.copyOnSelect
+            pane.nativeBackgroundColor = bg
+            pane.nativeForegroundColor = fg
+            pane.caretColor = config.themeCursorColor ?? fg
+            if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
+            pane.needsDisplay = true
+        }
+    }
+
     private func refreshTitle(for pane: PaneView) {
         guard pane === currentPane() else { return }
+        refreshTitle()
+    }
+
+    private func refreshTitle() {
+        if let customTitle {
+            window?.title = customTitle
+            return
+        }
+        guard let pane = currentPane() else {
+            window?.title = "memterm"
+            return
+        }
         if !pane.paneTitle.isEmpty {
             window?.title = pane.paneTitle
         } else if let dir = pane.currentLocalDirectory {
@@ -466,6 +507,25 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         } else {
             window?.title = "memterm"
         }
+    }
+
+    /// Double-click on the tab (FR: founder request 2026-08-31). Empty input
+    /// clears the custom name and automatic titles resume.
+    func promptRenameTab() {
+        let alert = NSAlert()
+        alert.messageText = "Rename Tab"
+        alert.informativeText = "Leave empty to go back to automatic titles."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = customTitle ?? ""
+        field.placeholderString = window?.title
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        customTitle = name.isEmpty ? nil : name
+        app.memory?.scheduleTopologySave()
     }
 
     // MARK: - NSWindowDelegate
