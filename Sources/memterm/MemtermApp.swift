@@ -236,6 +236,38 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                     print("UIPROBE-FAIL workspace bar is not above the tab strip"); exit(1)
                 }
             }
+            // Monitor-band leg: the double-click-rename and right-click-menu
+            // monitors must target the tab strip band and ONLY it. Synthesize
+            // the events the monitors would receive and run them through the
+            // shared region check: mid-strip hits, terminal content misses,
+            // the bar's interior misses, and the accessory row's side margins
+            // (the 4pt sliver beside the bar, under the traffic lights)
+            // miss — those are titlebar clicks, not tab-strip gestures.
+            func probeEvent(_ x: CGFloat, _ y: CGFloat) -> NSEvent? {
+                NSEvent.mouseEvent(with: .leftMouseDown,
+                                   location: NSPoint(x: x, y: y),
+                                   modifierFlags: [], timestamp: 0,
+                                   windowNumber: window.windowNumber,
+                                   context: nil, eventNumber: 0, clickCount: 2,
+                                   pressure: 1)
+            }
+            func hits(_ x: CGFloat, _ y: CGFloat) -> Bool {
+                probeEvent(x, y).flatMap { self.tabStripController(for: $0) } != nil
+            }
+            let stripBottom = controller.tabStripBottomY()
+            let bandTop = self.config.workspaceBar && barFrame.height > 0
+                ? barFrame.minY : window.frame.height - 28
+            let stripHit = hits(window.frame.width / 2, (stripBottom + bandTop) / 2)
+            let contentHit = hits(window.frame.width / 2, stripBottom - 30)
+            var barHit = false, sliverHit = false
+            if self.config.workspaceBar, barFrame.height > 0 {
+                barHit = hits(barFrame.midX, barFrame.midY)
+                sliverHit = hits(barFrame.minX - 10, barFrame.minY + 2)
+            }
+            print("UIPROBE-BAND strip=\(stripHit) content=\(contentHit) bar=\(barHit) titlebar_sliver=\(sliverHit)")
+            if !stripHit || contentHit || barHit || sliverHit {
+                print("UIPROBE-FAIL tab-strip monitors target the wrong band"); exit(1)
+            }
         }
         // Activity-indicator leg: output lands on the FIRST tab while the
         // second (created above) is selected → active → decays to unseen →
@@ -311,7 +343,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // Inline-rename leg (.top accessory placement): the editor must take
         // focus INSIDE the titlebar accessory, and committing (focus-loss /
         // Enter both end editing) must hand the first responder back to the
-        // pane — the exact gate the content-view placement needed.
+        // pane — the exact gate the content-view placement needed. The
+        // controller is captured per leg (not re-resolved via keyController)
+        // so key-window churn under load can't misdirect the assertions.
+        var renameController: TerminalWindowController?
         DispatchQueue.main.asyncAfter(deadline: .now() + 8.5) {
             guard self.config.workspaceBar else {
                 print("UIPROBE-RENAME skipped (workspace_bar=false)"); return
@@ -319,6 +354,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             guard let controller = self.keyController() else {
                 print("UIPROBE-FAIL no controller (rename leg)"); exit(1)
             }
+            renameController = controller
             controller.beginWorkspaceRename(self.activeWorkspaceId)
             // While editing, the first responder is the field editor.
             let editorFocused = controller.window?.firstResponder is NSTextView
@@ -330,21 +366,53 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 8.9) {
             guard self.config.workspaceBar else { return }
-            let focusBack = self.keyController()?.window?.firstResponder is PaneView
+            let focusBack = renameController?.window?.firstResponder is PaneView
             print("UIPROBE-RENAME focus_back_to_pane=\(focusBack)")
             if !focusBack {
                 print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
                 exit(1)
             }
         }
+        // Esc-cancel leg (the rename contract's other half — the known
+        // regression class): type a replacement name, press Esc — the store
+        // must keep the old name and the keyboard must return to the pane.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9.2) {
+            guard self.config.workspaceBar else {
+                print("UIPROBE-ESC skipped (workspace_bar=false)"); return
+            }
+            guard let controller = self.keyController(), let window = controller.window else {
+                print("UIPROBE-FAIL no controller (esc leg)"); exit(1)
+            }
+            renameController = controller
+            controller.beginWorkspaceRename(self.activeWorkspaceId)
+            guard let editor = window.firstResponder as? NSTextView else {
+                print("UIPROBE-FAIL esc leg: editor did not take focus"); exit(1)
+            }
+            editor.insertText("Garbage-Name",
+                              replacementRange: NSRange(location: 0,
+                                                        length: (editor.string as NSString).length))
+            // Field-editor Esc routes through NSTextField's delegate chain to
+            // the chip's control(_:textView:doCommandBy:) — the real key path.
+            editor.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9.6) {
+            guard self.config.workspaceBar else { return }
+            let names = self.memory?.store.listWorkspaces().map { $0.name } ?? []
+            let cancelled = !names.contains("Garbage-Name")
+            let focusBack = renameController?.window?.firstResponder is PaneView
+            print("UIPROBE-ESC cancelled=\(cancelled) focus_back_to_pane=\(focusBack) names=\(names) fr=\(String(describing: renameController?.window?.firstResponder))")
+            if !cancelled || !focusBack {
+                print("UIPROBE-FAIL Esc did not cancel the rename cleanly"); exit(1)
+            }
+        }
         // Fullscreen leg (.top accessory placement): enter/exit must not wedge
         // the accessory — after the round-trip the window is out of
         // fullscreen, the terminal content spans the restored layout area,
         // and the bar is back in the titlebar above the tab strip.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 9.2) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9.9) {
             self.keyController()?.window?.toggleFullScreen(nil)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 11.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 11.7) {
             guard let window = self.keyController()?.window else {
                 print("UIPROBE-FAIL no window (fullscreen leg)"); exit(1)
             }
@@ -355,7 +423,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             }
             window.toggleFullScreen(nil)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12.8) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 13.5) {
             guard let controller = self.keyController(), let window = controller.window else {
                 print("UIPROBE-FAIL no window (fullscreen exit)"); exit(1)
             }
@@ -389,12 +457,26 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
               window.tabGroup?.isTabBarVisible == true,
               let controller = controllers.first(where: { $0.window === window })
         else { return nil }
-        if let barFrame = controller.workspaceBarFrameInWindow(),
-           barFrame.contains(event.locationInWindow) { return nil }
         let y = event.locationInWindow.y
         let tabStripBottom = controller.tabStripBottomY()
-        let titlebarBottom = window.frame.height - 28
-        guard y >= tabStripBottom, y <= titlebarBottom else { return nil }
+        // 28 is a heuristic: with .fullSizeContentView the titlebar row
+        // measures 32 on macOS 26.2 (probe-verified: chrome is 68pt with and
+        // without the bar), so without the bar installed the band overshoots
+        // ~4pt into blank titlebar — harmless (double-click there renames
+        // instead of zooming), and there is no public API for the row height.
+        // With the bar installed, its frame gives the row exactly.
+        var bandTop = window.frame.height - 28
+        if let barFrame = controller.workspaceBarFrameInWindow() {
+            if barFrame.contains(event.locationInWindow) { return nil }
+            // With the bar installed, its row IS the topmost titlebar row
+            // (traffic lights inset it on the left, the gear on the right),
+            // and the tab strip ends where that row begins. The 28pt
+            // heuristic alone overshoots ~4pt into the accessory row's side
+            // margins (x < traffic-light inset, x > bar trailing edge) —
+            // clicks there are titlebar clicks, never tab-strip gestures.
+            bandTop = min(bandTop, barFrame.minY)
+        }
+        guard y >= tabStripBottom, y <= bandTop else { return nil }
         return controller
     }
 

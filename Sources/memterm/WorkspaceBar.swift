@@ -346,19 +346,38 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         field.currentEditor()?.selectAll(nil)
     }
 
-    /// Esc cancels; Enter commits by resigning focus (controlTextDidEndEditing).
+    /// Esc cancels; Enter commits. Both end editing by handing the first
+    /// responder STRAIGHT to the pane: makeFirstResponder(pane) resigns the
+    /// field editor (running the commit/cancel logic in
+    /// controlTextDidEndEditing) and lands the keyboard in the terminal in
+    /// one atomic step. The previous two-step dance — makeFirstResponder(nil)
+    /// parking focus on the window, an async block re-targeting the pane —
+    /// raced AppKit's field-editor teardown and intermittently stranded the
+    /// keyboard on the window (probe-reproduced); the async handoff in
+    /// controlTextDidEndEditing remains only as the fallback for OTHER
+    /// end-editing paths.
     func control(_ control: NSControl, textView: NSTextView,
                  doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
             renameCancelled = true
-            window?.makeFirstResponder(nil)
+            endEditingReturningFocusToPane()
             return true
         }
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            window?.makeFirstResponder(nil)
+            endEditingReturningFocusToPane()
             return true
         }
         return false
+    }
+
+    private func endEditingReturningFocusToPane() {
+        guard let window else { return }
+        if let controller = window.delegate as? TerminalWindowController,
+           let pane = controller.currentPane() {
+            window.makeFirstResponder(pane)
+        } else {
+            window.makeFirstResponder(nil)
+        }
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
