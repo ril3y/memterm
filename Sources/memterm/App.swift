@@ -1,0 +1,188 @@
+import AppKit
+import SwiftTerm
+
+// M0 spike shell: one NSWindow, one LocalProcessTerminalView running the
+// user's login shell. Instrumented modes:
+//   --latency  measure draw latency (feed -> displayed frame) and pty echo
+//              round trip, print p50/p95, then quit.
+//   --flood    feed 32 MB of `yes`-style output through the view on the main
+//              loop with 60 Hz display, report wall time + worst stall, quit.
+
+final class ProbeTerminalView: LocalProcessTerminalView {
+    var onPtyData: ((Int) -> Void)?
+
+    override func dataReceived(slice: ArraySlice<UInt8>) {
+        super.dataReceived(slice: slice) // parse + mark dirty first, so the probe measures through draw
+        if let onPtyData {
+            let count = slice.count
+            if Thread.isMainThread {
+                onPtyData(count)
+            } else {
+                DispatchQueue.main.async { onPtyData(count) }
+            }
+        }
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelegate {
+    let mode: RunMode
+    var window: NSWindow!
+    var termView: ProbeTerminalView!
+
+    init(mode: RunMode) {
+        self.mode = mode
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let contentRect = NSRect(x: 0, y: 0, width: 980, height: 640)
+        window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "memterm"
+        window.center()
+
+        termView = ProbeTerminalView(frame: contentRect)
+        termView.autoresizingMask = [.width, .height]
+        termView.processDelegate = self
+        window.contentView = termView
+        window.makeFirstResponder(termView)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let shellName = (shell as NSString).lastPathComponent
+        termView.startProcess(executable: shell, execName: "-\(shellName)")
+
+        switch mode {
+        case .interactive:
+            break
+        case .latency:
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.runLatencyProbe() }
+        case .flood:
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.runFloodProbe() }
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // MARK: - Probes
+
+    private func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 } // ms
+
+    /// Draw latency: parse one small feed + full synchronous redisplay.
+    /// Echo RTT: send a byte to the pty, stamp when the shell's echo comes back
+    /// through feed(). Together they bracket the app's share of keypress-to-glyph.
+    private func runLatencyProbe() {
+        var drawSamples: [Double] = []
+        for i in 0..<300 {
+            let t0 = now()
+            termView.feed(text: i % 10 == 0 ? "\u{1b}[1;33mx\u{1b}[0m" : "x")
+            window.displayIfNeeded()
+            drawSamples.append(now() - t0)
+        }
+        termView.feed(text: "\r\n")
+
+        var rttSamples: [Double] = []
+        var sentAt: Double = 0
+        var pending = false
+        termView.onPtyData = { [weak self] _ in
+            guard let self, pending else { return }
+            pending = false
+            self.window.displayIfNeeded()
+            rttSamples.append(self.now() - sentAt)
+        }
+
+        var iteration = 0
+        func step() {
+            if iteration >= 200 {
+                self.report(draw: drawSamples, rtt: rttSamples)
+                NSApp.terminate(nil)
+                return
+            }
+            iteration += 1
+            pending = true
+            sentAt = now()
+            termView.send(txt: " ")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { step() }
+        }
+        step()
+    }
+
+    private func percentile(_ sorted: [Double], _ p: Double) -> Double {
+        guard !sorted.isEmpty else { return .nan }
+        let idx = min(sorted.count - 1, Int(Double(sorted.count) * p))
+        return sorted[idx]
+    }
+
+    private func report(draw: [Double], rtt: [Double]) {
+        let d = draw.sorted(), r = rtt.sorted()
+        print("memterm M0 latency probe (CoreText renderer, 980x640 window)")
+        print(String(format: "draw latency   n=%3d  p50=%6.2f ms  p95=%6.2f ms  max=%6.2f ms",
+                     d.count, percentile(d, 0.5), percentile(d, 0.95), d.last ?? .nan))
+        print(String(format: "pty echo rtt   n=%3d  p50=%6.2f ms  p95=%6.2f ms  max=%6.2f ms",
+                     r.count, percentile(r, 0.5), percentile(r, 0.95), r.last ?? .nan))
+        print("kill-criterion check (REQUIREMENTS.md M0): p95 draw+rtt < 35 ms required")
+    }
+
+    /// Flood: 32 MB of tiny lines fed on the main loop with a display every
+    /// frame budget; measures total wall time and the worst main-thread stall.
+    private func runFloodProbe() {
+        let yesLine = Array("y\n".utf8)
+        var chunk: [UInt8] = []
+        while chunk.count < 65_536 { chunk += yesLine }
+        let totalBytes = 32 * 1_048_576
+        var fed = 0
+        var worstStall: Double = 0
+        var lastTick = now()
+        let t0 = now()
+
+        func pump() {
+            let tickStart = now()
+            worstStall = max(worstStall, tickStart - lastTick)
+            let budgetDeadline = tickStart + 12.0 // leave headroom in a 16.7ms frame
+            while fed < totalBytes && now() < budgetDeadline {
+                termView.feed(byteArray: chunk[0...])
+                fed += chunk.count
+            }
+            window.displayIfNeeded()
+            lastTick = now()
+            if fed < totalBytes {
+                DispatchQueue.main.async { pump() }
+            } else {
+                let dt = (now() - t0) / 1000.0
+                print("memterm M0 flood probe (in-window, main-loop feed + 60Hz display)")
+                print(String(format: "fed %d MB in %.2f s  ->  %.1f MB/s;  worst main-thread stall %.1f ms",
+                             totalBytes / 1_048_576, dt, Double(totalBytes) / 1_048_576.0 / dt, worstStall))
+                print("kill-criterion check: UI must not freeze (stall ~< 100 ms) under flood")
+                NSApp.terminate(nil)
+            }
+        }
+        pump()
+    }
+
+    // MARK: - LocalProcessTerminalViewDelegate
+
+    func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
+    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
+        window?.title = title.isEmpty ? "memterm" : title
+    }
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+    func processTerminated(source: TerminalView, exitCode: Int32?) {
+        if mode == .interactive { NSApp.terminate(nil) }
+    }
+}
+
+enum RunMode {
+    case interactive, latency, flood
+}
+
+func runApp(mode: RunMode) {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let delegate = AppDelegate(mode: mode)
+    app.delegate = delegate
+    app.run()
+}
