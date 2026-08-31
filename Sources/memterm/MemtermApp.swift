@@ -178,6 +178,26 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func runUIProbe() {
+        // Single-tab leg (always_show_tab_bar): before the second tab exists,
+        // the tab bar must already be visible and the monitors' tab-strip
+        // region (tabStripBottomY .. frame.height-28) must be non-empty, or
+        // double-click rename / right-click menu are unreachable on a fresh
+        // window. Skipped when the founder's config disables the policy.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard self.config.alwaysShowTabBar else {
+                print("UIPROBE-SINGLE skipped (always_show_tab_bar=false)")
+                return
+            }
+            guard let controller = self.keyController(), let window = controller.window else {
+                print("UIPROBE-FAIL no window (single-tab leg)"); exit(1)
+            }
+            let visible = window.tabGroup?.isTabBarVisible == true
+            let regionHeight = window.frame.height - 28 - controller.tabStripBottomY()
+            print("UIPROBE-SINGLE tab_bar_visible=\(visible) strip_region_h=\(Int(regionHeight))")
+            if !visible || regionHeight <= 0 {
+                print("UIPROBE-FAIL single-tab tab bar not reachable"); exit(1)
+            }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             self.newWindowForTab(nil)  // second tab so the tab bar is visible
             _ = self.createWorkspace(named: "Probe")
@@ -379,6 +399,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             var workspaceB: String?
             // FR-59 live-switch leg state: Default's identity before switching.
             var defaultControllerIds = Set<ObjectIdentifier>()
+            var defaultPaneIds = Set<ObjectIdentifier>()
             var defaultPids: [pid_t] = []
             var defaultFrame = NSRect.zero
             func defaultControllers() -> [TerminalWindowController] {
@@ -393,9 +414,17 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 // HIDE Default — same objects, processes untouched.
                 let defaults = defaultControllers()
                 defaultControllerIds = Set(defaults.map(ObjectIdentifier.init))
-                defaultPids = defaults.flatMap { $0.allPanes() }
-                    .compactMap { $0.process?.shellPid }
+                let panes = defaults.flatMap { $0.allPanes() }
+                defaultPaneIds = Set(panes.map(ObjectIdentifier.init))
+                defaultPids = panes.compactMap { $0.process?.shellPid }
                 defaultFrame = defaults.first?.window?.frame ?? .zero
+                // The leg is only meaningful against the full 2-tab/3-pane
+                // build-out: every pane must have a live shell pid recorded.
+                guard defaults.count == 2, panes.count == 3,
+                      defaultPids.count == 3 else {
+                    print("SMOKE-FAIL live-switch precondition: tabs=\(defaults.count) panes=\(panes.count) pids=\(defaultPids.count)")
+                    exit(1)
+                }
                 workspaceB = self.createWorkspace(named: "B")
                 if let b = workspaceB { self.switchToWorkspace(b) }
             }
@@ -416,18 +445,23 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 6.1) {
                 let defaults = defaultControllers()
+                let panes = defaults.flatMap { $0.allPanes() }
                 let sameObjects = Set(defaults.map(ObjectIdentifier.init)) == defaultControllerIds
+                // Identity on the PANE object graph too, not just controllers:
+                // a rebuilt pane tree inside surviving controllers would pass
+                // the controller check while silently respawning shells.
+                let samePanes = Set(panes.map(ObjectIdentifier.init)) == defaultPaneIds
                 let visible = defaults.contains { $0.window?.isVisible == true }
+                // kill(pid, 0) on the ORIGINAL pre-switch pids, post round-trip.
                 let survivors = defaultPids.filter { kill($0, 0) == 0 }.count
-                let dividers = defaults.flatMap { $0.allPanes() }
-                    .reduce(0) { $0 + $1.restoredDividerCount }
+                let dividers = panes.reduce(0) { $0 + $1.restoredDividerCount }
                 let framesStable = defaults.first?.window?.frame == defaultFrame
-                guard sameObjects, visible, survivors == defaultPids.count,
+                guard sameObjects, samePanes, visible, survivors == defaultPids.count,
                       !defaultPids.isEmpty, dividers == 0, framesStable else {
-                    print("SMOKE-FAIL live-switch show: sameObjects=\(sameObjects) visible=\(visible) pids=\(survivors)/\(defaultPids.count) dividers=\(dividers) framesStable=\(framesStable)")
+                    print("SMOKE-FAIL live-switch show: sameObjects=\(sameObjects) samePanes=\(samePanes) visible=\(visible) pids=\(survivors)/\(defaultPids.count) dividers=\(dividers) framesStable=\(framesStable)")
                     exit(1)
                 }
-                print("SMOKE-LIVE-SWITCH pids_survived=\(survivors) frames_stable=\(framesStable)")
+                print("SMOKE-LIVE-SWITCH pids_survived=\(survivors) same_panes=\(samePanes) frames_stable=\(framesStable)")
             }
             // Park leg (FR-51): B — hidden but live — gets parked, which DOES
             // close its windows (the explicit destructive-but-remembered
