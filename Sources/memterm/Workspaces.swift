@@ -1,11 +1,23 @@
 import AppKit
 import MemtermCore
 
-// Group G (FR-49..52): workspace runtime — switching, park/reopen, forget —
-// plus the switcher menu and the titlebar chip plumbing. Switching and parking
-// reuse the capture (flushSync) and restore (restoreWindows) pipelines that
-// reboot-restore already exercises: parking a workspace and surviving a reboot
-// are the same journal → restore path, which is the point of the feature.
+// Group G (FR-49..52, FR-59): workspace runtime — switching, park/reopen,
+// forget — plus the switcher menu and the titlebar chip plumbing.
+//
+// FR-59 (founder decision 2026-08-31): SWITCHING IS NON-DESTRUCTIVE. A switch
+// hides the outgoing workspace's windows (orderOut) and keeps every pane's pty
+// and process alive; switching back shows the same NSWindow objects at their
+// existing frames — no restore pipeline, no "restored" divider, no respawn.
+// The journal → resurrect pipeline runs ONLY when the processes are actually
+// gone: app launch, and reopening a PARKED workspace. Park stays the explicit
+// destructive-but-remembered gesture (capture + close windows + keep rows).
+//
+// EMPIRICAL FACT (probe, macOS 26.2): orderOut() dissolves native tab groups —
+// each hidden window lands in its own single-window group (frames survive).
+// So hiding records each group's tab order + selected tab (hiddenLayouts on
+// the delegate), showing regroups via addTabbedWindow, and topology capture of
+// hidden workspaces uses the recorded layout (captureGroups), never the
+// dissolved live tabGroups.
 
 extension MemtermAppDelegate {
 
@@ -21,10 +33,14 @@ extension MemtermAppDelegate {
 
     // MARK: - Core operations
 
-    /// Switch = capture + close the current workspace's windows, then bring
-    /// the target's back through the standard restore pipeline (ghost
-    /// scrollback + consent-gated ⌘R offers come free). Switching to a parked
-    /// workspace reopens (unparks) it.
+    /// FR-59: switch = hide/show. The outgoing workspace is captured (scoped
+    /// save) and its windows ordered out — controllers stay in `controllers`,
+    /// ptys and child processes untouched, capture keeps polling them. If the
+    /// target has hidden live windows they are shown again (same NSWindow
+    /// objects, same frames, regrouped from the recorded layout). ONLY a
+    /// target with no live windows (parked, or never materialized this
+    /// session) goes through the journal → resurrect pipeline. Switching to a
+    /// parked workspace reopens (unparks) it.
     func switchToWorkspace(_ id: String) {
         guard let engine = memory else { return }
         let workspaces = engine.store.listWorkspaces()
@@ -33,16 +49,17 @@ extension MemtermAppDelegate {
             focusWindows(ofWorkspace: id)
             return
         }
-        // Capture the outgoing workspace while its windows are still open.
+        // Capture the outgoing workspace while its windows are still visible.
         engine.flushSync()
         if target.isParked {
             engine.store.setWorkspaceParked(id, parked: false)  // reopen
         }
-        let outgoing = controllers.filter { $0.workspaceId == activeWorkspaceId }
+        let outgoingId = activeWorkspaceId
         isSwitchingWorkspaces = true
-        // Materialize the target BEFORE closing the old windows so the window
-        // count never hits zero (last-window-closed would terminate the app).
-        if !controllers.contains(where: { $0.workspaceId == id }) {
+        // Bring the target up FIRST, hide the outgoing after — the app never
+        // passes through a windowless moment.
+        if !showHiddenWindows(of: id) {
+            // Resurrect path: no live windows for this workspace exist.
             let restored = engine.store.loadState(workspaceId: id)
             if restored.isEmpty {
                 openNewWindow(in: id)
@@ -50,19 +67,96 @@ extension MemtermAppDelegate {
                 restoreWindows(restored, workspaceId: id)
             }
         }
-        for controller in outgoing { controller.close() }
+        hideWindows(of: outgoingId)
         isSwitchingWorkspaces = false
-        materializedWorkspaceIds.remove(activeWorkspaceId)
+        // The outgoing workspace stays materialized: its windows are live
+        // (hidden), so its topology keeps being captured in scope.
         materializedWorkspaceIds.insert(id)
         activeWorkspaceId = id
+        workspaceMRU.removeAll { $0 == outgoingId }
+        workspaceMRU.insert(outgoingId, at: 0)
         engine.store.setMeta("active_workspace_id", id)
-        focusWindows(ofWorkspace: id)
         rebuildWorkspaceMenu()
         engine.scheduleTopologySave()
     }
 
+    /// Orders out every window of `workspaceId` after recording its tab-group
+    /// layout (order + selection), because orderOut dissolves native tab
+    /// groups (see the header note). Nothing is closed; nothing is forgotten.
+    func hideWindows(of workspaceId: String) {
+        let members = controllers.filter { $0.workspaceId == workspaceId }
+        guard !members.isEmpty else { return }
+        let keyWindow = NSApp.keyWindow
+        var layout = HiddenWorkspaceLayout(
+            groups: [], keyTabId: members.first { $0.window === keyWindow }?.tabId)
+        for group in MemoryEngine.groupedControllers(members) {
+            // Strip order from the live tab group while it still exists.
+            let ordered: [TerminalWindowController]
+            if let tabWindows = group.first?.window?.tabGroup?.windows, tabWindows.count > 1 {
+                ordered = tabWindows.compactMap { w in group.first { $0.window === w } }
+            } else {
+                ordered = group
+            }
+            let selected = group.first { $0.window?.tabGroup?.selectedWindow === $0.window }
+            layout.groups.append(HiddenWorkspaceLayout.Group(
+                tabIds: ordered.map(\.tabId),
+                selectedTabId: (selected ?? ordered.first)?.tabId))
+            for controller in ordered { controller.window?.orderOut(nil) }
+        }
+        hiddenLayouts[workspaceId] = layout
+    }
+
+    /// Shows the hidden live windows of `workspaceId`, regrouping tabs from
+    /// the recorded layout and restoring the selected tab. Returns false when
+    /// the workspace has no live windows (caller falls back to resurrect).
+    /// Windows keep their frames — nothing here centers, cascades, or moves.
+    @discardableResult
+    func showHiddenWindows(of workspaceId: String) -> Bool {
+        let members = controllers.filter { $0.workspaceId == workspaceId }
+        guard !members.isEmpty else { return false }
+        let layout = hiddenLayouts.removeValue(forKey: workspaceId)
+        var byTab: [String: TerminalWindowController] = [:]
+        for member in members { byTab[member.tabId] = member }
+        var shown = Set<ObjectIdentifier>()
+        var focusTarget: TerminalWindowController?
+        for group in layout?.groups ?? [] {
+            let live = group.tabIds.compactMap { byTab[$0] }
+            guard let host = live.first, let hostWindow = host.window else { continue }
+            hostWindow.orderFront(nil)
+            shown.insert(ObjectIdentifier(host))
+            var anchor = hostWindow
+            for controller in live.dropFirst() {
+                guard let window = controller.window else { continue }
+                if hostWindow.tabGroup?.windows.contains(window) != true {
+                    // orderOut dissolved the group: re-tab in strip order.
+                    anchor.addTabbedWindow(window, ordered: .above)
+                }
+                window.orderFront(nil)
+                anchor = window
+                shown.insert(ObjectIdentifier(controller))
+            }
+            let selected = group.selectedTabId.flatMap { byTab[$0] } ?? host
+            selected.window?.makeKeyAndOrderFront(nil)
+            if focusTarget == nil || group.tabIds.contains(layout?.keyTabId ?? "") {
+                focusTarget = selected
+            }
+        }
+        // Members the layout doesn't cover (a tab moved into this hidden
+        // workspace, or a layout lost to a close): just bring them forward.
+        for member in members where !shown.contains(ObjectIdentifier(member)) {
+            member.window?.orderFront(nil)
+            if focusTarget == nil { focusTarget = member }
+        }
+        focusTarget?.window?.makeKeyAndOrderFront(nil)
+        return true
+    }
+
     /// Park = capture, close the windows, keep every journal row (FR-51).
-    /// The last open workspace can't be parked — the app always has a window.
+    /// FR-59: park stays destructive-but-remembered — parking a workspace with
+    /// live processes may terminate them; that is what the explicit gesture
+    /// means. (Switching away first only HIDES, so parking the active
+    /// workspace must close its now-hidden windows itself.) The last open
+    /// workspace can't be parked — the app always has a window.
     func parkWorkspace(_ id: String) {
         guard let engine = memory else { return }
         let workspaces = engine.store.listWorkspaces()
@@ -71,20 +165,23 @@ extension MemtermAppDelegate {
         if nonParked.count <= 1, nonParked.first?.id == id { return }
         if id == activeWorkspaceId {
             guard let fallback = nonParked.first(where: { $0.id != id }) else { return }
-            switchToWorkspace(fallback.id)  // captures + closes this one for us
-        } else if controllers.contains(where: { $0.workspaceId == id }) {
-            engine.flushSync()
+            switchToWorkspace(fallback.id)  // hides this one; capture ran in the switch
+        }
+        if controllers.contains(where: { $0.workspaceId == id }) {
+            engine.flushSync()  // capture the (possibly hidden) windows before closing
             isSwitchingWorkspaces = true
             for controller in controllers.filter({ $0.workspaceId == id }) { controller.close() }
             isSwitchingWorkspaces = false
             materializedWorkspaceIds.remove(id)
         }
+        hiddenLayouts.removeValue(forKey: id)
         engine.store.setWorkspaceParked(id, parked: true)
         rebuildWorkspaceMenu()
     }
 
     /// Forget = purge journal rows AND scrollback files (FR-50/57). The last
-    /// remaining workspace can't be forgotten.
+    /// remaining workspace can't be forgotten. Like park, this closes the
+    /// workspace's (possibly hidden) windows itself — switching only hides.
     func forgetWorkspace(_ id: String) {
         guard let engine = memory else { return }
         let workspaces = engine.store.listWorkspaces()
@@ -93,12 +190,13 @@ extension MemtermAppDelegate {
             let others = workspaces.filter { $0.id != id }
             guard let fallback = others.first(where: { !$0.isParked }) ?? others.first else { return }
             switchToWorkspace(fallback.id)
-        } else if controllers.contains(where: { $0.workspaceId == id }) {
+        }
+        if controllers.contains(where: { $0.workspaceId == id }) {
             isSwitchingWorkspaces = true
             for controller in controllers.filter({ $0.workspaceId == id }) { controller.close() }
             isSwitchingWorkspaces = false
-            materializedWorkspaceIds.remove(id)
         }
+        hiddenLayouts.removeValue(forKey: id)
         engine.store.forgetWorkspace(id, scrollbackDir: engine.scrollbackDir)
         engine.store.barrier()
         materializedWorkspaceIds.remove(id)
@@ -119,54 +217,58 @@ extension MemtermAppDelegate {
         controllers.first { $0.workspaceId == id }?.window?.makeKeyAndOrderFront(nil)
     }
 
-    /// FR-58: reassigns a live tab to another workspace. The tab stays on
-    /// screen — it joins the target's tab group when one is open, else stands
-    /// alone — and the next scoped topology save rewrites both workspaces'
-    /// rows (old without this tab, new with it; both are in captureScope via
-    /// materializedWorkspaceIds / the controllers list). Moving a tab into a
-    /// parked workspace reopens it: parked means "no windows on screen", and
-    /// this tab is on screen.
+    /// FR-58: reassigns a live tab to another workspace, then FOLLOWS the tab
+    /// (switches to the target) so the FR-59 invariant — exactly the active
+    /// workspace's windows are visible — holds. The next scoped topology save
+    /// rewrites both workspaces' rows (old without this tab, new with it; both
+    /// are in captureScope via materializedWorkspaceIds / the controllers
+    /// list). Moving a tab into a parked workspace reopens it.
     func moveTab(_ controller: TerminalWindowController, toWorkspace id: String) {
         guard controller.workspaceId != id, let engine = memory,
               let target = engine.store.listWorkspaces().first(where: { $0.id == id })
         else { return }
         if target.isParked { engine.store.setWorkspaceParked(id, parked: false) }
         // The scoped topology save that follows rewrites ALL of the target
-        // workspace's rows from what is on screen — so a target with journal
-        // rows but no windows (parked, or switched-away this session) must be
-        // materialized through the standard restore pipeline FIRST, or the
-        // save would erase its stored tabs, a forget the user never asked for
-        // (FR-51: park keeps every journal row; FR-56: only a user gesture
-        // forgets). This also keeps the invariant switchToWorkspace's
-        // materialize-guard relies on: a workspace with any window on screen
-        // has ALL its journaled windows on screen.
+        // workspace's rows from live windows — so a target with journal rows
+        // but no windows (parked this session) must be materialized through
+        // the standard restore pipeline FIRST, or the save would erase its
+        // stored tabs, a forget the user never asked for (FR-51: park keeps
+        // every journal row; FR-56: only a user gesture forgets). A target
+        // with HIDDEN live windows needs nothing: its windows are live and in
+        // capture scope already (FR-59).
         if !controllers.contains(where: { $0.workspaceId == id }) {
             let stored = engine.store.loadState(workspaceId: id)
             if !stored.isEmpty {
                 restoreWindows(stored, workspaceId: id)
             }
         }
-        let oldId = controller.workspaceId
         if let window = controller.window, let group = window.tabGroup,
            group.windows.count > 1 {
             group.removeWindow(window)
         }
         controller.setWorkspace(id)
+        // Join the target's tab group when one exists (hidden hosts count:
+        // the switch below will show the whole group, moved tab included).
         if let host = controllers.first(where: { $0 !== controller && $0.workspaceId == id })?.window,
            let moved = controller.window {
             host.addTabbedWindow(moved, ordered: .above)
         }
-        controller.window?.makeKeyAndOrderFront(nil)
+        // A moved tab joining a hidden group must be part of that group's
+        // recorded layout, or showHiddenWindows would strand it ungrouped.
+        // Simplest correct fix: drop the stale layout; the show path's
+        // fallback loop brings every member forward and live grouping (just
+        // re-established by addTabbedWindow) is intact again.
+        hiddenLayouts.removeValue(forKey: id)
         materializedWorkspaceIds.insert(id)
-        // Moving the active workspace's last tab away leaves it with nothing
-        // on screen; follow the tab so the "active" workspace is a visible one.
-        if oldId == activeWorkspaceId,
-           !controllers.contains(where: { $0.workspaceId == oldId }) {
-            activeWorkspaceId = id
-            engine.store.setMeta("active_workspace_id", id)
-        }
         rebuildWorkspaceMenu()
         engine.scheduleTopologySave()
+        // Follow the tab: the target becomes the visible workspace. (If the
+        // old workspace lost its last tab it simply hides with zero windows.)
+        if id != activeWorkspaceId {
+            switchToWorkspace(id)
+        } else {
+            controller.window?.makeKeyAndOrderFront(nil)
+        }
     }
 
     // MARK: - Menu actions

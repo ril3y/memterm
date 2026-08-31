@@ -15,6 +15,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let copyOnSelectCheck = NSButton(checkboxWithTitle: "Selecting text copies it", target: nil, action: nil)
     private let sameCwdCheck = NSButton(checkboxWithTitle: "New tabs open in the current directory", target: nil, action: nil)
     private let optionMetaCheck = NSButton(checkboxWithTitle: "Option key sends Esc+ (meta)", target: nil, action: nil)
+    private let alwaysTabBarCheck = NSButton(checkboxWithTitle: "Always show the tab bar", target: nil, action: nil)
     private let bellPopUp = NSPopUpButton()
     private let cursorPopUp = NSPopUpButton()
     private let scrollbackField = NSTextField()
@@ -67,6 +68,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         sameCwdCheck.action = #selector(controlChanged)
         optionMetaCheck.target = self
         optionMetaCheck.action = #selector(controlChanged)
+        alwaysTabBarCheck.target = self
+        alwaysTabBarCheck.action = #selector(controlChanged)
         // Popup rows mirror Config's valid-value lists index-for-index.
         bellPopUp.addItems(withTitles: ["None", "Sound", "Visual", "Sound and Visual"])
         bellPopUp.target = self
@@ -119,6 +122,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSGridCell.emptyContentView, copyOnSelectCheck],
             [NSGridCell.emptyContentView, sameCwdCheck],
             [NSGridCell.emptyContentView, optionMetaCheck],
+            [NSGridCell.emptyContentView, alwaysTabBarCheck],
             [NSTextField(labelWithString: "Cursor:"), cursorPopUp],
             [NSTextField(labelWithString: "Bell:"), bellPopUp],
             [NSTextField(labelWithString: "Scrollback:"), scrollbackField],
@@ -172,6 +176,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         copyOnSelectCheck.state = config.copyOnSelect ? .on : .off
         sameCwdCheck.state = config.newTabSameCwd ? .on : .off
         optionMetaCheck.state = config.optionAsMeta ? .on : .off
+        alwaysTabBarCheck.state = config.alwaysShowTabBar ? .on : .off
         bellPopUp.selectItem(at: Config.bellStyles.firstIndex(of: config.bellStyle) ?? 1)
         cursorPopUp.selectItem(at: Config.cursorStyles.firstIndex(of: config.cursorStyle) ?? 0)
         scrollbackField.integerValue = config.scrollbackLines
@@ -207,6 +212,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         config.copyOnSelect = copyOnSelectCheck.state == .on
         config.newTabSameCwd = sameCwdCheck.state == .on
         config.optionAsMeta = optionMetaCheck.state == .on
+        config.alwaysShowTabBar = alwaysTabBarCheck.state == .on
         if Config.bellStyles.indices.contains(bellPopUp.indexOfSelectedItem) {
             config.bellStyle = Config.bellStyles[bellPopUp.indexOfSelectedItem]
         }

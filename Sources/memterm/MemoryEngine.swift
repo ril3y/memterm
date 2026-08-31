@@ -128,16 +128,18 @@ final class MemoryEngine {
         return groups
     }
 
+    /// FR-59: grouping and focus come from app.captureGroups(), which uses the
+    /// live tab groups for visible windows and the recorded hide-time layout
+    /// for hidden ones (orderOut dissolves native tab groups, so reading them
+    /// directly would journal each hidden tab as its own window).
     private func snapshotTopology() -> [WindowSnap] {
-        MemoryEngine.groupedControllers(app.controllers).compactMap { members in
-            let tabs = members.compactMap { $0.snapshotTab() }
-            guard !tabs.isEmpty, let firstWindow = members[0].window else { return nil }
+        app.captureGroups().compactMap { group in
+            let tabs = group.members.compactMap { $0.snapshotTab() }
+            guard !tabs.isEmpty, let firstWindow = group.members[0].window else { return nil }
             let f = firstWindow.frame
             let frame = "\(Int(f.origin.x)),\(Int(f.origin.y)),\(Int(f.width)),\(Int(f.height))"
-            let focused = members.first { $0.window?.tabGroup?.selectedWindow === $0.window
-                                          || members.count == 1 }?.tabId
-            return WindowSnap(id: tabs[0].id, frame: frame, focusedTab: focused, tabs: tabs,
-                              workspaceId: members[0].workspaceId)
+            return WindowSnap(id: tabs[0].id, frame: frame, focusedTab: group.focusedTabId,
+                              tabs: tabs, workspaceId: group.members[0].workspaceId)
         }
     }
 
@@ -145,6 +147,8 @@ final class MemoryEngine {
 
     func pollNow() {
         guard !app.isTerminating else { return }
+        // app.controllers, never visible windows: hidden workspaces' panes
+        // (FR-59) are live and keep being captured exactly like visible ones.
         for controller in app.controllers {
             for pane in controller.allPanes() {
                 pollPane(pane)
@@ -203,6 +207,7 @@ final class MemoryEngine {
     func saveScrollback(force: Bool) {
         guard force || !app.isTerminating else { return }
         var livePaneIds = Set<String>()
+        // app.controllers: hidden workspaces' scrollback keeps flushing (FR-59).
         for controller in app.controllers {
             for pane in controller.allPanes() {
                 livePaneIds.insert(pane.paneId)

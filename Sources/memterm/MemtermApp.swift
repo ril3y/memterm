@@ -26,20 +26,65 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// Workspaces with windows on screen this session; scopes topology saves
     /// so switched-away / parked workspaces' journal rows are never erased.
     var materializedWorkspaceIds: Set<String> = []
-    /// Set while a switch/park tears windows down so the closes aren't
-    /// captured as topology mutations (same idea as isTerminating).
+    /// Set while park/forget tear windows down (and around a switch's
+    /// hide/show transition) so those events aren't captured as topology
+    /// mutations (same idea as isTerminating).
     var isSwitchingWorkspaces = false
     /// Shell ▸ Workspace submenu; rebuilt in place whenever workspaces change
     /// so its ⌃⌘n key equivalents stay live (FR-52).
     let workspaceMenu = NSMenu(title: "Workspace")
 
+    // -- FR-59: non-destructive switching state --
+    /// Tab-group layout of each workspace hidden by switchToWorkspace, keyed
+    /// by workspace id. Needed because orderOut() dissolves native tab groups
+    /// (verified empirically on macOS 26.2): the show path regroups from this,
+    /// and captureGroups() uses it so a hidden workspace's topology keeps
+    /// journaling as the tab groups it had on screen.
+    var hiddenLayouts: [String: HiddenWorkspaceLayout] = [:]
+    /// Workspaces most-recently switched AWAY from, newest first — the pick
+    /// order when the active workspace's last visible window closes and a
+    /// hidden workspace must be surfaced (FR-59 corollary).
+    var workspaceMRU: [String] = []
+
     /// The workspaces a topology capture may rewrite: everything that is (or
     /// was, this session) on screen. Parked and never-opened workspaces stay out.
+    /// Hidden workspaces stay IN: their windows are live and still captured.
     func captureScope() -> Set<String> {
         var scope = materializedWorkspaceIds
         scope.insert(activeWorkspaceId)
         for controller in controllers { scope.insert(controller.workspaceId) }
         return scope
+    }
+
+    /// The controller groups a topology capture should treat as windows, with
+    /// the focused tab per group. Visible windows group by their live native
+    /// tab group; HIDDEN windows group by the layout recorded when they were
+    /// ordered out (their live tab groups are dissolved — see hiddenLayouts).
+    func captureGroups() -> [CaptureGroup] {
+        var groups: [CaptureGroup] = []
+        var claimed = Set<ObjectIdentifier>()
+        for workspaceId in hiddenLayouts.keys.sorted() {
+            guard let layout = hiddenLayouts[workspaceId] else { continue }
+            for group in layout.groups {
+                let members = group.tabIds.compactMap { tabId in
+                    controllers.first { $0.tabId == tabId && $0.workspaceId == workspaceId }
+                }
+                guard !members.isEmpty else { continue }
+                for member in members { claimed.insert(ObjectIdentifier(member)) }
+                let focused = group.selectedTabId.flatMap { id in
+                    members.contains { $0.tabId == id } ? id : nil
+                }
+                groups.append(CaptureGroup(members: members,
+                                           focusedTabId: focused ?? members[0].tabId))
+            }
+        }
+        let rest = controllers.filter { !claimed.contains(ObjectIdentifier($0)) }
+        for group in MemoryEngine.groupedControllers(rest) {
+            let focused = group.first { $0.window?.tabGroup?.selectedWindow === $0.window
+                                        || group.count == 1 }?.tabId
+            groups.append(CaptureGroup(members: group, focusedTabId: focused))
+        }
+        return groups
     }
 
     init(smokeMode: Bool = false) {
@@ -239,7 +284,33 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         (sender.representedObject as? MoveTabRequest)?.controller?.close()
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// FR-59 corollary: hidden live controllers keep the app alive — closing
+    /// the last VISIBLE window must never quit while other workspaces hold
+    /// live (hidden) windows. With no controllers left at all, quit as before.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        controllers.isEmpty
+    }
+
+    /// Called from windowWillClose after the controller is deregistered. When
+    /// a user gesture closed the active workspace's last visible window and
+    /// hidden live windows exist elsewhere, surface the most recently used
+    /// hidden workspace instead of sitting windowless (FR-59 corollary). The
+    /// switch is deferred: never re-enter window plumbing from inside a close.
+    func activeWorkspaceWindowClosed(_ workspaceId: String, userInitiated: Bool) {
+        guard userInitiated, workspaceId == activeWorkspaceId,
+              !controllers.contains(where: { $0.workspaceId == workspaceId }),
+              !controllers.isEmpty else { return }
+        let hidden = Set(controllers.map { $0.workspaceId })
+        guard let pick = SwitchSupport.mruPick(candidates: hidden,
+                                               mostRecentFirst: workspaceMRU) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  !self.controllers.contains(where: { $0.workspaceId == self.activeWorkspaceId }),
+                  self.controllers.contains(where: { $0.workspaceId == pick })
+            else { return }
+            self.switchToWorkspace(pick)
+        }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         memory?.flushSync()   // windows still open: the snapshot is the live layout
@@ -278,11 +349,17 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         refreshWorkspaceChips()
     }
 
+    /// FR-59 frame stability, resurrect path: the journaled frame is used
+    /// as-is; only a frame that would land fully off every screen is adjusted
+    /// (monitor unplugged since capture). The pure containment/clamp logic is
+    /// SwitchSupport.adjustedFrame, unit-tested headlessly.
     private func parseFrame(_ s: String?) -> NSRect? {
         guard let s else { return nil }
         let parts = s.split(separator: ",").compactMap { Double($0) }
         guard parts.count == 4, parts[2] > 50, parts[3] > 50 else { return nil }
-        return NSRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+        let frame = NSRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+        return SwitchSupport.adjustedFrame(frame,
+                                           visibleFrames: NSScreen.screens.map(\.visibleFrame))
     }
 
     // MARK: - Smoke test (deterministic capture/restore gate, no interaction)
@@ -300,21 +377,62 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 self.controllers.first?.allPanes().first?.send(txt: "cd /tmp\r")
             }
             var workspaceB: String?
+            // FR-59 live-switch leg state: Default's identity before switching.
+            var defaultControllerIds = Set<ObjectIdentifier>()
+            var defaultPids: [pid_t] = []
+            var defaultFrame = NSRect.zero
+            func defaultControllers() -> [TerminalWindowController] {
+                self.controllers.filter { $0.workspaceId == StateStore.defaultWorkspaceId }
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) {
                 self.memory?.flushSync()
                 guard let counts = self.memory?.store.counts() else { exit(1) }
                 print("SMOKE-SAVED windows=\(counts.windows) tabs=\(counts.tabs) panes=\(counts.panes)")
-                // Workspace leg (FR-49..51): create B and switch to it — the
-                // switch captures + closes Default's windows and opens B fresh.
+                // FR-59 leg: record Default's controllers, shell pids, and
+                // frame, then switch to a fresh workspace B. The switch must
+                // HIDE Default — same objects, processes untouched.
+                let defaults = defaultControllers()
+                defaultControllerIds = Set(defaults.map(ObjectIdentifier.init))
+                defaultPids = defaults.flatMap { $0.allPanes() }
+                    .compactMap { $0.process?.shellPid }
+                defaultFrame = defaults.first?.window?.frame ?? .zero
                 workspaceB = self.createWorkspace(named: "B")
                 if let b = workspaceB { self.switchToWorkspace(b) }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.3) {
-                // Switch back: Default's tabs come back through the standard
-                // restore pipeline (ghost scrollback + offers included).
+                // Hidden, not closed: windows off screen, shells alive,
+                // controllers still registered.
+                let defaults = defaultControllers()
+                let hidden = !defaults.isEmpty
+                    && defaults.allSatisfy { $0.window?.isVisible != true }
+                let alive = defaultPids.allSatisfy { kill($0, 0) == 0 }
+                let sameObjects = Set(defaults.map(ObjectIdentifier.init)) == defaultControllerIds
+                guard hidden, alive, sameObjects else {
+                    print("SMOKE-FAIL live-switch hide: hidden=\(hidden) alive=\(alive) sameObjects=\(sameObjects)")
+                    exit(1)
+                }
+                // Switch back: hide/show, NOT the restore pipeline.
                 self.switchToWorkspace(StateStore.defaultWorkspaceId)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 6.1) {
+                let defaults = defaultControllers()
+                let sameObjects = Set(defaults.map(ObjectIdentifier.init)) == defaultControllerIds
+                let visible = defaults.contains { $0.window?.isVisible == true }
+                let survivors = defaultPids.filter { kill($0, 0) == 0 }.count
+                let dividers = defaults.flatMap { $0.allPanes() }
+                    .reduce(0) { $0 + $1.restoredDividerCount }
+                let framesStable = defaults.first?.window?.frame == defaultFrame
+                guard sameObjects, visible, survivors == defaultPids.count,
+                      !defaultPids.isEmpty, dividers == 0, framesStable else {
+                    print("SMOKE-FAIL live-switch show: sameObjects=\(sameObjects) visible=\(visible) pids=\(survivors)/\(defaultPids.count) dividers=\(dividers) framesStable=\(framesStable)")
+                    exit(1)
+                }
+                print("SMOKE-LIVE-SWITCH pids_survived=\(survivors) frames_stable=\(framesStable)")
+            }
+            // Park leg (FR-51): B — hidden but live — gets parked, which DOES
+            // close its windows (the explicit destructive-but-remembered
+            // gesture), so both switch semantics are exercised in one run.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.9) {
                 guard let engine = self.memory, let b = workspaceB else { exit(1) }
                 self.parkWorkspace(b)
                 engine.flushSync()
@@ -327,7 +445,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             // FR-56 leg: deliberately close one tab (the single-pane one) —
             // a user gesture, so it must be forgotten. Run 2 asserts it is
             // NOT restored while everything else is.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6.9) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 7.7) {
                 guard let doomed = self.controllers.first(where: {
                     $0.workspaceId == self.activeWorkspaceId && $0.allPanes().count == 1
                 }) else {
@@ -335,9 +453,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                     exit(1)
                 }
                 print("SMOKE-CLOSED tab=\(doomed.tabId)")
-                doomed.close()  // neither isTerminating nor isSwitchingWorkspaces: forgets
+                doomed.close()  // active-workspace user close: forgets
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 7.7) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.5) {
                 guard let engine = self.memory else { exit(1) }
                 engine.flushSync()
                 let counts = engine.store.counts()
@@ -481,6 +599,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         for controller in controllers {
             controller.applyFont(font)
             controller.applyTheme(config)
+            // Safe to call per controller: applyTabBarPolicy checks the live
+            // bar state, so the first controller of a group flips it and the
+            // rest no-op.
+            controller.applyTabBarPolicy(alwaysShow: config.alwaysShowTabBar)
         }
         refreshWorkspaceChips()  // workspace_bar visibility follows the config
         config.save()
@@ -585,4 +707,28 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         pane.send(txt: command)
         pane.pendingResumeCommand = nil
     }
+}
+
+// MARK: - FR-59 supporting types
+
+/// The native-tab-group layout of a workspace at the moment it was hidden:
+/// per group, the member tabIds in strip order and the selected tab, plus
+/// which tab held key status. Recorded by hideWindows, consumed by
+/// showHiddenWindows (regrouping) and captureGroups (topology fidelity),
+/// because orderOut() dissolves live tab groups.
+struct HiddenWorkspaceLayout {
+    struct Group {
+        var tabIds: [String]
+        var selectedTabId: String?
+    }
+
+    var groups: [Group]
+    var keyTabId: String?
+}
+
+/// One journal "window": the tab controllers that form (or formed, while
+/// hidden) a native tab group, plus its focused tab.
+struct CaptureGroup {
+    let members: [TerminalWindowController]
+    let focusedTabId: String?
 }

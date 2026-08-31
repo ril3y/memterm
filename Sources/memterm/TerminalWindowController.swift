@@ -122,6 +122,27 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
+    // MARK: - Tab bar policy (founder: single-tab windows must show their tab)
+
+    /// `always_show_tab_bar`: with one tab, macOS hides the tab bar, making
+    /// double-click rename unreachable — toggle it visible. The check makes
+    /// this idempotent (toggleTabBar is a flip, never call it blind), which
+    /// also means calling it for several controllers of one tab group is safe:
+    /// the first call flips, the rest see the bar already visible and no-op.
+    func applyTabBarPolicy(alwaysShow: Bool) {
+        guard let window, let group = window.tabGroup else { return }
+        if alwaysShow, !group.isTabBarVisible {
+            window.toggleTabBar(nil)
+        } else if !alwaysShow, group.isTabBarVisible, group.windows.count <= 1 {
+            window.toggleTabBar(nil)
+        }
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        if app.config.alwaysShowTabBar { applyTabBarPolicy(alwaysShow: true) }
+    }
+
     // MARK: - Workspace chip (FR-50: titlebar control)
 
     private func installWorkspaceChip(on window: NSWindow) {
@@ -411,6 +432,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         }
         let stamp = Self.restoreDateFormatter.string(from: Date())
         pane.feed(text: "\u{1b}[36m── restored — \(stamp) ──\u{1b}[0m\r\n")
+        pane.restoredDividerCount += 1
         if fellBack, let saved = restore?.cwd {
             pane.feed(text: "\u{1b}[2mmemterm: directory not available: \(saved)\u{1b}[0m\r\n")
         }
@@ -531,10 +553,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             return
         }
         // FR-56: a user-initiated pane close forgets that pane NOW — journal
-        // rows and scrollback bytes. Quit/switch teardown never reaches here
+        // rows and scrollback bytes. Quit/park teardown never reaches here
         // (windowWillClose detaches processDelegate before terminating), but
-        // the flags guard it anyway.
-        if !app.isTerminating && !app.isSwitchingWorkspaces {
+        // the flags guard it anyway. FR-59: a pane in a HIDDEN workspace can
+        // only get here via processTerminated (its shell died on its own) —
+        // no user gesture is possible there, so it never forgets.
+        if !app.isTerminating && !app.isSwitchingWorkspaces
+            && workspaceId == app.activeWorkspaceId {
             app.memory?.forgetPane(pane.paneId)
         }
         split.removeArrangedSubview(pane)
@@ -673,6 +698,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     func windowDidBecomeKey(_ notification: Notification) {
         activity.recordSelected()
         refreshActivityIndicator()
+        // Re-assert only the "show" half of the policy here: closing the
+        // second-to-last tab makes AppKit hide the bar again, and the surviving
+        // tab becomes key right after. (The "hide" half runs only on an
+        // explicit settings change — never fight a user who showed it by hand.)
+        if app.config.alwaysShowTabBar { applyTabBarPolicy(alwaysShow: true) }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -680,9 +710,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         activityRefreshWork = nil
         // FR-56 discrimination: this fires for user closes (⌘W, close button,
         // native tab close) AND for teardown closes (⌘Q quit, workspace
-        // switch/park). Only the user gesture forgets — quit is "put it
+        // park/forget). Only the user gesture forgets — quit is "put it
         // down", close is "throw it away", crash runs nothing at all.
+        // FR-59: a hidden workspace's window has no on-screen UI, so no user
+        // gesture can close it — if macOS ever closes one behind our back,
+        // that is teardown, never a forget.
         let userInitiated = !app.isTerminating && !app.isSwitchingWorkspaces
+            && workspaceId == app.activeWorkspaceId
         let paneIds = allPanes().map { $0.paneId }
         for pane in allPanes() {
             pane.processDelegate = nil
@@ -697,6 +731,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             app.memory?.forgetTab(tabId: tabId, paneIds: paneIds)
         }
         app.memory?.scheduleTopologySave()
+        // FR-59 corollary: never leave the app windowless while other
+        // workspaces hold hidden live windows — surface the MRU one.
+        app.activeWorkspaceWindowClosed(workspaceId, userInitiated: userInitiated)
     }
 
     func windowDidResize(_ notification: Notification) {

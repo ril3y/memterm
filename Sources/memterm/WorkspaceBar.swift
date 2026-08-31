@@ -218,8 +218,9 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             beginRename()
             return
         }
-        // Deferred: switching closes this chip's own window (the outgoing
-        // workspace's) — never tear the window down from inside its mouseDown.
+        // Deferred: switching orders out this chip's own window (the outgoing
+        // workspace's, FR-59 hide/show) — never hide the window from inside
+        // its own mouseDown.
         let id = workspaceId
         DispatchQueue.main.async { [weak app = self.app] in
             app?.switchToWorkspace(id)

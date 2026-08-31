@@ -23,6 +23,7 @@ final class ConfigTests: XCTestCase {
         c.fontSize = 15
         c.copyOnSelect = false
         c.workspaceBar = false
+        c.alwaysShowTabBar = false
         c.scrollbackLines = 4321
         c.shell = "/opt/homebrew/bin/fish"
         c.newTabSameCwd = false
@@ -39,6 +40,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(parsed.fontSize, c.fontSize)
         XCTAssertEqual(parsed.copyOnSelect, c.copyOnSelect)
         XCTAssertEqual(parsed.workspaceBar, c.workspaceBar)
+        XCTAssertEqual(parsed.alwaysShowTabBar, c.alwaysShowTabBar)
         XCTAssertEqual(parsed.scrollbackLines, c.scrollbackLines)
         XCTAssertEqual(parsed.shell, c.shell)
         XCTAssertEqual(parsed.newTabSameCwd, c.newTabSameCwd)
@@ -57,6 +59,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(parsed.fontSize, 13)
         XCTAssertTrue(parsed.copyOnSelect)
         XCTAssertTrue(parsed.workspaceBar, "the workspace bar shows by default")
+        XCTAssertTrue(parsed.alwaysShowTabBar, "single-tab windows show their tab bar by default")
         XCTAssertEqual(parsed.scrollbackLines, 10_000)
         XCTAssertNil(parsed.shell)
         XCTAssertTrue(parsed.newTabSameCwd, "new tabs inherit the cwd by default")

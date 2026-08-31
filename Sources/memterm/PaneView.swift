@@ -21,6 +21,11 @@ final class PaneView: LocalProcessTerminalView {
     var cwdSource = "spawn"
     /// The captured command ⌘R types into the pty (never executed — FR-29).
     var pendingResumeCommand: String?
+    /// FR-59 guard rail: how many "── restored ──" dividers were ever fed into
+    /// this pane. The resurrect path increments it; a workspace switch must
+    /// not (switching is hide/show, never restore) — the smoke gate asserts
+    /// this stays 0 across a switch round-trip.
+    var restoredDividerCount = 0
     /// Shell executable this pane spawned; restored panes respawn the same one.
     var shellPath: String?
     /// Set by the host controller: pty output arrived (tab activity
