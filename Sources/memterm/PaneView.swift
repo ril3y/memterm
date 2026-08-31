@@ -23,6 +23,10 @@ final class PaneView: LocalProcessTerminalView {
     var pendingResumeCommand: String?
     /// Shell executable this pane spawned; restored panes respawn the same one.
     var shellPath: String?
+    /// Set by the host controller: pty output arrived (tab activity
+    /// indicator). Fired from dataReceived on the main thread; the controller
+    /// coalesces, so this stays cheap per chunk.
+    var onOutputActivity: (() -> Void)?
 
     // -- Search state (FR-4, plumbing in FindBar.swift) --
     /// This pane's ⌘F find bar, created lazily on first use.
@@ -69,6 +73,15 @@ final class PaneView: LocalProcessTerminalView {
             return super.menu(for: event)
         }
         return controller.contextMenu(for: self)
+    }
+
+    /// Founder UX: live tab-activity marks. LocalProcess delivers pty data on
+    /// DispatchQueue.main (its default dispatchQueue — verified in
+    /// LocalProcess.swift), so this runs on the main thread; super parses the
+    /// bytes into the terminal first.
+    override func dataReceived(slice: ArraySlice<UInt8>) {
+        super.dataReceived(slice: slice)
+        onOutputActivity?()
     }
 
     override func otherMouseDown(with event: NSEvent) {

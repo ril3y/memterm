@@ -9,6 +9,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     private(set) var config = Config.load()
     private var settingsController: SettingsWindowController?
     private var tabRenameClickMonitor: Any?
+    private var tabContextMenuMonitor: Any?
     private(set) var controllers: [TerminalWindowController] = []
     private var fontSize: CGFloat
     private(set) var memory: MemoryEngine?
@@ -104,19 +105,138 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         tabRenameClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) {
             [weak self] event in
             guard let self, event.clickCount == 2,
-                  let window = event.window,
-                  window.tabGroup?.isTabBarVisible == true,
-                  self.controllers.contains(where: { $0.window === window }) else { return event }
-            let y = event.locationInWindow.y
-            let tabStripBottom = window.contentLayoutRect.maxY
-            let titlebarBottom = window.frame.height - 28
-            guard y >= tabStripBottom, y <= titlebarBottom else { return event }
+                  self.tabStripController(for: event) != nil else { return event }
             DispatchQueue.main.async { self.keyController()?.promptRenameTab() }
             return nil  // swallow: nothing else should react to this gesture
         }
 
+        // Founder UX stage: right-click on the tab strip pops OUR tab menu
+        // (the native tab context menu is private AppKit — established at the
+        // FR-58 stage — so it can't be extended, only replaced). The event is
+        // swallowed so the private menu doesn't double-show; clicks outside
+        // the strip region (titlebar proper, workspace bar, content) pass
+        // through untouched, keeping any native behavior there.
+        tabContextMenuMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) {
+            [weak self] event in
+            guard let self, let controller = self.tabStripController(for: event)
+            else { return event }
+            self.showTabContextMenu(for: controller, event: event)
+            return nil
+        }
+
         NSApp.activate(ignoringOtherApps: true)
         if smokeMode { runSmoke(restoredAnything: restoredAnything) }
+        // MEMTERM_UI_PROBE=1: geometry self-check for the titlebar surfaces
+        // (workspace bar under the tab strip, tab accessory) — the headless
+        // stand-in for eyeballing when no screen capture is available.
+        if ProcessInfo.processInfo.environment["MEMTERM_UI_PROBE"] == "1" { runUIProbe() }
+    }
+
+    private func runUIProbe() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            self.newWindowForTab(nil)  // second tab so the tab bar is visible
+            _ = self.createWorkspace(named: "Probe")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            guard let controller = self.keyController(), let window = controller.window else {
+                print("UIPROBE-FAIL no window"); exit(1)
+            }
+            let bar = controller.workspaceBar
+            let barFrame = bar.map { $0.convert($0.bounds, to: nil) } ?? .zero
+            let content = window.contentLayoutRect
+            print("UIPROBE window_h=\(Int(window.frame.height)) content_maxY=\(Int(content.maxY))")
+            print("UIPROBE bar_frame=\(Int(barFrame.minX)),\(Int(barFrame.minY)),\(Int(barFrame.width)),\(Int(barFrame.height)) in_window=\(bar?.window === window)")
+            print("UIPROBE tabstrip_bottom=\(Int(controller.tabStripBottomY())) tab_bar_visible=\(window.tabGroup?.isTabBarVisible == true)")
+            print("UIPROBE chips=\(bar?.chipTitlesForProbe() ?? []) accessory_set=\(window.tab.accessoryView != nil)")
+        }
+        // Activity-indicator leg: output lands on the FIRST tab while the
+        // second (created above) is selected → active → decays to unseen →
+        // clears when the tab is selected.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            self.controllers.first?.allPanes().first?.send(txt: "echo probe-activity\r")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+            print("UIPROBE-ACT after_output=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.4) {
+            print("UIPROBE-ACT after_decay=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
+            self.controllers.first?.window?.makeKeyAndOrderFront(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.8) {
+            print("UIPROBE-ACT after_select=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
+            exit(0)
+        }
+    }
+
+    // MARK: - Tab-strip gestures (shared region logic for both monitors)
+
+    /// The tab this gesture applies to, when the event lands on the native
+    /// tab strip of one of our windows: between the top of the workspace bar
+    /// (or contentLayoutRect.maxY when the bar is hidden) and the bottom of
+    /// the titlebar proper. Returns the controller of the window that
+    /// received the event — the selected tab of its group.
+    private func tabStripController(for event: NSEvent) -> TerminalWindowController? {
+        guard let window = event.window,
+              window.tabGroup?.isTabBarVisible == true,
+              let controller = controllers.first(where: { $0.window === window })
+        else { return nil }
+        let y = event.locationInWindow.y
+        let tabStripBottom = controller.tabStripBottomY()
+        let titlebarBottom = window.frame.height - 28
+        guard y >= tabStripBottom, y <= titlebarBottom else { return nil }
+        return controller
+    }
+
+    /// Founder UX stage: our tab context menu. A right-click can't select a
+    /// private tab item, so it applies to the SELECTED tab of the clicked
+    /// window group — the disabled header names it to keep the target
+    /// unambiguous.
+    private func showTabContextMenu(for controller: TerminalWindowController, event: NSEvent) {
+        let menu = NSMenu(title: "Tab")
+        let header = NSMenuItem(title: "Tab “\(controller.window?.title ?? "memterm")”",
+                                action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(.separator())
+
+        func add(_ title: String, _ action: Selector) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = MoveTabRequest(controller: controller, workspaceId: nil)
+            menu.addItem(item)
+        }
+        add("Rename Tab…", #selector(ctxTabRename(_:)))
+        let moveItem = NSMenuItem(title: "Move to Workspace", action: nil, keyEquivalent: "")
+        moveItem.submenu = makeMoveTabSubmenu(for: controller)
+        menu.addItem(moveItem)
+        add("New Workspace from Tab…", #selector(newWorkspaceFromTabItem(_:)))
+        menu.addItem(.separator())
+        add("Forget Tab Memory", #selector(ctxTabForget(_:)))
+        menu.addItem(.separator())
+        add("Close Tab", #selector(ctxTabClose(_:)))
+
+        guard let contentView = event.window?.contentView else { return }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        menu.popUp(positioning: nil, at: point, in: contentView)
+    }
+
+    @objc private func ctxTabRename(_ sender: NSMenuItem) {
+        (sender.representedObject as? MoveTabRequest)?.controller?.promptRenameTab()
+    }
+
+    /// FR-57 for the clicked tab (same semantics as Shell ▸ Forget Tab
+    /// Memory: rows + scrollback files go now, capture restarts fresh).
+    @objc private func ctxTabForget(_ sender: NSMenuItem) {
+        guard let controller = (sender.representedObject as? MoveTabRequest)?.controller
+        else { return }
+        memory?.forgetTab(tabId: controller.tabId,
+                          paneIds: controller.allPanes().map { $0.paneId })
+    }
+
+    /// FR-56: closing from the menu is a user gesture — windowWillClose runs
+    /// the standard forget path.
+    @objc private func ctxTabClose(_ sender: NSMenuItem) {
+        (sender.representedObject as? MoveTabRequest)?.controller?.close()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -346,6 +466,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             controller.applyFont(font)
             controller.applyTheme(config)
         }
+        refreshWorkspaceChips()  // workspace_bar visibility follows the config
         config.save()
     }
 

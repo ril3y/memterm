@@ -22,6 +22,7 @@ final class ConfigTests: XCTestCase {
         c.fontFamily = "MesloLGS NF"
         c.fontSize = 15
         c.copyOnSelect = false
+        c.workspaceBar = false
         c.scrollbackLines = 4321
         c.shell = "/opt/homebrew/bin/fish"
         c.themeBackground = ConfigRGB(red: 0x1d, green: 0x1f, blue: 0x21)
@@ -33,6 +34,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(parsed.fontFamily, c.fontFamily)
         XCTAssertEqual(parsed.fontSize, c.fontSize)
         XCTAssertEqual(parsed.copyOnSelect, c.copyOnSelect)
+        XCTAssertEqual(parsed.workspaceBar, c.workspaceBar)
         XCTAssertEqual(parsed.scrollbackLines, c.scrollbackLines)
         XCTAssertEqual(parsed.shell, c.shell)
         XCTAssertEqual(parsed.themeBackground, c.themeBackground)
@@ -46,6 +48,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertNil(parsed.fontFamily)
         XCTAssertEqual(parsed.fontSize, 13)
         XCTAssertTrue(parsed.copyOnSelect)
+        XCTAssertTrue(parsed.workspaceBar, "the workspace bar shows by default")
         XCTAssertEqual(parsed.scrollbackLines, 10_000)
         XCTAssertNil(parsed.shell)
         XCTAssertNil(parsed.themeBackground)

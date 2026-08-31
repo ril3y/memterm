@@ -39,6 +39,16 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     /// Titlebar workspace chip (color dot + name; click = switcher menu).
     /// FR-58: right-click opens the same switcher menu as left-click.
     private let workspaceChipButton = ChipButton()
+    /// The always-visible workspace bar under the tab bar (WorkspaceBar.swift),
+    /// pinned to the top of the content view; the pane tree lives in
+    /// `terminalContainer` beneath it.
+    private(set) var workspaceBar: WorkspaceBarView?
+    private let terminalContainer = NSView()
+    /// Per-tab activity indicator (spinner while output flows on a
+    /// non-selected tab, decaying to an unseen-output dot; TabActivity.swift).
+    private let activityIndicator = TabActivityIndicatorView()
+    private var activity = TabActivityTracker()
+    private var activityRefreshWork: DispatchWorkItem?
 
     init(app: MemtermAppDelegate, workspaceId: String = StateStore.defaultWorkspaceId,
          restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil) {
@@ -62,6 +72,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         super.init(window: window)
         window.delegate = self
         installWorkspaceChip(on: window)
+        window.tab.accessoryView = activityIndicator
         // PINNED DEPENDENCY: NSWindow.firstResponder is not documented as
         // KVO-compliant (it works on every macOS to date). If a macOS update
         // stops emitting changes here, focusedPane stops updating and
@@ -76,13 +87,21 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
         let content = NSView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
         window.contentView = content
+        terminalContainer.frame = content.bounds
+        terminalContainer.autoresizingMask = [.width, .height]
+        content.addSubview(terminalContainer)
+        let bar = WorkspaceBarView(app: app)
+        workspaceBar = bar
+        content.addSubview(bar)
+        layoutWorkspaceBar(visible: app.config.workspaceBar)
         let root: NSView
         if let restoredTab {
-            root = buildNode(restoredTab.tree, frame: content.bounds, panes: restoredTab.panes)
+            root = buildNode(restoredTab.tree, frame: terminalContainer.bounds,
+                             panes: restoredTab.panes)
         } else {
-            root = makePane(frame: content.bounds, cwd: nil)
+            root = makePane(frame: terminalContainer.bounds, cwd: nil)
         }
-        content.addSubview(root)
+        terminalContainer.addSubview(root)
         if let restoredTab, !restoredTab.title.isEmpty {
             // Only custom names are journaled (auto titles regenerate live).
             customTitle = restoredTab.title
@@ -116,6 +135,41 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         accessory.view = container
         accessory.layoutAttribute = .right
         window.addTitlebarAccessoryViewController(accessory)
+    }
+
+    // MARK: - Workspace bar (founder UX: visible workspaces, inline rename)
+
+    /// Pins the bar to the top of the content view and gives the terminal
+    /// container the rest. (A titlebar accessory was tried first — see the
+    /// header note in WorkspaceBar.swift for why content-view placement won.)
+    private func layoutWorkspaceBar(visible: Bool) {
+        guard let content = window?.contentView, let bar = workspaceBar else { return }
+        bar.isHidden = !visible
+        let barHeight = visible ? WorkspaceBarView.height : 0
+        bar.frame = NSRect(x: 0, y: content.bounds.height - WorkspaceBarView.height,
+                           width: content.bounds.width, height: WorkspaceBarView.height)
+        bar.autoresizingMask = [.width, .minYMargin]
+        terminalContainer.frame = NSRect(x: 0, y: 0, width: content.bounds.width,
+                                         height: content.bounds.height - barHeight)
+    }
+
+    func updateWorkspaceBar(workspaces: [WorkspaceRow], activeId: String) {
+        workspaceBar?.update(workspaces: workspaces, activeId: activeId)
+        let visible = app.config.workspaceBar
+        if workspaceBar?.isHidden == visible {  // visibility flipped in config
+            layoutWorkspaceBar(visible: visible)
+        }
+    }
+
+    func beginWorkspaceRename(_ workspaceId: String) {
+        workspaceBar?.beginRename(workspaceId: workspaceId)
+    }
+
+    /// Bottom edge (window coords) of the native tab strip. The workspace bar
+    /// lives inside the content view, so this is simply contentLayoutRect.maxY.
+    /// Shared by the double-click-rename and right-click-menu monitors.
+    func tabStripBottomY() -> CGFloat {
+        window?.contentLayoutRect.maxY ?? 0
     }
 
     func updateWorkspaceChip(name: String, color: NSColor) {
@@ -222,7 +276,59 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let fg = config.themeForegroundColor { pane.nativeForegroundColor = fg }
         if let cursor = config.themeCursorColor { pane.caretColor = cursor }
         if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
+        pane.onOutputActivity = { [weak self] in self?.paneProducedOutput() }
         return pane
+    }
+
+    // MARK: - Tab activity (founder UX: spinner / unseen dot on the tab)
+
+    /// "Selected" for activity purposes: the tab the user is looking at in its
+    /// window. A window not in a multi-tab group is its own selected tab.
+    private var isSelectedTab: Bool {
+        guard let window else { return true }
+        if let group = window.tabGroup, group.windows.count > 1 {
+            return group.selectedWindow === window
+        }
+        return true
+    }
+
+    /// Called from PaneView.dataReceived (main thread — LocalProcess delivers
+    /// on DispatchQueue.main). Coalesced by the tracker to ≤1 UI update per
+    /// 250 ms per tab, so flood output never churns the tab bar.
+    func paneProducedOutput() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if activity.recordOutput(at: now, isSelected: isSelectedTab) {
+            refreshActivityIndicator()
+        } else {
+            scheduleActivityRefresh(after: activity.coalesceInterval)
+        }
+    }
+
+    private func refreshActivityIndicator() {
+        activityRefreshWork?.cancel()
+        activityRefreshWork = nil
+        let now = ProcessInfo.processInfo.systemUptime
+        activityIndicator.apply(state: activity.state(at: now))
+        // While active, one more repaint just past the decay boundary flips
+        // the spinner to the solid unseen-output dot.
+        if let decayAt = activity.nextDecay(after: now) {
+            scheduleActivityRefresh(after: decayAt - now + 0.05)
+        }
+    }
+
+    /// MEMTERM_UI_PROBE support: the tracker's current state.
+    func activityStateForProbe() -> TabActivityState {
+        activity.state(at: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func scheduleActivityRefresh(after delay: TimeInterval) {
+        guard activityRefreshWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.activityRefreshWork = nil
+            self?.refreshActivityIndicator()
+        }
+        activityRefreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0.05), execute: work)
     }
 
     private func startShell(in pane: PaneView, cwd: String?, shellOverride: String? = nil) {
@@ -310,7 +416,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     // MARK: - Capture (split tree snapshot for the state store)
 
     func snapshotTab() -> TabSnap? {
-        guard let root = window?.contentView?.subviews.first,
+        guard let root = terminalContainer.subviews.first,
               let tree = snapshotNode(root) else { return nil }
         let panes = allPanes().map {
             PaneSnap(id: $0.paneId, shell: $0.shellPath, cwd: $0.lastKnownCwd,
@@ -530,7 +636,16 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
     // MARK: - NSWindowDelegate
 
+    /// Selecting a tab makes its window key: everything is seen, the
+    /// indicator clears.
+    func windowDidBecomeKey(_ notification: Notification) {
+        activity.recordSelected()
+        refreshActivityIndicator()
+    }
+
     func windowWillClose(_ notification: Notification) {
+        activityRefreshWork?.cancel()
+        activityRefreshWork = nil
         // FR-56 discrimination: this fires for user closes (⌘W, close button,
         // native tab close) AND for teardown closes (⌘Q quit, workspace
         // switch/park). Only the user gesture forgets — quit is "put it

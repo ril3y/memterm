@@ -20,6 +20,10 @@ public struct Config {
     public var fontFamily: String?
     public var fontSize: Double = 13
     public var copyOnSelect = true
+    /// Founder UX: the always-visible workspace bar under the tab bar. Shown
+    /// by default (the founder wants to SEE workspaces); `workspace_bar =
+    /// false` hides it.
+    public var workspaceBar = true
     public var scrollbackLines = 10_000
     public var shell: String?
     public var themeBackground: ConfigRGB?
@@ -64,6 +68,7 @@ public struct Config {
         if let s = string(values["font_family"]), !s.isEmpty { c.fontFamily = s }
         if let n = number(values["font_size"]), n > 4 { c.fontSize = n }
         if let b = boolean(values["copy_on_select"]) { c.copyOnSelect = b }
+        if let b = boolean(values["workspace_bar"]) { c.workspaceBar = b }
         if case .int(let n)? = values["scrollback_lines"], n >= 0 { c.scrollbackLines = n }
         if let s = string(values["shell"]), !s.isEmpty { c.shell = s }
 
@@ -130,6 +135,7 @@ public struct Config {
         }
         lines.append("font_size = \(fontSize == fontSize.rounded() ? String(Int(fontSize)) : String(fontSize))")
         lines.append("copy_on_select = \(copyOnSelect)")
+        lines.append("workspace_bar = \(workspaceBar)")
         lines.append("scrollback_lines = \(scrollbackLines)")
         if let shell {
             lines.append("shell = \"\(shell)\"")
@@ -170,6 +176,9 @@ public struct Config {
 
         # Selecting text copies it to the clipboard immediately.
         # copy_on_select = true
+
+        # The workspace bar (chips under the tab bar). false hides it.
+        # workspace_bar = true
 
         # scrollback_lines = 10000
 

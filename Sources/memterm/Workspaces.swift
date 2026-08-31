@@ -209,8 +209,12 @@ extension MemtermAppDelegate {
 
     /// FR-50: deleting offers "park" vs "forget".
     @objc func deleteWorkspaceAction(_ sender: Any?) {
+        confirmDeleteWorkspace(activeWorkspaceId)
+    }
+
+    func confirmDeleteWorkspace(_ id: String) {
         guard let store = memory?.store,
-              let workspace = store.listWorkspaces().first(where: { $0.id == activeWorkspaceId })
+              let workspace = store.listWorkspaces().first(where: { $0.id == id })
         else { return }
         let alert = NSAlert()
         alert.messageText = "Delete workspace “\(workspace.name)”?"
@@ -287,6 +291,14 @@ extension MemtermAppDelegate {
         menu.addItem(newFromTab)
 
         let moveItem = NSMenuItem(title: "Move Tab to Workspace", action: nil, keyEquivalent: "")
+        moveItem.submenu = makeMoveTabSubmenu(for: controller)
+        menu.addItem(moveItem)
+        return menu
+    }
+
+    /// "Move Tab to Workspace ▸" submenu — shared between the pane context
+    /// menu (FR-58) and the tab-strip right-click menu (founder UX stage).
+    func makeMoveTabSubmenu(for controller: TerminalWindowController) -> NSMenu {
         let moveMenu = NSMenu(title: "Move Tab to Workspace")
         if let store = memory?.store {
             for workspace in store.listWorkspaces() {
@@ -304,9 +316,87 @@ extension MemtermAppDelegate {
                 moveMenu.addItem(item)
             }
         }
-        moveItem.submenu = moveMenu
-        menu.addItem(moveItem)
+        return moveMenu
+    }
+
+    // MARK: - Workspace-bar chip menu (founder UX: right-click a chip)
+
+    /// The per-workspace menu the bar chips pop on right-click: Rename
+    /// (inline, in the bar), Color ▸, Park / Reopen, Delete…. Unlike the
+    /// switcher menu these target the CLICKED workspace, not the active one.
+    func makeWorkspaceChipMenu(for id: String) -> NSMenu? {
+        guard let store = memory?.store,
+              let workspace = store.listWorkspaces().first(where: { $0.id == id })
+        else { return nil }
+        let menu = NSMenu(title: workspace.name)
+
+        func add(_ title: String, _ action: Selector, represented: Any) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = represented
+            menu.addItem(item)
+        }
+        add("Rename", #selector(chipRenameWorkspaceItem(_:)), represented: id)
+
+        let colorItem = NSMenuItem(title: "Color", action: nil, keyEquivalent: "")
+        let colorMenu = NSMenu(title: "Color")
+        for preset in Self.workspaceColorPresets {
+            let item = NSMenuItem(title: preset.name,
+                                  action: #selector(recolorWorkspaceTargetItem(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = WorkspaceColorRequest(workspaceId: id, color: preset.hex)
+            item.image = Self.chipImage(hex: preset.hex)
+            item.state = preset.hex == workspace.color ? .on : .off
+            colorMenu.addItem(item)
+        }
+        colorItem.submenu = colorMenu
+        menu.addItem(colorItem)
+        menu.addItem(.separator())
+
+        if workspace.isParked {
+            add("Reopen", #selector(reopenWorkspaceItem(_:)), represented: id)
+        } else {
+            let canPark = store.listWorkspaces().filter { !$0.isParked }.count > 1
+            let item = NSMenuItem(title: "Park", action: canPark
+                                  ? #selector(parkWorkspaceItem(_:)) : nil, keyEquivalent: "")
+            item.target = canPark ? self : nil
+            item.representedObject = id
+            menu.addItem(item)
+        }
+        let canDelete = store.listWorkspaces().count > 1
+        let delete = NSMenuItem(title: "Delete…", action: canDelete
+                                ? #selector(deleteWorkspaceItem(_:)) : nil, keyEquivalent: "")
+        delete.target = canDelete ? self : nil
+        delete.representedObject = id
+        menu.addItem(delete)
         return menu
+    }
+
+    @objc func chipRenameWorkspaceItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        keyController()?.beginWorkspaceRename(id)
+    }
+
+    @objc func recolorWorkspaceTargetItem(_ sender: NSMenuItem) {
+        guard let request = sender.representedObject as? WorkspaceColorRequest else { return }
+        memory?.store.recolorWorkspace(request.workspaceId, color: request.color)
+        rebuildWorkspaceMenu()
+    }
+
+    @objc func parkWorkspaceItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        parkWorkspace(id)
+    }
+
+    @objc func reopenWorkspaceItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        switchToWorkspace(id)  // switching to a parked workspace reopens it
+    }
+
+    @objc func deleteWorkspaceItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        confirmDeleteWorkspace(id)
     }
 
     @objc func newWorkspaceFromTabItem(_ sender: NSMenuItem) {
@@ -392,13 +482,15 @@ extension MemtermAppDelegate {
 
     func refreshWorkspaceChips() {
         guard let store = memory?.store else { return }
+        let list = store.listWorkspaces()
         var byId: [String: WorkspaceRow] = [:]
-        for workspace in store.listWorkspaces() { byId[workspace.id] = workspace }
+        for workspace in list { byId[workspace.id] = workspace }
         for controller in controllers {
             let workspace = byId[controller.workspaceId]
             controller.updateWorkspaceChip(
                 name: workspace?.name ?? "Workspace",
                 color: Self.nsColor(hex: workspace?.color ?? StateStore.defaultWorkspaceColor))
+            controller.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId)
         }
     }
 
@@ -437,6 +529,18 @@ extension MemtermAppDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let name = field.stringValue.trimmingCharacters(in: .whitespaces)
         return name.isEmpty ? nil : name
+    }
+}
+
+/// representedObject payload for the chip-menu color items: which workspace,
+/// which preset.
+final class WorkspaceColorRequest: NSObject {
+    let workspaceId: String
+    let color: String
+
+    init(workspaceId: String, color: String) {
+        self.workspaceId = workspaceId
+        self.color = color
     }
 }
 
