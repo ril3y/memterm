@@ -165,22 +165,41 @@ public struct WindowRestore {
 public final class StateStore {
     private var db: OpaquePointer?
     private let writer = DispatchQueue(label: "memterm.state-store")
+    /// listWorkspaces() cache: menu validation calls it on every key-equivalent
+    /// dispatch, and an uncached read would writer.sync behind queued scrollback
+    /// file writes. Invalidated by every workspace mutation.
+    private let cacheLock = NSLock()
+    private var workspaceCache: [WorkspaceRow]?
 
     /// Stable id of the auto-created workspace (FR-49): single-context users
     /// never see the concept until they want it.
     public static let defaultWorkspaceId = "default"
     public static let defaultWorkspaceColor = "#8e8e93"
+    /// Generation backups kept next to state.db (FR-17): state.db.gen-1..gen-N,
+    /// rotated on each successful open, tried newest-first on a corrupt open.
+    public static let generationCount = 3
 
     public init(url: URL) {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
-        guard sqlite3_open_v2(url.path, &db,
-                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                              nil) == SQLITE_OK else {
-            db = nil
+        // FR-17: open + integrity-check; on failure, restore from the newest
+        // passing generation; only with no usable generation degrade to empty.
+        if !openAndVerify(url) {
+            recoverFromGenerations(url)
+        }
+        guard db != nil else {
+            NSLog("memterm: state store could not be opened or recovered at %@ — journaling disabled for this session", url.path)
             return
         }
+        // The journal holds cwds, argv, and scrollback references: keep it
+        // out of other local users' reach (NFR-10) — the directory is 0700,
+        // the db itself 0600.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                               ofItemAtPath: url.path)
+        // Rotate the pre-launch file to gen-1 BEFORE this session writes, so a
+        // torn write mid-session can always fall back to last launch's state.
+        rotateGenerations(url)
         exec("PRAGMA journal_mode = WAL")
         exec("PRAGMA synchronous = NORMAL")
         exec("""
@@ -196,10 +215,85 @@ public final class StateStore {
         CREATE TABLE IF NOT EXISTS panes (id TEXT PRIMARY KEY, tab_id TEXT, shell TEXT,
                                           cwd TEXT, cwd_source TEXT, updated_at INTEGER);
         CREATE TABLE IF NOT EXISTS pane_snapshot (pane_id TEXT PRIMARY KEY, exe TEXT,
-                                                  argv TEXT, pid INTEGER, adapter TEXT,
-                                                  adapter_state TEXT, updated_at INTEGER);
+                                                  argv TEXT, pid INTEGER, proc_start INTEGER,
+                                                  adapter TEXT, adapter_state TEXT,
+                                                  updated_at INTEGER);
         """)
         migrateSchema()
+    }
+
+    /// Opens `url` and runs PRAGMA quick_check; on any failure the connection
+    /// is closed and db stays nil. A 2 s busy timeout keeps a second
+    /// connection's write lock from silently failing statements (SQLITE_BUSY
+    /// used to be swallowed, degrading transactions to autocommit soup).
+    private func openAndVerify(_ url: URL) -> Bool {
+        guard sqlite3_open_v2(url.path, &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                              nil) == SQLITE_OK, db != nil else {
+            closeDB()
+            return false
+        }
+        sqlite3_busy_timeout(db, 2000)
+        var ok = false
+        query("PRAGMA quick_check", []) { stmt in
+            if column(stmt, 0) == "ok" { ok = true }
+        }
+        if !ok { closeDB() }
+        return ok
+    }
+
+    private func closeDB() {
+        if db != nil { sqlite3_close(db) }
+        db = nil
+    }
+
+    private static func generationURL(_ url: URL, _ n: Int) -> URL {
+        URL(fileURLWithPath: url.path + ".gen-\(n)")
+    }
+
+    /// Restore-from-last-known-good (FR-17): the corrupt file is moved aside
+    /// and generations are tried newest-first; each candidate must itself pass
+    /// quick_check before being adopted.
+    private func recoverFromGenerations(_ url: URL) {
+        let fm = FileManager.default
+        let corrupt = URL(fileURLWithPath: url.path + ".corrupt")
+        try? fm.removeItem(at: corrupt)
+        try? fm.moveItem(at: url, to: corrupt)
+        for sidecar in ["-wal", "-shm"] {
+            try? fm.removeItem(at: URL(fileURLWithPath: url.path + sidecar))
+        }
+        for n in 1...Self.generationCount {
+            let gen = Self.generationURL(url, n)
+            guard fm.fileExists(atPath: gen.path) else { continue }
+            try? fm.removeItem(at: url)
+            guard (try? fm.copyItem(at: gen, to: url)) != nil else { continue }
+            if openAndVerify(url) {
+                NSLog("memterm: state.db was corrupt — restored from generation %d", n)
+                return
+            }
+        }
+        try? fm.removeItem(at: url)
+        _ = openAndVerify(url)  // fresh empty store (still better than no store)
+        if db != nil {
+            NSLog("memterm: state.db was corrupt and no generation was usable — starting empty")
+        }
+    }
+
+    /// On each successful open, the pre-launch file becomes gen-1 (older
+    /// generations shift down, keep `generationCount`). WAL contents are
+    /// checkpointed into the main file first so the copy is self-contained.
+    private func rotateGenerations(_ url: URL) {
+        exec("PRAGMA wal_checkpoint(TRUNCATE)")
+        let fm = FileManager.default
+        try? fm.removeItem(at: Self.generationURL(url, Self.generationCount))
+        for n in stride(from: Self.generationCount - 1, through: 1, by: -1) {
+            let from = Self.generationURL(url, n)
+            guard fm.fileExists(atPath: from.path) else { continue }
+            try? fm.moveItem(at: from, to: Self.generationURL(url, n + 1))
+        }
+        let gen1 = Self.generationURL(url, 1)
+        try? fm.copyItem(at: url, to: gen1)
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: gen1.path)
     }
 
     /// v1 → v2 (Group G): tabs/windows gain workspace_id, a "Default" workspace
@@ -212,6 +306,10 @@ public final class StateStore {
         }
         if !columnExists("windows", "workspace_id") {
             exec("ALTER TABLE windows ADD COLUMN workspace_id TEXT")
+        }
+        // v2 → v3: pane_snapshot gains proc_start (FR-14 PID-reuse guard).
+        if !columnExists("pane_snapshot", "proc_start") {
+            exec("ALTER TABLE pane_snapshot ADD COLUMN proc_start INTEGER")
         }
         run("""
             INSERT INTO workspaces (id, name, color, ord, is_parked)
@@ -233,7 +331,7 @@ public final class StateStore {
                     """, [.text(adopter)])
             }
         }
-        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2')")
+        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')")
     }
 
     private func columnExists(_ table: String, _ name: String) -> Bool {
@@ -246,6 +344,12 @@ public final class StateStore {
 
     deinit {
         sqlite3_close(db)
+    }
+
+    private func invalidateWorkspaceCache() {
+        cacheLock.lock()
+        workspaceCache = nil
+        cacheLock.unlock()
     }
 
     // MARK: Meta
@@ -269,7 +373,13 @@ public final class StateStore {
     // MARK: Workspaces (FR-49/50/51)
 
     public func listWorkspaces() -> [WorkspaceRow] {
-        writer.sync {
+        cacheLock.lock()
+        if let cached = workspaceCache {
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+        let rows: [WorkspaceRow] = writer.sync {
             var rows: [WorkspaceRow] = []
             query("SELECT id, name, color, ord, is_parked FROM workspaces ORDER BY ord", []) { stmt in
                 guard let id = column(stmt, 0) else { return }
@@ -281,6 +391,10 @@ public final class StateStore {
             }
             return rows
         }
+        cacheLock.lock()
+        workspaceCache = rows
+        cacheLock.unlock()
+        return rows
     }
 
     /// Appends the workspace at the end of the switcher order. Returns the id.
@@ -293,6 +407,7 @@ public final class StateStore {
                 VALUES (?,?,?,(SELECT COALESCE(MAX(ord) + 1, 0) FROM workspaces),0)
                 """, [.text(id), .text(name), .text(color)])
         }
+        invalidateWorkspaceCache()
         return id
     }
 
@@ -300,12 +415,14 @@ public final class StateStore {
         writer.async { [self] in
             run("UPDATE workspaces SET name = ? WHERE id = ?", [.text(name), .text(id)])
         }
+        invalidateWorkspaceCache()
     }
 
     public func recolorWorkspace(_ id: String, color: String) {
         writer.async { [self] in
             run("UPDATE workspaces SET color = ? WHERE id = ?", [.text(color), .text(id)])
         }
+        invalidateWorkspaceCache()
     }
 
     /// Parked = closed-but-kept (FR-51): rows stay, launch restore skips it.
@@ -314,37 +431,68 @@ public final class StateStore {
             run("UPDATE workspaces SET is_parked = ? WHERE id = ?",
                 [.int(parked ? 1 : 0), .text(id)])
         }
+        invalidateWorkspaceCache()
     }
 
     /// FR-50/57 "forget": purges the workspace's journal rows AND its panes'
     /// scrollback files on disk — forgetting deletes bytes, not just the index.
+    /// Files are removed only after the row purge COMMITs, so a failed
+    /// transaction never leaves rows pointing at deleted scrollback.
     public func forgetWorkspace(_ id: String, scrollbackDir: URL?) {
         writer.async { [self] in
-            if let scrollbackDir {
-                var paneIds: [String] = []
+            var paneIds: [String] = []
+            if scrollbackDir != nil {
                 query("""
                       SELECT p.id FROM panes p JOIN tabs t ON p.tab_id = t.id
                       WHERE t.workspace_id = ?
                       """, [.text(id)]) { stmt in
                     if let paneId = column(stmt, 0) { paneIds.append(paneId) }
                 }
+            }
+            let committed = inTransaction {
+                var ok = true
+                ok = run("""
+                    DELETE FROM pane_snapshot WHERE pane_id IN
+                      (SELECT p.id FROM panes p JOIN tabs t ON p.tab_id = t.id
+                       WHERE t.workspace_id = ?)
+                    """, [.text(id)]) == SQLITE_OK && ok
+                ok = run("DELETE FROM panes WHERE tab_id IN (SELECT id FROM tabs WHERE workspace_id = ?)",
+                         [.text(id)]) == SQLITE_OK && ok
+                ok = run("DELETE FROM tabs WHERE workspace_id = ?", [.text(id)]) == SQLITE_OK && ok
+                ok = run("DELETE FROM windows WHERE workspace_id = ?", [.text(id)]) == SQLITE_OK && ok
+                ok = run("DELETE FROM workspaces WHERE id = ?", [.text(id)]) == SQLITE_OK && ok
+                return ok
+            }
+            if committed, let scrollbackDir {
                 for paneId in paneIds {
                     try? FileManager.default.removeItem(
                         at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
                 }
             }
-            run("BEGIN IMMEDIATE")
-            run("""
-                DELETE FROM pane_snapshot WHERE pane_id IN
-                  (SELECT p.id FROM panes p JOIN tabs t ON p.tab_id = t.id
-                   WHERE t.workspace_id = ?)
-                """, [.text(id)])
-            run("DELETE FROM panes WHERE tab_id IN (SELECT id FROM tabs WHERE workspace_id = ?)",
-                [.text(id)])
-            run("DELETE FROM tabs WHERE workspace_id = ?", [.text(id)])
-            run("DELETE FROM windows WHERE workspace_id = ?", [.text(id)])
-            run("DELETE FROM workspaces WHERE id = ?", [.text(id)])
-            run("COMMIT")
+        }
+        invalidateWorkspaceCache()
+    }
+
+    /// FR-57 hygiene: deletes scrollback files whose pane no longer has a row
+    /// in the panes table (closed panes' files used to accumulate forever).
+    /// No-ops on a degraded store — an empty pane set there is ignorance, not
+    /// evidence, and must never trigger a mass delete.
+    public func purgeOrphanScrollback(dir: URL) {
+        writer.async { [self] in
+            guard db != nil else { return }
+            var live = Set<String>()
+            query("SELECT id FROM panes", []) { stmt in
+                // Compare in file-name space: fileURL sanitizes ids on write.
+                if let id = column(stmt, 0) { live.insert(ScrollbackText.safePaneId(id)) }
+            }
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil) else { return }
+            for file in files where file.pathExtension == "txt" {
+                let paneId = file.deletingPathExtension().lastPathComponent
+                if !live.contains(paneId) {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }
         }
     }
 
@@ -361,40 +509,42 @@ public final class StateStore {
     public func saveTopology(_ windows: [WindowSnap], forWorkspaces scope: Set<String>?) {
         let now = Int(Date().timeIntervalSince1970)
         writer.async { [self] in
-            run("BEGIN IMMEDIATE")
-            if let scope {
-                let marks = Array(repeating: "?", count: scope.count).joined(separator: ",")
-                let binds = scope.sorted().map { Bind.text($0) }
-                run("""
-                    DELETE FROM panes WHERE tab_id IN
-                      (SELECT id FROM tabs WHERE workspace_id IN (\(marks)))
-                    """, binds)
-                run("DELETE FROM tabs WHERE workspace_id IN (\(marks))", binds)
-                run("DELETE FROM windows WHERE workspace_id IN (\(marks))", binds)
-            } else {
-                run("DELETE FROM windows")
-                run("DELETE FROM tabs")
-                run("DELETE FROM panes")
-            }
-            for (wi, win) in windows.enumerated() {
-                run("INSERT INTO windows (id, frame, ord, focused_tab, workspace_id, updated_at) VALUES (?,?,?,?,?,?)",
-                    [.text(win.id), .text(win.frame), .int(wi), .textOrNull(win.focusedTab),
-                     .text(win.workspaceId), .int(now)])
-                for (ti, tab) in win.tabs.enumerated() {
-                    let tree = jsonString(tab.tree.toJSONObject()) ?? "{}"
-                    run("INSERT INTO tabs (id, window_id, ord, title, split_tree, workspace_id, updated_at) VALUES (?,?,?,?,?,?,?)",
-                        [.text(tab.id), .text(win.id), .int(ti), .text(tab.title), .text(tree),
-                         .text(win.workspaceId), .int(now)])
-                    for pane in tab.panes {
-                        run("INSERT INTO panes (id, tab_id, shell, cwd, cwd_source, updated_at) VALUES (?,?,?,?,?,?)",
-                            [.text(pane.id), .text(tab.id), .textOrNull(pane.shell),
-                             .textOrNull(pane.cwd), .textOrNull(pane.cwdSource), .int(now)])
+            inTransaction {
+                var ok = true
+                if let scope {
+                    let marks = Array(repeating: "?", count: scope.count).joined(separator: ",")
+                    let binds = scope.sorted().map { Bind.text($0) }
+                    ok = run("""
+                        DELETE FROM panes WHERE tab_id IN
+                          (SELECT id FROM tabs WHERE workspace_id IN (\(marks)))
+                        """, binds) == SQLITE_OK && ok
+                    ok = run("DELETE FROM tabs WHERE workspace_id IN (\(marks))", binds) == SQLITE_OK && ok
+                    ok = run("DELETE FROM windows WHERE workspace_id IN (\(marks))", binds) == SQLITE_OK && ok
+                } else {
+                    ok = run("DELETE FROM windows") == SQLITE_OK && ok
+                    ok = run("DELETE FROM tabs") == SQLITE_OK && ok
+                    ok = run("DELETE FROM panes") == SQLITE_OK && ok
+                }
+                for (wi, win) in windows.enumerated() {
+                    ok = run("INSERT INTO windows (id, frame, ord, focused_tab, workspace_id, updated_at) VALUES (?,?,?,?,?,?)",
+                             [.text(win.id), .text(win.frame), .int(wi), .textOrNull(win.focusedTab),
+                              .text(win.workspaceId), .int(now)]) == SQLITE_OK && ok
+                    for (ti, tab) in win.tabs.enumerated() {
+                        let tree = jsonString(tab.tree.toJSONObject()) ?? "{}"
+                        ok = run("INSERT INTO tabs (id, window_id, ord, title, split_tree, workspace_id, updated_at) VALUES (?,?,?,?,?,?,?)",
+                                 [.text(tab.id), .text(win.id), .int(ti), .text(tab.title), .text(tree),
+                                  .text(win.workspaceId), .int(now)]) == SQLITE_OK && ok
+                        for pane in tab.panes {
+                            ok = run("INSERT INTO panes (id, tab_id, shell, cwd, cwd_source, updated_at) VALUES (?,?,?,?,?,?)",
+                                     [.text(pane.id), .text(tab.id), .textOrNull(pane.shell),
+                                      .textOrNull(pane.cwd), .textOrNull(pane.cwdSource), .int(now)]) == SQLITE_OK && ok
+                        }
                     }
                 }
+                // Snapshots for panes that no longer exist go with them.
+                ok = run("DELETE FROM pane_snapshot WHERE pane_id NOT IN (SELECT id FROM panes)") == SQLITE_OK && ok
+                return ok
             }
-            // Snapshots for panes that no longer exist go with them.
-            run("DELETE FROM pane_snapshot WHERE pane_id NOT IN (SELECT id FROM panes)")
-            run("COMMIT")
         }
     }
 
@@ -408,15 +558,19 @@ public final class StateStore {
 
     // MARK: Snapshots
 
+    /// `procStart` is the FR-14 PID-reuse guard: the process's kernel start
+    /// timestamp captured alongside argv, persisted so a future consumer can
+    /// verify it is still talking about the same process.
     public func upsertSnapshot(_ paneId: String, exe: String, argv: [String], pid: pid_t,
+                               procStart: Int64 = 0,
                                adapter: String, adapterState: [String: String]) {
         let now = Int(Date().timeIntervalSince1970)
         let argvJSON = jsonString(argv) ?? "[]"
         let stateJSON = jsonString(adapterState) ?? "{}"
         writer.async { [self] in
-            run("INSERT OR REPLACE INTO pane_snapshot (pane_id, exe, argv, pid, adapter, adapter_state, updated_at) VALUES (?,?,?,?,?,?,?)",
+            run("INSERT OR REPLACE INTO pane_snapshot (pane_id, exe, argv, pid, proc_start, adapter, adapter_state, updated_at) VALUES (?,?,?,?,?,?,?,?)",
                 [.text(paneId), .text(exe), .text(argvJSON), .int(Int(pid)),
-                 .text(adapter), .text(stateJSON), .int(now)])
+                 .int(Int(procStart)), .text(adapter), .text(stateJSON), .int(now)])
         }
     }
 
@@ -523,13 +677,38 @@ public final class StateStore {
         sqlite3_exec(db, sql, nil, nil, nil)
     }
 
-    private func run(_ sql: String, _ binds: [Bind] = []) {
-        guard let db else { return }
+    /// Wraps `body` in BEGIN IMMEDIATE … COMMIT with real error handling
+    /// (FR-17): a failed BEGIN skips the batch entirely, and a failed
+    /// statement or COMMIT rolls back — the previous good rows survive
+    /// instead of a half-applied autocommit sequence. Returns true iff the
+    /// transaction committed.
+    @discardableResult
+    private func inTransaction(_ body: () -> Bool) -> Bool {
+        guard db != nil else { return false }  // degraded open: silent no-op floor
+        let begin = run("BEGIN IMMEDIATE")
+        guard begin == SQLITE_OK else {
+            NSLog("memterm: BEGIN IMMEDIATE failed (%d) — skipping write batch", begin)
+            return false
+        }
+        if body(), run("COMMIT") == SQLITE_OK {
+            return true
+        }
+        NSLog("memterm: transaction failed — rolled back")
+        run("ROLLBACK")
+        return false
+    }
+
+    @discardableResult
+    private func run(_ sql: String, _ binds: [Bind] = []) -> Int32 {
+        guard let db else { return SQLITE_ERROR }
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return sqlite3_errcode(db)
+        }
         defer { sqlite3_finalize(stmt) }
         bind(stmt, binds)
-        sqlite3_step(stmt)
+        let rc = sqlite3_step(stmt)
+        return (rc == SQLITE_DONE || rc == SQLITE_ROW) ? SQLITE_OK : rc
     }
 
     private func query(_ sql: String, _ binds: [Bind], row: (OpaquePointer) -> Void) {

@@ -32,11 +32,24 @@ public enum ScrollbackText {
         return lines.joined(separator: "\n")
     }
 
+    /// Pane ids are UUIDs at creation, but they round-trip through the DB and
+    /// split-tree JSON — both user-inspectable files (Persona B reads our disk
+    /// format). An id used as a path component must never escape the
+    /// scrollback dir: anything outside [A-Za-z0-9-] is replaced, so "../" and
+    /// absolute-path shapes cannot reach removeItem/write as traversal.
+    public static func safePaneId(_ paneId: String) -> String {
+        let cleaned = String(paneId.unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) || scalar == "-"
+                ? Character(scalar) : "_"
+        })
+        return cleaned.isEmpty ? "_invalid" : cleaned
+    }
+
     /// On-disk location of one pane's serialized scrollback. Single source of
     /// the naming scheme: the capture engine writes here and workspace-forget
     /// (FR-57) deletes here.
     public static func fileURL(dir: URL, paneId: String) -> URL {
-        dir.appendingPathComponent("\(paneId).txt")
+        dir.appendingPathComponent("\(safePaneId(paneId)).txt")
     }
 
     /// LF-joined serialized scrollback → CRLF text safe to feed() into a

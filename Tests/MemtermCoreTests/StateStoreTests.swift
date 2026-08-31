@@ -78,7 +78,7 @@ final class StateStoreTests: XCTestCase {
         let store = StateStore(url: dbURL)
         store.setMeta("boot_session_uuid", "ABC-123")
         XCTAssertEqual(store.getMeta("boot_session_uuid"), "ABC-123")
-        XCTAssertEqual(store.getMeta("schema_version"), "2")
+        XCTAssertEqual(store.getMeta("schema_version"), "3")
         XCTAssertNil(store.getMeta("nope"))
     }
 
@@ -158,19 +158,9 @@ final class StateStoreTests: XCTestCase {
         XCTAssertTrue(store.loadState().isEmpty)
     }
 
-    // MARK: Torn write / corruption
+    // MARK: Torn write / corruption (FR-17 / NFR-5)
 
-    /// Documented current behavior: a corrupted db file produces a DEGRADED
-    /// OPEN — the store constructs, every read returns empty (the app launches
-    /// as a fresh session), every write is a no-op, and nothing crashes.
-    /// FR-17's generation rotation (restore-from-last-known-good) is a later
-    /// stage; this pins the "never crash, never brick the terminal" floor.
-    func testCorruptedHeaderDoesNotCrashAndDegradesToEmpty() throws {
-        var store: StateStore? = StateStore(url: dbURL)
-        store?.saveTopology(sampleTopology())
-        store?.barrier()
-        store = nil
-
+    private func corruptHeader() throws {
         // Stomp the SQLite header + first page.
         let handle = try FileHandle(forWritingTo: dbURL)
         try handle.write(contentsOf: Data(repeating: 0xFF, count: 512))
@@ -178,13 +168,52 @@ final class StateStoreTests: XCTestCase {
         // The WAL sidecar no longer matches; remove it as a torn write could.
         try? FileManager.default.removeItem(at: URL(fileURLWithPath: dbURL.path + "-wal"))
         try? FileManager.default.removeItem(at: URL(fileURLWithPath: dbURL.path + "-shm"))
+    }
+
+    /// FR-17 restore-from-last-known-good: each successful open rotates the
+    /// pre-launch file to state.db.gen-1, and a corrupt open recovers from the
+    /// newest passing generation — a torn write costs at most the writes since
+    /// the previous launch, never the whole workspace (the tmux-resurrect
+    /// empty-save anti-goal).
+    func testCorruptedHeaderRecoversFromGeneration() throws {
+        // Launch 1: write topology A, close (gen-1 is the pre-launch empty db).
+        var store: StateStore? = StateStore(url: dbURL)
+        store?.saveTopology(sampleTopology())
+        store?.barrier()
+        store = nil
+
+        // Launch 2: rotation snapshots topology A into gen-1.
+        store = StateStore(url: dbURL)
+        XCTAssertEqual(store?.counts().panes, 4)
+        store?.barrier()
+        store = nil
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dbURL.path + ".gen-1"))
+
+        try corruptHeader()
+
+        // Launch 3: quick_check fails on the corrupt file; gen-1 (topology A)
+        // comes back instead of an empty session.
+        let recovered = StateStore(url: dbURL)
+        let loaded = recovered.loadState()
+        XCTAssertEqual(loaded.count, 1, "should have recovered last launch's topology")
+        XCTAssertEqual(loaded[0].tabs.count, 2)
+        XCTAssertEqual(loaded[0].tabs[0].panes["p1"]?.cwd, "/tmp")
+        // The recovered store is fully writable.
+        recovered.setMeta("k", "v")
+        recovered.barrier()
+        XCTAssertEqual(recovered.getMeta("k"), "v")
+    }
+
+    /// With no generation available (corruption on the very first launch) the
+    /// floor is unchanged: never crash, never brick — open fresh and empty.
+    func testCorruptedHeaderWithNoGenerationDegradesToEmptyWithoutCrashing() throws {
+        try Data(repeating: 0xFF, count: 4096).write(to: dbURL)
 
         let reopened = StateStore(url: dbURL)
         XCTAssertTrue(reopened.loadState().isEmpty)
-        let counts = reopened.counts()
-        XCTAssertEqual(counts.windows, 0)
-        XCTAssertEqual(counts.panes, 0)
-        // Writes against the corrupt store must not crash either.
+        XCTAssertEqual(reopened.counts().windows, 0)
+        // Writes against the recovered-empty store work (fresh db) or no-op
+        // (degraded) — either way, no crash.
         reopened.saveTopology(sampleTopology())
         reopened.setMeta("k", "v")
         reopened.barrier()
@@ -209,6 +238,31 @@ final class StateStoreTests: XCTestCase {
         reopened.barrier()
         // Degraded or recovered — either way: alive, consistent, no crash.
         _ = reopened.counts()
+    }
+
+    // MARK: Orphan scrollback GC
+
+    /// Files whose pane rows were dropped by a topology rewrite (user closed
+    /// the pane) are deleted by the sweep; files for live panes survive.
+    func testPurgeOrphanScrollbackDeletesOnlyOrphans() throws {
+        let store = StateStore(url: dbURL)
+        store.saveTopology(sampleTopology())
+
+        let dir = tempDir.appendingPathComponent("scrollback")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for paneId in ["p1", "p4", "closed-long-ago"] {
+            try "ghost".write(to: ScrollbackText.fileURL(dir: dir, paneId: paneId),
+                              atomically: true, encoding: .utf8)
+        }
+
+        store.purgeOrphanScrollback(dir: dir)
+        store.barrier()
+
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: ScrollbackText.fileURL(dir: dir, paneId: "p1").path))
+        XCTAssertTrue(fm.fileExists(atPath: ScrollbackText.fileURL(dir: dir, paneId: "p4").path))
+        XCTAssertFalse(fm.fileExists(
+            atPath: ScrollbackText.fileURL(dir: dir, paneId: "closed-long-ago").path))
     }
 
     // MARK: Writer-queue serialization

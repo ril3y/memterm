@@ -58,6 +58,15 @@ enum ProcessInspector {
         return args.isEmpty ? nil : args
     }
 
+    /// Kernel start timestamp of `pid` in microseconds (FR-14 PID-reuse
+    /// guard): the poller reads it before AND after the argv read — a change
+    /// means the pid was recycled mid-observation and the sample is dropped.
+    static func startTime(of pid: pid_t) -> Int64? {
+        guard pid > 0 else { return nil }
+        let t = memterm_pid_start_time(pid)
+        return t >= 0 ? t : nil
+    }
+
     /// FR-18: discriminates app-restart restore from reboot restore.
     static func bootSessionUUID() -> String? {
         var size = 0

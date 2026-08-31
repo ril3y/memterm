@@ -22,4 +22,13 @@ let mode: RunMode = arguments.contains("--latency") ? .latency
                   : arguments.contains("--flood") ? .flood
                   : .interactive
 // --smoke: deterministic capture/restore self-test (see MemtermApp.runSmoke).
-runApp(mode: mode, smoke: arguments.contains("--smoke"))
+// It defaults the state dir to a stable temp location (two consecutive runs
+// share it — run 1 saves, run 2 restores) so the gate is hermetic and never
+// touches ~/Library/Application Support/memterm. MEMTERM_STATE_DIR overrides.
+let smokeMode = arguments.contains("--smoke")
+if smokeMode, ProcessInfo.processInfo.environment["MEMTERM_STATE_DIR"] == nil {
+    let smokeDir = (NSTemporaryDirectory() as NSString)
+        .appendingPathComponent("memterm-smoke")
+    setenv("MEMTERM_STATE_DIR", smokeDir, 1)
+}
+runApp(mode: mode, smoke: smokeMode)

@@ -4,9 +4,18 @@ import Foundation
 // v0.1 backs this with SwiftTerm; the surface is deliberately small (~15 methods)
 // so libghostty-vt can be evaluated as a drop-in post-1.0.
 //
-// The persistence engine (M2) talks ONLY to this protocol — never to SwiftTerm
-// types directly — because serializing grid + scrollback is the killer feature
-// and must not be entangled with one emulator's internals.
+// SEAM STATUS (re-scoped at the Stage-2 audit): nothing conforms to this
+// protocol yet. In the shipping v0 code the engine-swap seam is held by TWO
+// concrete choke points instead, both deliberately narrow:
+//   - capture: PaneView.scrollbackText(maxLines:) is the ONLY place the
+//     persistence path touches SwiftTerm buffer internals (the pure assembly
+//     lives in MemtermCore.ScrollbackText, engine-free);
+//   - restore: ghost content goes through TerminalView.feed(text:) only
+//     (TerminalWindowController.makeRestoredPane), never the pty.
+// Swapping engines means reimplementing those two surfaces. Making PaneView
+// conform to this protocol (serializeState/restoreGhostState) is the intended
+// M3+ refactor; until then this file is the contract those choke points must
+// converge to, not a description of current wiring.
 
 /// A single cell run captured from the grid; attribute payload stays opaque to
 /// the persistence layer (round-trips through the same engine that produced it).

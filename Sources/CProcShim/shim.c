@@ -17,3 +17,12 @@ int memterm_pid_cwd(pid_t pid, char *buf, size_t bufsize) {
 int memterm_child_pids(pid_t pid, pid_t *buf, int bufsize) {
     return proc_listchildpids(pid, buf, bufsize);
 }
+
+int64_t memterm_pid_start_time(pid_t pid) {
+    struct proc_bsdinfo info;
+    int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+    if (n <= 0) {
+        return -1;
+    }
+    return (int64_t)info.pbi_start_tvsec * 1000000 + (int64_t)info.pbi_start_tvusec;
+}

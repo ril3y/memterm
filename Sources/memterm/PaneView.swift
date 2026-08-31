@@ -34,6 +34,11 @@ final class PaneView: LocalProcessTerminalView {
     /// Whole buffer (scrollback + visible grid) as plain text, wrapped rows
     /// re-joined, trailing blank grid rows trimmed, capped to maxLines
     /// (assembly logic lives in MemtermCore.ScrollbackText).
+    ///
+    /// ENGINE SEAM: this method is the single SwiftTerm-facing capture surface
+    /// for persistence (see the seam-status note in TerminalEngine.swift).
+    /// Never let MemoryEngine/StateStore reach into SwiftTerm buffer types
+    /// anywhere else.
     func scrollbackText(maxLines: Int) -> String {
         let terminal = getTerminal()
         var rows: [ScrollbackText.Row] = []

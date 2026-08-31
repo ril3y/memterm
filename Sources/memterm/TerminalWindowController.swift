@@ -46,6 +46,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         super.init(window: window)
         window.delegate = self
         installWorkspaceChip(on: window)
+        // PINNED DEPENDENCY: NSWindow.firstResponder is not documented as
+        // KVO-compliant (it works on every macOS to date). If a macOS update
+        // stops emitting changes here, focusedPane stops updating and
+        // currentPane() silently degrades to its firstResponder-cast /
+        // allPanes().first fallback — check here first if multi-pane focus
+        // targeting (⌘R/⌘F/splits) regresses after an OS update.
         firstResponderObservation = window.observe(\.firstResponder) { [weak self] window, _ in
             if let pane = window.firstResponder as? PaneView {
                 self?.paneFocused(pane)
@@ -193,10 +199,23 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if fellBack, let saved = restore?.cwd {
             pane.feed(text: "\u{1b}[2mmemterm: directory not available: \(saved)\u{1b}[0m\r\n")
         }
-        if let snap = restore?.snapshot, !snap.adapter.isEmpty,
-           let offer = Adapters.resumeOffer(for: snap) {
-            pane.pendingResumeCommand = offer.command
-            pane.feed(text: "\u{1b}[36mmemterm: was running \(offer.label) — press ⌘R to type: \(offer.command)\u{1b}[0m\r\n")
+        if var snap = restore?.snapshot, !snap.adapter.isEmpty {
+            // FR-36/§9: the same Claude session UUID is never offered on two
+            // panes. First pane claims it; later panes with the same UUID
+            // (same-cwd fallback ambiguity) downgrade to `claude --continue`,
+            // honestly labeled by resumeOffer.
+            if snap.adapter == "claude",
+               let sessionId = snap.adapterState["sessionId"], !sessionId.isEmpty,
+               !app.claudeClaims.claim(sessionId: sessionId, paneId: id) {
+                snap.adapterState["sessionId"] = nil
+            }
+            // FR-25 second half: a fallback cwd disables cwd-dependent offers
+            // (watchers, `claude --continue`); `claude --resume <uuid>` stays
+            // with a "project directory unavailable" caveat in its label.
+            if let offer = Adapters.resumeOffer(for: snap, cwdUnavailable: fellBack) {
+                pane.pendingResumeCommand = offer.command
+                pane.feed(text: "\u{1b}[36mmemterm: was running \(offer.label) — press ⌘R to type: \(offer.command)\u{1b}[0m\r\n")
+            }
         }
         startShell(in: pane, cwd: cwd, shellOverride: restore?.shell)
         return pane
@@ -281,6 +300,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
     private func close(pane: PaneView) {
         pane.processDelegate = nil
+        app.claudeClaims.release(paneId: pane.paneId)
         if pane.process.running { pane.terminate() }
 
         guard let split = pane.superview as? NSSplitView else {
@@ -369,6 +389,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     func windowWillClose(_ notification: Notification) {
         for pane in allPanes() {
             pane.processDelegate = nil
+            app.claudeClaims.release(paneId: pane.paneId)
             if pane.process.running { pane.terminate() }
         }
         app.controllerClosed(self)

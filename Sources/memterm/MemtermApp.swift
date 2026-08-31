@@ -13,6 +13,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// Set before windows close at quit so their teardown isn't captured.
     private(set) var isTerminating = false
     private let smokeMode: Bool
+    /// FR-36/§9: offer-time registry ensuring one `--resume <uuid>` per UUID
+    /// across every restore path (launch, workspace switch, unpark).
+    let claudeClaims = ClaudeSessionClaims()
 
     // -- Workspaces (Group G) --
     /// The workspace whose tabs the user is working in right now.
@@ -143,6 +146,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Smoke test (deterministic capture/restore gate, no interaction)
 
     private func runSmoke(restoredAnything: Bool) {
+        // Hermetic by default: main.swift points MEMTERM_STATE_DIR at a temp
+        // location for --smoke, so the gate never rewrites the real journal.
+        print("SMOKE-STATE-DIR \(MemoryEngine.baseDir.path)")
         if !restoredAnything {
             // Run 1: build 1 window / 2 tabs / 3 panes, cd one pane, let the
             // 2 s poll capture it, flush, report what the store holds.
