@@ -5,18 +5,25 @@ import Foundation
 // are consent-gated (FR-29) — memterm NEVER auto-executes a captured command,
 // and there is no setting to change that.
 
-enum Adapters {
+public enum Adapters {
 
-    static let watcherNames: Set<String> = ["tail", "less", "more", "man", "htop", "top", "watch"]
+    public static let watcherNames: Set<String> = ["tail", "less", "more", "man", "htop", "top", "watch"]
+
+    public static var defaultClaudeProjectsDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects")
+    }
 
     /// Classifies a foreground process; returns (adapter, adapter_state) or nil.
-    static func classify(argv: [String], cwd: String?) -> (adapter: String, state: [String: String])? {
+    public static func classify(argv: [String], cwd: String?,
+                                claudeProjectsDir: URL = defaultClaudeProjectsDir)
+        -> (adapter: String, state: [String: String])? {
         guard let first = argv.first, !first.isEmpty else { return nil }
         let base = (first as NSString).lastPathComponent
 
         if base == "claude" || (base == "node" && argv.contains { $0.hasSuffix("/claude") || $0.contains("/.claude/") }) {
             var state: [String: String] = [:]
-            if let cwd, let sessionId = claudeSessionId(forCwd: cwd) {
+            if let cwd, let sessionId = claudeSessionId(forCwd: cwd, projectsDir: claudeProjectsDir) {
                 state["sessionId"] = sessionId
             }
             return ("claude", state)
@@ -30,15 +37,20 @@ enum Adapters {
         return nil
     }
 
-    /// Most-recently-modified session jsonl under ~/.claude/projects/<encoded-cwd>/.
-    /// Encoding: every non-alphanumeric character becomes '-'.
-    static func claudeSessionId(forCwd cwd: String) -> String? {
+    /// Claude's projects-dir slug for a cwd: every non-alphanumeric character
+    /// becomes '-'. Always map cwd → dir, never invert (§8).
+    public static func claudeProjectSlug(forCwd cwd: String) -> String {
         var encoded = ""
         for scalar in cwd.unicodeScalars {
             encoded.unicodeScalars.append(CharacterSet.alphanumerics.contains(scalar) ? scalar : "-")
         }
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/projects/\(encoded)")
+        return encoded
+    }
+
+    /// Most-recently-modified session jsonl under <projectsDir>/<encoded-cwd>/.
+    public static func claudeSessionId(forCwd cwd: String,
+                                       projectsDir: URL = defaultClaudeProjectsDir) -> String? {
+        let dir = projectsDir.appendingPathComponent(claudeProjectSlug(forCwd: cwd))
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return nil }
         let newest = files
@@ -54,7 +66,7 @@ enum Adapters {
 
     /// The "was running" offer for a restored pane (v0 of FR-26/27):
     /// nil when the pane had no adapter or the command is denylisted.
-    static func resumeOffer(for snap: SnapshotRow) -> (label: String, command: String)? {
+    public static func resumeOffer(for snap: SnapshotRow) -> (label: String, command: String)? {
         let offer: (label: String, command: String)
         switch snap.adapter {
         case "claude":
@@ -75,11 +87,27 @@ enum Adapters {
     }
 
     /// FR-30 hard denylist — checked before any offer, no override exists.
-    static func isDenylisted(_ command: String) -> Bool {
+    public static func isDenylisted(_ command: String) -> Bool {
         // Multiline unknowns are denylisted outright (FR-30); a newline would
         // also defeat the ⌘R types-without-newline guarantee (FR-29).
         if command.contains("\n") || command.contains("\r") {
             return true
+        }
+        // `curl … | sh` patterns (FR-30): a downloader piped into any shell.
+        let segments = command.split(separator: "|").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        if segments.count > 1 {
+            let downloaders: Set<String> = ["curl", "wget", "fetch"]
+            let shells: Set<String> = ["sh", "bash", "zsh", "dash", "ksh", "fish"]
+            let bases = segments.map { seg -> String in
+                let first = seg.split(separator: " ").first.map(String.init) ?? ""
+                return (first as NSString).lastPathComponent
+            }
+            if let dl = bases.firstIndex(where: { downloaders.contains($0) }),
+               bases[(dl + 1)...].contains(where: { shells.contains($0) }) {
+                return true
+            }
         }
         let tokens = command.split(separator: " ").map(String.init)
         guard let first = tokens.first else { return true }
@@ -94,7 +122,7 @@ enum Adapters {
         return false
     }
 
-    static func shellQuote(_ s: String) -> String {
+    public static func shellQuote(_ s: String) -> String {
         if !s.isEmpty, s.range(of: "^[A-Za-z0-9_@%+=:,./-]+$", options: .regularExpression) != nil {
             return s
         }

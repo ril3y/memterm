@@ -1,8 +1,9 @@
 import Foundation
 import SQLite3
 
-// FR-12/17: the durable description of the workspace. SQLite WAL at
-// ~/Library/Application Support/memterm/state.db, one serial queue as the
+// FR-12/17: the durable description of the workspace. SQLite WAL (default
+// location: ~/Library/Application Support/memterm/state.db — the base
+// directory is injectable so tests run in temp dirs), one serial queue as the
 // single writer, whole-topology transactional rewrites (the topology is tiny;
 // rewriting it beats diffing it for correctness).
 
@@ -10,18 +11,18 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 
 // MARK: - Model
 
-indirect enum SplitNode {
+public indirect enum SplitNode: Equatable {
     case pane(String)
     case split(vertical: Bool, ratio: Double, first: SplitNode, second: SplitNode)
 
-    var paneIds: [String] {
+    public var paneIds: [String] {
         switch self {
         case .pane(let id): return [id]
         case .split(_, _, let a, let b): return a.paneIds + b.paneIds
         }
     }
 
-    func toJSONObject() -> Any {
+    public func toJSONObject() -> Any {
         switch self {
         case .pane(let id):
             return ["pane": id]
@@ -31,7 +32,7 @@ indirect enum SplitNode {
         }
     }
 
-    static func from(jsonObject: Any) -> SplitNode? {
+    public static func from(jsonObject: Any) -> SplitNode? {
         guard let dict = jsonObject as? [String: Any] else { return nil }
         if let id = dict["pane"] as? String { return .pane(id) }
         guard let vertical = dict["vertical"] as? Bool,
@@ -43,59 +44,105 @@ indirect enum SplitNode {
     }
 }
 
-struct PaneSnap {
-    var id: String
-    var shell: String?
-    var cwd: String?
-    var cwdSource: String?
+public struct PaneSnap {
+    public var id: String
+    public var shell: String?
+    public var cwd: String?
+    public var cwdSource: String?
+
+    public init(id: String, shell: String?, cwd: String?, cwdSource: String?) {
+        self.id = id
+        self.shell = shell
+        self.cwd = cwd
+        self.cwdSource = cwdSource
+    }
 }
 
-struct TabSnap {
-    var id: String
-    var title: String
-    var tree: SplitNode
-    var panes: [PaneSnap]
+public struct TabSnap {
+    public var id: String
+    public var title: String
+    public var tree: SplitNode
+    public var panes: [PaneSnap]
+
+    public init(id: String, title: String, tree: SplitNode, panes: [PaneSnap]) {
+        self.id = id
+        self.title = title
+        self.tree = tree
+        self.panes = panes
+    }
 }
 
-struct WindowSnap {
-    var id: String
-    var frame: String  // "x,y,w,h"
-    var focusedTab: String?
-    var tabs: [TabSnap]
+public struct WindowSnap {
+    public var id: String
+    public var frame: String  // "x,y,w,h"
+    public var focusedTab: String?
+    public var tabs: [TabSnap]
+
+    public init(id: String, frame: String, focusedTab: String?, tabs: [TabSnap]) {
+        self.id = id
+        self.frame = frame
+        self.focusedTab = focusedTab
+        self.tabs = tabs
+    }
 }
 
-struct SnapshotRow {
-    var exe: String
-    var argv: [String]
-    var adapter: String
-    var adapterState: [String: String]
+public struct SnapshotRow {
+    public var exe: String
+    public var argv: [String]
+    public var adapter: String
+    public var adapterState: [String: String]
+
+    public init(exe: String, argv: [String], adapter: String, adapterState: [String: String]) {
+        self.exe = exe
+        self.argv = argv
+        self.adapter = adapter
+        self.adapterState = adapterState
+    }
 }
 
-struct PaneRestore {
-    var cwd: String?
-    var shell: String?
-    var snapshot: SnapshotRow?
+public struct PaneRestore {
+    public var cwd: String?
+    public var shell: String?
+    public var snapshot: SnapshotRow?
+
+    public init(cwd: String?, shell: String?, snapshot: SnapshotRow?) {
+        self.cwd = cwd
+        self.shell = shell
+        self.snapshot = snapshot
+    }
 }
 
-struct TabRestore {
-    var title: String
-    var tree: SplitNode
-    var panes: [String: PaneRestore]
+public struct TabRestore {
+    public var title: String
+    public var tree: SplitNode
+    public var panes: [String: PaneRestore]
+
+    public init(title: String, tree: SplitNode, panes: [String: PaneRestore]) {
+        self.title = title
+        self.tree = tree
+        self.panes = panes
+    }
 }
 
-struct WindowRestore {
-    var frame: String?
-    var focusedTab: String?
-    var tabs: [TabRestore]
+public struct WindowRestore {
+    public var frame: String?
+    public var focusedTab: String?
+    public var tabs: [TabRestore]
+
+    public init(frame: String?, focusedTab: String?, tabs: [TabRestore]) {
+        self.frame = frame
+        self.focusedTab = focusedTab
+        self.tabs = tabs
+    }
 }
 
 // MARK: - Store
 
-final class StateStore {
+public final class StateStore {
     private var db: OpaquePointer?
     private let writer = DispatchQueue(label: "memterm.state-store")
 
-    init(url: URL) {
+    public init(url: URL) {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
@@ -128,13 +175,13 @@ final class StateStore {
 
     // MARK: Meta
 
-    func setMeta(_ key: String, _ value: String) {
+    public func setMeta(_ key: String, _ value: String) {
         writer.async { [self] in
             run("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", [.text(key), .text(value)])
         }
     }
 
-    func getMeta(_ key: String) -> String? {
+    public func getMeta(_ key: String) -> String? {
         writer.sync {
             var result: String?
             query("SELECT value FROM meta WHERE key = ?", [.text(key)]) { stmt in
@@ -146,7 +193,7 @@ final class StateStore {
 
     // MARK: Topology
 
-    func saveTopology(_ windows: [WindowSnap]) {
+    public func saveTopology(_ windows: [WindowSnap]) {
         let now = Int(Date().timeIntervalSince1970)
         writer.async { [self] in
             run("BEGIN IMMEDIATE")
@@ -173,7 +220,7 @@ final class StateStore {
         }
     }
 
-    func updatePaneCwd(_ paneId: String, cwd: String, source: String) {
+    public func updatePaneCwd(_ paneId: String, cwd: String, source: String) {
         let now = Int(Date().timeIntervalSince1970)
         writer.async { [self] in
             run("UPDATE panes SET cwd = ?, cwd_source = ?, updated_at = ? WHERE id = ?",
@@ -183,8 +230,8 @@ final class StateStore {
 
     // MARK: Snapshots
 
-    func upsertSnapshot(_ paneId: String, exe: String, argv: [String], pid: pid_t,
-                        adapter: String, adapterState: [String: String]) {
+    public func upsertSnapshot(_ paneId: String, exe: String, argv: [String], pid: pid_t,
+                               adapter: String, adapterState: [String: String]) {
         let now = Int(Date().timeIntervalSince1970)
         let argvJSON = jsonString(argv) ?? "[]"
         let stateJSON = jsonString(adapterState) ?? "{}"
@@ -195,7 +242,7 @@ final class StateStore {
         }
     }
 
-    func clearSnapshot(_ paneId: String) {
+    public func clearSnapshot(_ paneId: String) {
         writer.async { [self] in
             run("DELETE FROM pane_snapshot WHERE pane_id = ?", [.text(paneId)])
         }
@@ -203,7 +250,7 @@ final class StateStore {
 
     // MARK: Load (launch path, synchronous)
 
-    func loadState() -> [WindowRestore] {
+    public func loadState() -> [WindowRestore] {
         writer.sync {
             var snapshots: [String: SnapshotRow] = [:]
             query("SELECT pane_id, exe, argv, adapter, adapter_state FROM pane_snapshot", []) { stmt in
@@ -244,7 +291,7 @@ final class StateStore {
         }
     }
 
-    func counts() -> (windows: Int, tabs: Int, panes: Int) {
+    public func counts() -> (windows: Int, tabs: Int, panes: Int) {
         writer.sync {
             func count(_ table: String) -> Int {
                 var n = 0
@@ -257,14 +304,26 @@ final class StateStore {
         }
     }
 
+    /// Number of pane_snapshot rows — lets tests assert the whole-topology
+    /// rewrite leaves no orphaned snapshots.
+    public func snapshotCount() -> Int {
+        writer.sync {
+            var n = 0
+            query("SELECT COUNT(*) FROM pane_snapshot", []) { stmt in
+                n = Int(sqlite3_column_int64(stmt, 0))
+            }
+            return n
+        }
+    }
+
     /// Runs `block` on the writer queue — used for scrollback file writes so
     /// they serialize with DB writes, and by barrier() below.
-    func onWriter(_ block: @escaping () -> Void) {
+    public func onWriter(_ block: @escaping () -> Void) {
         writer.async(execute: block)
     }
 
     /// Blocks until every queued write has committed (quit/poweroff flush).
-    func barrier() {
+    public func barrier() {
         writer.sync {}
     }
 

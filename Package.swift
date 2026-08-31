@@ -15,13 +15,25 @@ let package = Package(
             name: "CProcShim",
             path: "Sources/CProcShim"
         ),
+        // Pure logic (config, state store, adapters, restore helpers) —
+        // AppKit-free so it is testable headlessly.
+        .target(
+            name: "MemtermCore",
+            path: "Sources/MemtermCore"
+        ),
         .executableTarget(
             name: "memterm",
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
-                "CProcShim"
+                "CProcShim",
+                "MemtermCore"
             ],
             path: "Sources/memterm"
+        ),
+        .testTarget(
+            name: "MemtermCoreTests",
+            dependencies: ["MemtermCore"],
+            path: "Tests/MemtermCoreTests"
         )
     ]
 )

@@ -1,4 +1,5 @@
 import AppKit
+import MemtermCore
 
 // Interactive-mode application delegate: config, main menu, window/tab/pane
 // lifecycle. The probe modes (--latency/--flood) keep their own bare delegate
@@ -15,7 +16,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     init(smokeMode: Bool = false) {
         self.smokeMode = smokeMode
-        fontSize = config.fontSize
+        fontSize = CGFloat(config.fontSize)
         super.init()
     }
 

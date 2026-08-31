@@ -1,4 +1,5 @@
 import Foundation
+import MemtermCore
 
 let arguments = CommandLine.arguments.dropFirst()
 
@@ -11,7 +12,7 @@ if arguments.contains("--bench") {
 if arguments.contains("--config-dump") {
     let c = Config.load()
     print("config: \(Config.configURL.path)")
-    print("font_family=\(c.fontFamily ?? "(auto)") -> \(c.resolveFont(size: c.fontSize).fontName) @ \(c.fontSize)pt")
+    print("font_family=\(c.fontFamily ?? "(auto)") -> \(c.resolveFont(size: CGFloat(c.fontSize)).fontName) @ \(c.fontSize)pt")
     print("copy_on_select=\(c.copyOnSelect) scrollback_lines=\(c.scrollbackLines) shell=\(c.shell ?? "(env $SHELL)")")
     print("theme: bg=\(c.themeBackground != nil) fg=\(c.themeForeground != nil) cursor=\(c.themeCursor != nil) ansi16=\(c.ansiColors != nil)")
     exit(0)

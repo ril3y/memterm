@@ -1,4 +1,5 @@
 import AppKit
+import MemtermCore
 import SwiftTerm
 
 // One tab/window hosting a pane tree. Splits are plain nested NSSplitViews:
@@ -35,7 +36,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         } else {
             window.center()
         }
-        if let bg = app.config.themeBackground { window.backgroundColor = bg }
+        if let bg = app.config.themeBackgroundColor { window.backgroundColor = bg }
         super.init(window: window)
         window.delegate = self
         firstResponderObservation = window.observe(\.firstResponder) { [weak self] window, _ in
@@ -77,10 +78,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         pane.autoresizingMask = [.width, .height]
         pane.copyOnSelect = config.copyOnSelect
         pane.processDelegate = self
-        if let bg = config.themeBackground { pane.nativeBackgroundColor = bg }
-        if let fg = config.themeForeground { pane.nativeForegroundColor = fg }
-        if let cursor = config.themeCursor { pane.caretColor = cursor }
-        if let ansi = config.ansiColors { pane.installColors(ansi) }
+        if let bg = config.themeBackgroundColor { pane.nativeBackgroundColor = bg }
+        if let fg = config.themeForegroundColor { pane.nativeForegroundColor = fg }
+        if let cursor = config.themeCursorColor { pane.caretColor = cursor }
+        if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
         return pane
     }
 
@@ -127,7 +128,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     }()
 
     private func makeRestoredPane(frame: NSRect, id: String, restore: PaneRestore?) -> PaneView {
-        let (cwd, fellBack) = MemoryEngine.resolveCwd(restore?.cwd)
+        let (cwd, fellBack) = CwdFallback.resolve(restore?.cwd)
         let pane = constructPane(frame: frame)
         pane.paneId = id
         pane.lastKnownCwd = cwd
@@ -136,7 +137,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         // Ghost scrollback: history the user can scroll/search. feed() only —
         // nothing here ever reaches the pty.
         if let ghost = app.memory?.loadScrollback(for: id), !ghost.isEmpty {
-            let crlf = ghost.replacingOccurrences(of: "\n", with: "\r\n")
+            let crlf = ScrollbackText.ghostFeedText(ghost)
             pane.feed(text: "\u{1b}[2m" + crlf + "\u{1b}[0m\r\n")
         }
         let stamp = Self.restoreDateFormatter.string(from: Date())

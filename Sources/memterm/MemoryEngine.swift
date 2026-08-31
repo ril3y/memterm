@@ -1,4 +1,5 @@
 import AppKit
+import MemtermCore
 import SwiftTerm
 
 // The capture side of the memory engine (§7.3): layout on every mutation,
@@ -184,25 +185,6 @@ final class MemoryEngine {
 
     func loadStateForRestore() -> [WindowRestore] {
         store.loadState()
-    }
-
-    /// FR-25: stat the saved cwd; fall back to the nearest existing ancestor,
-    /// else $HOME. Returns (path, fellBack).
-    static func resolveCwd(_ saved: String?) -> (path: String, fellBack: Bool) {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        guard let saved, saved.hasPrefix("/") else { return (home, false) }
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: saved, isDirectory: &isDir), isDir.boolValue {
-            return (saved, false)
-        }
-        var url = URL(fileURLWithPath: saved)
-        while url.path != "/" {
-            url.deleteLastPathComponent()
-            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-                return (url.path, true)
-            }
-        }
-        return (home, true)
     }
 
     // MARK: - Flush (quit / poweroff)

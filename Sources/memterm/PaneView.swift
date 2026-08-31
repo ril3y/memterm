@@ -1,4 +1,5 @@
 import AppKit
+import MemtermCore
 import SwiftTerm
 
 // One terminal pane: a LocalProcessTerminalView plus the Stage-1 UX behaviors
@@ -24,23 +25,18 @@ final class PaneView: LocalProcessTerminalView {
     var shellPath: String?
 
     /// Whole buffer (scrollback + visible grid) as plain text, wrapped rows
-    /// re-joined, trailing blank grid rows trimmed, capped to maxLines.
+    /// re-joined, trailing blank grid rows trimmed, capped to maxLines
+    /// (assembly logic lives in MemtermCore.ScrollbackText).
     func scrollbackText(maxLines: Int) -> String {
         let terminal = getTerminal()
-        var lines: [String] = []
+        var rows: [ScrollbackText.Row] = []
         var row = terminal.buffer.totalLinesTrimmed
         while let line = terminal.getScrollInvariantLine(row: row) {
-            let text = line.translateToString(trimRight: true)
-            if line.isWrapped, !lines.isEmpty {
-                lines[lines.count - 1] += text
-            } else {
-                lines.append(text)
-            }
+            rows.append(ScrollbackText.Row(text: line.translateToString(trimRight: true),
+                                           isWrapped: line.isWrapped))
             row += 1
         }
-        while let last = lines.last, last.isEmpty { lines.removeLast() }
-        if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
-        return lines.joined(separator: "\n")
+        return ScrollbackText.assemble(rows: rows, maxLines: maxLines)
     }
     override func selectionChanged(source: Terminal) {
         super.selectionChanged(source: source)
