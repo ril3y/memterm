@@ -131,6 +131,21 @@ extension MemtermAppDelegate {
               let target = engine.store.listWorkspaces().first(where: { $0.id == id })
         else { return }
         if target.isParked { engine.store.setWorkspaceParked(id, parked: false) }
+        // The scoped topology save that follows rewrites ALL of the target
+        // workspace's rows from what is on screen — so a target with journal
+        // rows but no windows (parked, or switched-away this session) must be
+        // materialized through the standard restore pipeline FIRST, or the
+        // save would erase its stored tabs, a forget the user never asked for
+        // (FR-51: park keeps every journal row; FR-56: only a user gesture
+        // forgets). This also keeps the invariant switchToWorkspace's
+        // materialize-guard relies on: a workspace with any window on screen
+        // has ALL its journaled windows on screen.
+        if !controllers.contains(where: { $0.workspaceId == id }) {
+            let stored = engine.store.loadState(workspaceId: id)
+            if !stored.isEmpty {
+                restoreWindows(stored, workspaceId: id)
+            }
+        }
         let oldId = controller.workspaceId
         if let window = controller.window, let group = window.tabGroup,
            group.windows.count > 1 {
