@@ -282,5 +282,17 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             app.rebuildWorkspaceMenu()
         }
         renameCancelled = false
+        // Keyboard input must return to the terminal: Enter/Esc end editing
+        // via makeFirstResponder(nil), which parks focus on the window itself
+        // and keystrokes would go nowhere. Hand focus back to the pane —
+        // unless something else already claimed it (a focus-loss commit from
+        // clicking another responder: that click wins).
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window,
+                  window.firstResponder === window,
+                  let controller = window.delegate as? TerminalWindowController,
+                  let pane = controller.currentPane() else { return }
+            window.makeFirstResponder(pane)
+        }
     }
 }
