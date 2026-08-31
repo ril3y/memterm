@@ -19,6 +19,11 @@ final class TabStripView: NSVisualEffectView {
     private let scrollView = NSScrollView()
     private let content = TabStripBackgroundView()
     private let plusButton = NSButton()
+    /// Shown only while the workspace row is hidden (workspace_bar=false):
+    /// the Settings gear was its own .right titlebar accessory before the
+    /// custom chrome, independent of the bar — the affordance must survive
+    /// the bar being turned off.
+    private let gearButton = ChipButton()
     private let separator = NSView()
     private var items: [TabItemView] = []
     private var layoutModel = TabStripLayout(available: 0, count: 0)
@@ -26,6 +31,15 @@ final class TabStripView: NSVisualEffectView {
     /// Set by the host: the top visible chrome row clears the traffic lights.
     var leadingInset: CGFloat = 8 {
         didSet { needsLayout = true }
+    }
+
+    /// Set by the host: true while the workspace row (the gear's usual home)
+    /// is hidden, so Settings stays one click away.
+    var showsGear = false {
+        didSet {
+            gearButton.isHidden = !showsGear
+            needsLayout = true
+        }
     }
 
     // -- Drag-reorder state --
@@ -63,6 +77,18 @@ final class TabStripView: NSVisualEffectView {
         plusButton.target = app
         plusButton.action = #selector(MemtermAppDelegate.newWindowForTab(_:))
         addSubview(plusButton)
+
+        gearButton.menuProvider = { [weak app] in app?.makeWorkspacePopUpMenu() }
+        gearButton.isBordered = false
+        gearButton.setButtonType(.momentaryChange)
+        gearButton.image = NSImage(systemSymbolName: "gearshape",
+                                   accessibilityDescription: "Settings")
+        gearButton.contentTintColor = .secondaryLabelColor
+        gearButton.toolTip = "Settings (right-click: workspaces)"
+        gearButton.target = app
+        gearButton.action = #selector(MemtermAppDelegate.openPreferences(_:))
+        gearButton.isHidden = true
+        addSubview(gearButton)
 
         setAccessibilityElement(true)
         setAccessibilityRole(.tabGroup)
@@ -128,7 +154,14 @@ final class TabStripView: NSVisualEffectView {
         super.layout()
         separator.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 1)
         let plusSize: CGFloat = 24
-        plusButton.frame = NSRect(x: bounds.width - plusSize - 6,
+        var trailingX = bounds.width - 6
+        if showsGear {
+            gearButton.frame = NSRect(x: trailingX - plusSize,
+                                      y: (bounds.height - plusSize) / 2 + 0.5,
+                                      width: plusSize, height: plusSize)
+            trailingX = gearButton.frame.minX - 2
+        }
+        plusButton.frame = NSRect(x: trailingX - plusSize,
                                   y: (bounds.height - plusSize) / 2 + 0.5,
                                   width: plusSize, height: plusSize)
         scrollView.frame = NSRect(x: leadingInset, y: 1,
@@ -241,6 +274,35 @@ final class TabStripView: NSVisualEffectView {
 
     func probeTabIds() -> [String] {
         items.compactMap { $0.tab?.tabId }
+    }
+
+    /// The rendered BODY fill of a tab (whole-tab tint probe — the founder's
+    /// ask is the tab body tinted, not a text attribute).
+    func probeBodyColor(of tabId: String) -> CGColor? {
+        items.first { $0.tab?.tabId == tabId }?.layer?.backgroundColor
+    }
+
+    /// Clicks a tab's hover ✕ through the real button action (FR-56 probe:
+    /// the gesture chain closeTapped → closeItem → tab.close()).
+    func probeClickClose(of tabId: String) -> Bool {
+        guard let item = items.first(where: { $0.tab?.tabId == tabId }) else { return false }
+        item.probeClickClose()
+        return true
+    }
+
+    /// Delivers a double-click to a tab body — the rename gesture — through
+    /// the item's real mouseDown path.
+    func probeDoubleClickTab(_ tabId: String) -> Bool {
+        guard let item = items.first(where: { $0.tab?.tabId == tabId }),
+              let window = item.window else { return false }
+        let center = item.convert(NSPoint(x: item.bounds.midX, y: item.bounds.midY), to: nil)
+        guard let event = NSEvent.mouseEvent(
+            with: .leftMouseDown, location: center, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 2, pressure: 1) else { return false }
+        item.mouseDown(with: event)
+        return true
     }
 }
 
@@ -418,5 +480,10 @@ final class TabItemView: NSView {
 
     @objc private func closeTapped(_ sender: Any?) {
         strip?.closeItem(self)
+    }
+
+    /// MEMTERM_UI_PROBE: presses the hover ✕ through its real target/action.
+    func probeClickClose() {
+        closeButton.performClick(nil)
     }
 }

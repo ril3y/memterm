@@ -16,6 +16,16 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// Every live window host (custom-tab-chrome stage). Hosts of hidden
     /// workspaces stay registered while their windows are ordered out.
     private(set) var hosts: [WindowHostController] = []
+    /// The model's own notion of the focused host. NSApp.keyWindow can be nil
+    /// or stale whenever the app is not the ACTIVE app (activation denied —
+    /// probe/smoke runs launched from a shell hit this), so every deliberate
+    /// focus (windowDidBecomeKey, showWindow, focusWindow()) records here and
+    /// keyHost() prefers it over guessing by workspace.
+    private(set) weak var lastFocusedHost: WindowHostController?
+
+    func noteHostFocused(_ host: WindowHostController) {
+        lastFocusedHost = host
+    }
     private var fontSize: CGFloat
     private(set) var memory: MemoryEngine?
     /// Set before windows close at quit so their teardown isn't captured.
@@ -242,26 +252,44 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             }
             selected.tabColor = "#febc2e"
             let yellowDark = strip.probeLabelColor(of: selected.tabId) == NSColor.black
+            // WHOLE-tab tint (the founder's ask, twice): the tab BODY layer's
+            // fill must equal the set color exactly — not a text attribute.
+            let yellowBody = strip.probeBodyColor(of: selected.tabId)
+            let yellowWanted = Self.nsColor(hex: "#febc2e").cgColor
+            let yellowBodyOK = yellowBody == yellowWanted
             selected.tabColor = "#0a84ff"
             let blueLight = strip.probeLabelColor(of: selected.tabId) == NSColor.white
+            let blueBodyOK = strip.probeBodyColor(of: selected.tabId)
+                == Self.nsColor(hex: "#0a84ff").cgColor
             selected.tabColor = nil
-            print("UIPROBE-TINT yellow_dark_text=\(yellowDark) blue_light_text=\(blueLight)")
-            if !yellowDark || !blueLight {
-                print("UIPROBE-FAIL full-tab tint contrast flip"); exit(1)
+            print("UIPROBE-TINT yellow_dark_text=\(yellowDark) blue_light_text=\(blueLight) yellow_body=\(yellowBodyOK) blue_body=\(blueBodyOK)")
+            if !yellowDark || !blueLight || !yellowBodyOK || !blueBodyOK {
+                print("UIPROBE-FAIL full-tab tint (body layer color / contrast flip)"); exit(1)
             }
-            // In-strip reorder leg: reordering is model state (host.tabs) and
-            // the strip mirrors it.
+            // In-strip reorder leg: reordering is model state (host.tabs), the
+            // strip mirrors it, and the order PERSISTS to the journal (custom
+            // titles mark the tabs so the journal rows are attributable).
+            host.tabs[0].customTitle = "R-A"
+            host.tabs[1].customTitle = "R-B"
             let before = strip.probeTabIds()
             host.reorderTab(from: 0, to: 1)
             host.reorderCommitted()
             let after = strip.probeTabIds()
             let reordered = after == [before[1], before[0]]
                 && host.tabs.map(\.tabId) == after
+            self.memory?.flushSync()
+            let journalTitles = self.memory?.store
+                .loadState(workspaceId: self.activeWorkspaceId)
+                .first { $0.tabs.count == 2 }?.tabs.map(\.title) ?? []
+            let journaled = journalTitles == ["R-B", "R-A"]
             host.reorderTab(from: 1, to: 0)  // put it back
             host.reorderCommitted()
-            print("UIPROBE-REORDER swapped=\(reordered)")
-            if !reordered {
-                print("UIPROBE-FAIL strip reorder did not mirror the model"); exit(1)
+            host.tabs[0].customTitle = nil
+            host.tabs[1].customTitle = nil
+            print("UIPROBE-REORDER swapped=\(reordered) journal_order=\(journaled) journal_titles=\(journalTitles)")
+            if !reordered || !journaled {
+                print("UIPROBE-FAIL strip reorder did not mirror the model / persist to the journal")
+                exit(1)
             }
         }
         // Activity-indicator leg: output lands on the FIRST tab while the
@@ -280,12 +308,27 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.8) {
             print("UIPROBE-ACT after_select=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
+            // Keyboard contract: after a tab switch (host.select), the first
+            // responder is a pane OF THE SELECTED TAB — keystrokes land in
+            // the visible pane.
+            guard let host = self.keyHost(), let tab = host.selectedTab else {
+                print("UIPROBE-FAIL no selected tab (focus-after-select)"); exit(1)
+            }
+            let fr = host.window?.firstResponder as? PaneView
+            let focusOK = fr != nil && tab.allPanes().contains { $0 === fr }
+            print("UIPROBE-FOCUS after_tab_select=\(focusOK)")
+            if !focusOK {
+                print("UIPROBE-FAIL keystrokes would not land in the selected tab's pane after tab switch")
+                exit(1)
+            }
         }
         // Workspace-activity leg (founder: hidden workspaces show output):
         // switch to the Probe workspace (Default's windows hide, shells stay
         // live per FR-59), write to a hidden Default pane → Default's chip
         // must mark active, decay to unseen, and clear on switch-back.
         let defaultId = StateStore.defaultWorkspaceId
+        var preSwitchHostIds = Set<ObjectIdentifier>()
+        var preSwitchVisibleWindow: NSWindow?
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
             guard let probe = probeWorkspaceId else {
                 print("UIPROBE-FAIL no Probe workspace"); exit(1)
@@ -319,6 +362,12 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             if chip != .unseen {
                 print("UIPROBE-FAIL chip does not show the unseen ring"); exit(1)
             }
+            // FR-59 swap invariants: record host + visible-window identity so
+            // the switch-back can prove no window was created or destroyed
+            // and the user keeps looking at the SAME window object.
+            preSwitchHostIds = Set(self.hosts.map(ObjectIdentifier.init))
+            preSwitchVisibleWindow = self.hosts
+                .first { $0.window?.isVisible == true }?.window
             self.switchToWorkspace(defaultId)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 8.2) {
@@ -326,6 +375,22 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             print("UIPROBE-WSACT after_switch=\(state)")
             if state != .idle {
                 print("UIPROBE-FAIL switching back must clear the mark"); exit(1)
+            }
+            // Swap-in-place: the same host set, and the same window object is
+            // the visible one (no window created/destroyed on switch).
+            let sameHosts = Set(self.hosts.map(ObjectIdentifier.init)) == preSwitchHostIds
+            let visibleNow = self.hosts.first { $0.window?.isVisible == true }?.window
+            let sameWindow = visibleNow != nil && visibleNow === preSwitchVisibleWindow
+            // Keyboard contract across a workspace switch: keystrokes land in
+            // the swapped-in workspace's selected pane.
+            let host = self.keyHost()
+            let fr = host?.window?.firstResponder as? PaneView
+            let focusOK = fr != nil
+                && host?.selectedTab?.allPanes().contains { $0 === fr } == true
+            print("UIPROBE-SWAP same_hosts=\(sameHosts) same_visible_window=\(sameWindow) focus_in_pane=\(focusOK)")
+            if !sameHosts || !sameWindow || !focusOK {
+                print("UIPROBE-FAIL FR-59 swap must reuse the same hosts/window and land focus in the pane")
+                exit(1)
             }
             // Settings 2.0 leg: the sectioned window must construct and load
             // (buildForm + loadValues run in init) — a broken control graph
@@ -365,6 +430,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             let focusBack = renameHost?.window?.firstResponder is PaneView
             print("UIPROBE-RENAME focus_back_to_pane=\(focusBack)")
             if !focusBack {
+                print("UIPROBE-RENAME-DEBUG fr=\(String(describing: renameHost?.window?.firstResponder)) window=\(String(describing: renameHost?.window)) isWindow=\(renameHost?.window?.firstResponder === renameHost?.window) selected=\(String(describing: renameHost?.selectedTab?.displayTitle)) pane=\(String(describing: renameHost?.selectedTab?.currentPane()))")
                 print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
                 exit(1)
             }
@@ -598,7 +664,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             let host = self.makeHost(frame: nil)
             host.attach(controller, select: true)
             host.showWindow(nil)
-            host.window?.makeKeyAndOrderFront(nil)
+            host.focusWindow()
             restoredSerialController = controller
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 18.4) {
@@ -661,6 +727,129 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             print("UIPROBE-WSCLOSE probe_removed=\(probeGone) default_kept=\(defaultKept) surfaced_default=\(surfacedDefault) visible_window=\(visibleWindow) names=\(names)")
             if !probeGone || !defaultKept || !surfacedDefault || !visibleWindow {
                 print("UIPROBE-FAIL last-tab close must remove the empty workspace and surface Default")
+                exit(1)
+            }
+        }
+        // Hover-✕ leg (founder ask): the strip's ✕ closes the tab through the
+        // real button action, which is a USER close — FR-56 forgets its rows
+        // at the moment of the gesture (before any debounced topology save
+        // could) — and focus lands in the surviving selected tab's pane.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20.6) {
+            guard let host = self.keyHost() else {
+                print("UIPROBE-FAIL no host (close-x leg)"); exit(1)
+            }
+            self.newWindowForTab(nil)
+            guard let doomed = host.selectedTab else {
+                print("UIPROBE-FAIL close-x leg: no new tab"); exit(1)
+            }
+            self.memory?.flushSync()
+            let beforeTabs = self.memory?.store.counts().tabs ?? -1
+            let clicked = host.tabStrip.probeClickClose(of: doomed.tabId)
+            self.memory?.store.barrier()
+            let afterTabs = self.memory?.store.counts().tabs ?? -1
+            let forgotten = afterTabs == beforeTabs - 1
+            let gone = !self.controllers.contains { $0 === doomed }
+            let stripGone = !host.tabStrip.probeTabIds().contains(doomed.tabId)
+            let fr = host.window?.firstResponder as? PaneView
+            let focusOK = fr != nil
+                && host.selectedTab?.allPanes().contains { $0 === fr } == true
+            print("UIPROBE-CLOSEX clicked=\(clicked) rows_forgotten=\(forgotten) controller_gone=\(gone) strip_gone=\(stripGone) focus_in_pane=\(focusOK)")
+            if !clicked || !forgotten || !gone || !stripGone || !focusOK {
+                print("UIPROBE-FAIL hover ✕ must close, forget (FR-56), and return focus to a pane")
+                exit(1)
+            }
+        }
+        // Strip double-click-rename leg (founder ask): the double-click
+        // gesture on a tab body opens the rename sheet; committing through
+        // the sheet's own Rename button pins the title and journals it.
+        var renamedTab: TerminalWindowController?
+        DispatchQueue.main.asyncAfter(deadline: .now() + 21.0) {
+            guard let host = self.keyHost(), let window = host.window,
+                  let tab = host.selectedTab else {
+                print("UIPROBE-FAIL no host (rename-tab leg)"); exit(1)
+            }
+            renamedTab = tab
+            let doubled = host.tabStrip.probeDoubleClickTab(tab.tabId)
+            guard doubled, let sheet = window.attachedSheet,
+                  let sheetRoot = sheet.contentView else {
+                print("UIPROBE-FAIL double-click on the tab did not open the rename sheet")
+                exit(1)
+            }
+            func findField(_ view: NSView) -> NSTextField? {
+                if let field = view as? NSTextField, field.isEditable { return field }
+                for sub in view.subviews { if let f = findField(sub) { return f } }
+                return nil
+            }
+            func findButton(_ view: NSView, title: String) -> NSButton? {
+                if let button = view as? NSButton, button.title == title { return button }
+                for sub in view.subviews {
+                    if let b = findButton(sub, title: title) { return b }
+                }
+                return nil
+            }
+            guard let field = findField(sheetRoot),
+                  let rename = findButton(sheetRoot, title: "Rename") else {
+                print("UIPROBE-FAIL rename sheet lacks its field/button"); exit(1)
+            }
+            field.stringValue = "Probe-Renamed"
+            rename.performClick(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 21.4) {
+            guard let tab = renamedTab else { exit(1) }
+            let titleOK = tab.displayTitle == "Probe-Renamed"
+            self.memory?.flushSync()
+            let journaled = self.memory?.store
+                .loadState(workspaceId: self.activeWorkspaceId)
+                .flatMap(\.tabs).contains { $0.title == "Probe-Renamed" } ?? false
+            print("UIPROBE-RENAMETAB title=\(titleOK) journaled=\(journaled) display=\(tab.displayTitle)")
+            if !titleOK || !journaled {
+                print("UIPROBE-FAIL strip double-click rename did not pin/journal the title")
+                exit(1)
+            }
+            tab.customTitle = nil
+        }
+        // Move Tab to New Window / Merge All Windows leg: OUR re-homing —
+        // same pane objects, same shell process, one extra host; merge folds
+        // the workspace back into one host with identity intact.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 21.8) {
+            // The active workspace holds several hosts by now; act on the
+            // multi-tab one (moveTabToNewWindow needs a tab to leave behind).
+            guard let host = self.hosts.first(where: { h in
+                      h.workspaceId == self.activeWorkspaceId && h.tabs.count > 1
+                          && h.tabs.contains {
+                              $0.allPanes().first?.process?.running == true
+                          }
+                  }),
+                  let tab = host.tabs.first(where: {
+                      $0.allPanes().first?.process?.running == true
+                  }) else {
+                print("UIPROBE-FAIL no multi-tab host with a shell tab (move-window leg)")
+                exit(1)
+            }
+            host.focusWindow()
+            host.select(tab)
+            let paneIds = Set(tab.allPanes().map(ObjectIdentifier.init))
+            guard let pid = tab.allPanes().first?.process?.shellPid else {
+                print("UIPROBE-FAIL move-window leg: no shell pid"); exit(1)
+            }
+            let hostsBefore = self.hosts.count
+            self.moveTabToNewWindowAction(nil)
+            let fresh = tab.host
+            let moved = fresh !== host && self.hosts.count == hostsBefore + 1
+                && fresh?.tabs.count == 1
+            let samePanesMoved = Set(tab.allPanes().map(ObjectIdentifier.init)) == paneIds
+            self.mergeAllWindowsAction(nil)
+            let mergedHosts = self.hosts.filter {
+                $0.workspaceId == self.activeWorkspaceId
+            }
+            let merged = mergedHosts.count == 1
+                && (mergedHosts.first?.tabs.count ?? 0) >= 2
+            let samePanes = samePanesMoved
+                && Set(tab.allPanes().map(ObjectIdentifier.init)) == paneIds
+            let alive = kill(pid, 0) == 0
+            print("UIPROBE-MOVEWIN moved=\(moved) merged=\(merged) same_panes=\(samePanes) pid_alive=\(alive)")
+            if !moved || !merged || !samePanes || !alive {
+                print("UIPROBE-FAIL move-to-new-window/merge must re-home the same panes with the process untouched")
                 exit(1)
             }
             exit(0)
@@ -921,7 +1110,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             host.showWindow(nil)
             if focusedInHost || focusHost == nil { focusHost = host }
         }
-        focusHost?.window?.makeKeyAndOrderFront(nil)
+        focusHost?.focusWindow()
         refreshWorkspaceChips()
     }
 
@@ -1144,12 +1333,18 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     func hostClosed(_ host: WindowHostController) {
         hosts.removeAll { $0 === host }
+        if lastFocusedHost === host { lastFocusedHost = nil }
     }
 
     func keyHost() -> WindowHostController? {
         if let window = NSApp.keyWindow ?? NSApp.mainWindow,
            let host = hosts.first(where: { $0.window === window }) {
             return host
+        }
+        // No key-window info (app not active, or a non-host window is key):
+        // the model's own focus notion wins over guessing by workspace.
+        if let last = lastFocusedHost, hosts.contains(where: { $0 === last }) {
+            return last
         }
         return hosts.first { $0.workspaceId == activeWorkspaceId } ?? hosts.first
     }
@@ -1225,7 +1420,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         let fresh = makeHost(frame: frame)
         fresh.attach(tab, select: true)
         fresh.showWindow(nil)
-        fresh.window?.makeKeyAndOrderFront(nil)
+        fresh.focusWindow()
         memory?.scheduleTopologySave()
         refreshWorkspaceChips()
     }

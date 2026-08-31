@@ -454,16 +454,21 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             app.rebuildWorkspaceMenu()
         }
         renameCancelled = false
-        // Keyboard input must return to the terminal: Enter/Esc end editing
-        // via makeFirstResponder(nil), which parks focus on the window itself
-        // and keystrokes would go nowhere. Hand focus back to the pane —
-        // unless something else already claimed it (a focus-loss commit from
-        // clicking another responder: that click wins).
+        // Keyboard input must return to the terminal: a focus-loss commit
+        // (makeFirstResponder(nil)) parks focus on the window itself — and,
+        // probe-reproduced, AppKit can also leave the DYING field's orphaned
+        // field editor as first responder past this notification. Hand focus
+        // back to the pane in both cases — unless something else already
+        // claimed it (a focus-loss commit from clicking another responder:
+        // that click wins; its field editor has a different delegate).
+        let dyingField = field
         DispatchQueue.main.async { [weak self] in
             guard let self, let window = self.window,
-                  window.firstResponder === window,
                   let host = window.delegate as? WindowHostController,
                   let pane = host.selectedTab?.currentPane() else { return }
+            let fr = window.firstResponder
+            let orphanEditor = (fr as? NSTextView)?.delegate as? NSTextField === dyingField
+            guard fr === window || fr == nil || orphanEditor else { return }
             window.makeFirstResponder(pane)
         }
     }

@@ -65,7 +65,8 @@ extension MemtermAppDelegate {
         // Slot order: the KEY host first — the in-place presentation swaps
         // the incoming primary group into the window the user is looking at.
         var outgoing = hosts.filter { $0.workspaceId == outgoingId }
-        if let keyWindow = NSApp.keyWindow ?? NSApp.mainWindow,
+        if let keyWindow = NSApp.keyWindow ?? NSApp.mainWindow
+            ?? lastFocusedHost?.window,
            let keyIndex = outgoing.firstIndex(where: { $0.window === keyWindow }),
            keyIndex != 0 {
             outgoing.swapAt(0, keyIndex)
@@ -164,7 +165,7 @@ extension MemtermAppDelegate {
         } else {
             for host in extraOutgoing { host.window?.orderOut(nil) }
         }
-        (outgoing.first ?? incoming.first)?.window?.makeKeyAndOrderFront(nil)
+        (outgoing.first ?? incoming.first)?.focusWindow()
     }
 
     /// Resurrect-path presentation: the freshly built hosts rise from alpha 0
@@ -285,7 +286,7 @@ extension MemtermAppDelegate {
     }
 
     func focusWindows(ofWorkspace id: String) {
-        hosts.first { $0.workspaceId == id }?.window?.makeKeyAndOrderFront(nil)
+        hosts.first { $0.workspaceId == id }?.focusWindow()
     }
 
     /// FR-58: reassigns a live tab to another workspace, then FOLLOWS the tab
@@ -333,7 +334,7 @@ extension MemtermAppDelegate {
         if id != activeWorkspaceId {
             switchToWorkspace(id)
         } else {
-            controller.window?.makeKeyAndOrderFront(nil)
+            controller.host?.focusWindow()
         }
     }
 

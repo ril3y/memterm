@@ -169,6 +169,20 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     /// traffic lights (AppKit used to inset titlebar accessories ~78 pt).
     static let trafficLightInset: CGFloat = 78
 
+    /// Deliberate programmatic focus: orders the window key/front AND records
+    /// this host as the app's focused host — NSApp.keyWindow can lag or stay
+    /// nil entirely when the app is not the active app (probe/smoke runs), so
+    /// keyHost() needs the model's own notion kept current.
+    func focusWindow() {
+        window?.makeKeyAndOrderFront(nil)
+        app.noteHostFocused(self)
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        app.noteHostFocused(self)
+    }
+
     // MARK: - Tab management
 
     func tab(containing pane: PaneView) -> TerminalWindowController? {
@@ -351,6 +365,11 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         // The TOP visible chrome row keeps its content clear of the traffic
         // lights; a strip below the workspace bar needs no extra inset.
         tabStrip.leadingInset = barVisible ? 8 : Self.trafficLightInset
+        // The Settings gear was its own .right titlebar accessory before the
+        // custom chrome — visible regardless of workspace_bar. With the bar
+        // row (its current home) hidden, the strip shows its own gear so the
+        // affordance never disappears.
+        tabStrip.showsGear = !barVisible
     }
 
     /// Live config application (Settings changes): chrome rows + window-level
@@ -416,6 +435,7 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     // MARK: - NSWindowDelegate
 
     func windowDidBecomeKey(_ notification: Notification) {
+        app.noteHostFocused(self)
         // Everything on the selected tab is seen: its activity mark clears.
         selectedTab?.noteSelected()
     }
