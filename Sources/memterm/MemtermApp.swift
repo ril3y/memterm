@@ -214,12 +214,28 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 print("UIPROBE-FAIL no window"); exit(1)
             }
             let bar = controller.workspaceBar
-            let barFrame = bar.map { $0.convert($0.bounds, to: nil) } ?? .zero
+            let barFrame = controller.workspaceBarFrameInWindow() ?? .zero
             let content = window.contentLayoutRect
             print("UIPROBE window_h=\(Int(window.frame.height)) content_maxY=\(Int(content.maxY))")
             print("UIPROBE bar_frame=\(Int(barFrame.minX)),\(Int(barFrame.minY)),\(Int(barFrame.width)),\(Int(barFrame.height)) in_window=\(bar?.window === window)")
             print("UIPROBE tabstrip_bottom=\(Int(controller.tabStripBottomY())) tab_bar_visible=\(window.tabGroup?.isTabBarVisible == true)")
             print("UIPROBE chips=\(bar?.chipTitlesForProbe() ?? []) accessory_set=\(window.tab.accessoryView != nil)")
+            // Founder: "workspaces should be on top then tabs below it" — the
+            // bar (a .top titlebar accessory) must sit fully ABOVE the tab
+            // strip, whose band is [tabStripBottomY, minY of the bar]: assert
+            // the bar's bottom clears the strip's bottom edge by at least the
+            // strip's own plausible height (i.e. bar.minY > content top), and
+            // that the terminal content starts below ALL chrome.
+            if self.config.workspaceBar {
+                let stripBottom = controller.tabStripBottomY()
+                print("UIPROBE bar_above_strip=\(barFrame.minY > stripBottom)")
+                if bar?.window !== window || barFrame.height < 20 {
+                    print("UIPROBE-FAIL workspace bar not installed in the titlebar"); exit(1)
+                }
+                if barFrame.minY <= stripBottom {
+                    print("UIPROBE-FAIL workspace bar is not above the tab strip"); exit(1)
+                }
+            }
         }
         // Activity-indicator leg: output lands on the FIRST tab while the
         // second (created above) is selected → active → decays to unseen →
@@ -291,6 +307,67 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             if settings.window == nil {
                 print("UIPROBE-FAIL settings window did not build"); exit(1)
             }
+        }
+        // Inline-rename leg (.top accessory placement): the editor must take
+        // focus INSIDE the titlebar accessory, and committing (focus-loss /
+        // Enter both end editing) must hand the first responder back to the
+        // pane — the exact gate the content-view placement needed.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.5) {
+            guard self.config.workspaceBar else {
+                print("UIPROBE-RENAME skipped (workspace_bar=false)"); return
+            }
+            guard let controller = self.keyController() else {
+                print("UIPROBE-FAIL no controller (rename leg)"); exit(1)
+            }
+            controller.beginWorkspaceRename(self.activeWorkspaceId)
+            // While editing, the first responder is the field editor.
+            let editorFocused = controller.window?.firstResponder is NSTextView
+            print("UIPROBE-RENAME editor_focused=\(editorFocused)")
+            if !editorFocused {
+                print("UIPROBE-FAIL rename editor did not take focus"); exit(1)
+            }
+            controller.window?.makeFirstResponder(nil)  // commit via end-editing
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.9) {
+            guard self.config.workspaceBar else { return }
+            let focusBack = self.keyController()?.window?.firstResponder is PaneView
+            print("UIPROBE-RENAME focus_back_to_pane=\(focusBack)")
+            if !focusBack {
+                print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
+                exit(1)
+            }
+        }
+        // Fullscreen leg (.top accessory placement): enter/exit must not wedge
+        // the accessory — after the round-trip the window is out of
+        // fullscreen, the terminal content spans the restored layout area,
+        // and the bar is back in the titlebar above the tab strip.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9.2) {
+            self.keyController()?.window?.toggleFullScreen(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 11.0) {
+            guard let window = self.keyController()?.window else {
+                print("UIPROBE-FAIL no window (fullscreen leg)"); exit(1)
+            }
+            let inFullScreen = window.styleMask.contains(.fullScreen)
+            print("UIPROBE-FS entered=\(inFullScreen) content_maxY=\(Int(window.contentLayoutRect.maxY)) frame_h=\(Int(window.frame.height))")
+            if !inFullScreen {
+                print("UIPROBE-FAIL window did not enter fullscreen"); exit(1)
+            }
+            window.toggleFullScreen(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12.8) {
+            guard let controller = self.keyController(), let window = controller.window else {
+                print("UIPROBE-FAIL no window (fullscreen exit)"); exit(1)
+            }
+            let stillFullScreen = window.styleMask.contains(.fullScreen)
+            let barFrame = controller.workspaceBarFrameInWindow() ?? .zero
+            let barOK = !self.config.workspaceBar
+                || (controller.workspaceBar?.window === window
+                    && barFrame.minY > controller.tabStripBottomY())
+            print("UIPROBE-FS exited=\(!stillFullScreen) bar_restored=\(barOK)")
+            if stillFullScreen || !barOK {
+                print("UIPROBE-FAIL fullscreen round-trip wedged the accessory"); exit(1)
+            }
             exit(0)
         }
     }
@@ -298,15 +375,22 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Tab-strip gestures (shared region logic for both monitors)
 
     /// The tab this gesture applies to, when the event lands on the native
-    /// tab strip of one of our windows: between the top of the workspace bar
-    /// (or contentLayoutRect.maxY when the bar is hidden) and the bottom of
-    /// the titlebar proper. Returns the controller of the window that
-    /// received the event — the selected tab of its group.
+    /// tab strip of one of our windows: between the top of the content layout
+    /// area (contentLayoutRect.maxY — the strip's bottom edge under
+    /// .fullSizeContentView) and the bottom of the titlebar proper. The
+    /// workspace bar is a .top titlebar accessory now, so any point inside
+    /// its frame is the BAR's gesture (chip double-click rename, chip
+    /// right-click menu), never the tab strip's — excluded explicitly, which
+    /// stays correct wherever AppKit places the accessory. Returns the
+    /// controller of the window that received the event — the selected tab
+    /// of its group.
     private func tabStripController(for event: NSEvent) -> TerminalWindowController? {
         guard let window = event.window,
               window.tabGroup?.isTabBarVisible == true,
               let controller = controllers.first(where: { $0.window === window })
         else { return nil }
+        if let barFrame = controller.workspaceBarFrameInWindow(),
+           barFrame.contains(event.locationInWindow) { return nil }
         let y = event.locationInWindow.y
         let tabStripBottom = controller.tabStripBottomY()
         let titlebarBottom = window.frame.height - 28

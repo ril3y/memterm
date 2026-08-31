@@ -39,10 +39,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     /// Titlebar workspace chip (color dot + name; click = switcher menu).
     /// FR-58: right-click opens the same switcher menu as left-click.
     private let workspaceChipButton = ChipButton()
-    /// The always-visible workspace bar under the tab bar (WorkspaceBar.swift),
-    /// pinned to the top of the content view; the pane tree lives in
-    /// `terminalContainer` beneath it.
+    /// The workspace bar (WorkspaceBar.swift), hosted in a .top titlebar
+    /// accessory ABOVE the native tab strip (founder: "workspaces should be
+    /// on top then tabs below it"); the pane tree fills the full content
+    /// layout area beneath the chrome.
     private(set) var workspaceBar: WorkspaceBarView?
+    /// The .top accessory hosting `workspaceBar`; nil while workspace_bar=false
+    /// (removing it also restores the titlebar's window title).
+    private var workspaceBarAccessory: NSTitlebarAccessoryViewController?
     private let terminalContainer = NSView()
     /// `window_blur`: behind-window blur, shown only while the window is
     /// translucent (Settings 2.0). Public NSVisualEffectView — no private
@@ -64,9 +68,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         self.app = app
         self.workspaceId = workspaceId
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
+        // .fullSizeContentView is required for the workspace bar's .top
+        // titlebar accessory (feasibility study, macOS 26.2); the terminal
+        // never draws under the chrome because terminalContainer is pinned to
+        // contentLayoutGuide, which excludes titlebar + accessory + tab strip.
         let window = NSWindow(
             contentRect: rect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable,
+                        .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -94,23 +103,35 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             }
         }
 
-        let content = NSView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
+        let content = NSView(frame: NSRect(origin: .zero, size: window.frame.size))
         window.contentView = content
         blurView.material = .hudWindow
         blurView.blendingMode = .behindWindow
         blurView.state = .active
-        blurView.frame = content.bounds
-        blurView.autoresizingMask = [.width, .height]
         blurView.isHidden = true
         content.addSubview(blurView)
-        terminalContainer.frame = content.bounds
-        terminalContainer.autoresizingMask = [.width, .height]
         content.addSubview(terminalContainer)
         applyWindowChrome(app.config)
         let bar = WorkspaceBarView(app: app)
         workspaceBar = bar
-        content.addSubview(bar)
-        layoutWorkspaceBar(visible: app.config.workspaceBar)
+        setWorkspaceBarVisible(app.config.workspaceBar)
+        // With .fullSizeContentView the content view spans the whole window;
+        // contentLayoutGuide tracks the region below titlebar + top accessory
+        // + tab strip, through tab-bar show/hide and fullscreen transitions.
+        if let guide = window.contentLayoutGuide as? NSLayoutGuide {
+            for view in [blurView, terminalContainer] {
+                view.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([
+                    view.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                    view.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                    view.topAnchor.constraint(equalTo: guide.topAnchor),
+                    view.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                ])
+            }
+        }
+        // Pre-layout bounds so the initial pane/split tree is built against a
+        // realistic size (Auto Layout replaces this on the first pass).
+        terminalContainer.frame = window.contentLayoutRect
         let root: NSView
         if let restoredTab {
             root = buildNode(restoredTab.tree, frame: terminalContainer.bounds,
@@ -183,40 +204,62 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         window.addTitlebarAccessoryViewController(accessory)
     }
 
-    // MARK: - Workspace bar (founder UX: visible workspaces, inline rename)
+    // MARK: - Workspace bar (founder UX: visible workspaces ABOVE the tabs)
 
-    /// Pins the bar to the top of the content view and gives the terminal
-    /// container the rest. (A titlebar accessory was tried first — see the
-    /// header note in WorkspaceBar.swift for why content-view placement won.)
-    private func layoutWorkspaceBar(visible: Bool) {
-        guard let content = window?.contentView, let bar = workspaceBar else { return }
-        bar.isHidden = !visible
-        let barHeight = visible ? WorkspaceBarView.height : 0
-        bar.frame = NSRect(x: 0, y: content.bounds.height - WorkspaceBarView.height,
-                           width: content.bounds.width, height: WorkspaceBarView.height)
-        bar.autoresizingMask = [.width, .minYMargin]
-        terminalContainer.frame = NSRect(x: 0, y: 0, width: content.bounds.width,
-                                         height: content.bounds.height - barHeight)
+    /// Installs/removes the bar's .top titlebar accessory (one per window,
+    /// like the .right gear). Verified on macOS 26.2: with .fullSizeContentView
+    /// a .top accessory renders ABOVE the native tab strip, per-window, without
+    /// the .bottom stacking bug (see the WorkspaceBar.swift header). Known
+    /// trade-off: while a .top accessory is present AppKit auto-hides the
+    /// titlebar's window-title text — acceptable because memterm shows the tab
+    /// bar by default (tab titles carry the info); with always_show_tab_bar =
+    /// false AND workspace_bar = true the title is not visible on a single-tab
+    /// window. Removing the accessory (workspace_bar = false) restores the
+    /// native title automatically.
+    private func setWorkspaceBarVisible(_ visible: Bool) {
+        guard let window, let bar = workspaceBar else { return }
+        if visible {
+            guard workspaceBarAccessory == nil else { return }
+            bar.frame = NSRect(x: 0, y: 0, width: window.frame.width,
+                               height: WorkspaceBarView.height)
+            let accessory = NSTitlebarAccessoryViewController()
+            accessory.view = bar
+            accessory.layoutAttribute = .top
+            window.addTitlebarAccessoryViewController(accessory)
+            workspaceBarAccessory = accessory
+        } else if let accessory = workspaceBarAccessory {
+            accessory.removeFromParent()
+            workspaceBarAccessory = nil
+        }
     }
 
     func updateWorkspaceBar(workspaces: [WorkspaceRow], activeId: String,
                             activity: [String: TabActivityState] = [:]) {
         workspaceBar?.update(workspaces: workspaces, activeId: activeId, activity: activity)
-        let visible = app.config.workspaceBar
-        if workspaceBar?.isHidden == visible {  // visibility flipped in config
-            layoutWorkspaceBar(visible: visible)
-        }
+        setWorkspaceBarVisible(app.config.workspaceBar)  // follows config flips
     }
 
     func beginWorkspaceRename(_ workspaceId: String) {
         workspaceBar?.beginRename(workspaceId: workspaceId)
     }
 
-    /// Bottom edge (window coords) of the native tab strip. The workspace bar
-    /// lives inside the content view, so this is simply contentLayoutRect.maxY.
-    /// Shared by the double-click-rename and right-click-menu monitors.
+    /// Bottom edge (window coords) of the native tab strip: the top of the
+    /// content layout area — with .fullSizeContentView, contentLayoutRect
+    /// excludes ALL titlebar chrome (titlebar row, .top workspace-bar
+    /// accessory, tab strip), so its maxY is the strip's bottom edge. Shared
+    /// by the double-click-rename and right-click-menu monitors (which also
+    /// exclude the workspace bar's own frame — see tabStripController).
     func tabStripBottomY() -> CGFloat {
         window?.contentLayoutRect.maxY ?? 0
+    }
+
+    /// The workspace bar's frame in window coords, when it is installed in
+    /// this window's titlebar (nil while workspace_bar=false). Used by the
+    /// tab-strip gesture monitors and the UI probe.
+    func workspaceBarFrameInWindow() -> NSRect? {
+        guard let bar = workspaceBar, workspaceBarAccessory != nil,
+              bar.window === window else { return nil }
+        return bar.convert(bar.bounds, to: nil)
     }
 
     /// The gear replaced the name/color chip; the workspace identity lives in

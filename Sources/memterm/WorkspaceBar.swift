@@ -2,18 +2,25 @@ import AppKit
 import MemtermCore
 
 // Founder UX stage (2026-08-31): "i would almost expect to be able to see the
-// workspaces and then click on the name to change vs right clicking".
+// workspaces and then click on the name to change vs right clicking" — and
+// then: "workspaces should be on top then tabs below it".
 //
-// The workspace bar: a full-width 26 pt strip pinned to the top of each
-// tab's content view, directly under the native tab bar. (The
-// NSTitlebarAccessoryViewController .bottom placement was tried first and
-// measured wrong: with native tabs, EVERY tabbed window's bottom accessory
-// stacks into the shared titlebar at once — two tabs rendered two bars,
-// 72 pt of chrome — and AppKit forced the height to 36. A content-view bar
-// is one-per-tab with exactly the selected tab's visible, which is the
-// stage's named fallback.) All workspaces render as chips (color dot +
-// name): the active one visually distinct, parked ones dimmed with
-// "(parked)", plus a "+" to create one.
+// The workspace bar: a 26 pt strip hosted in a .top
+// NSTitlebarAccessoryViewController, one per window, rendering ABOVE the
+// native tab strip (window styleMask includes .fullSizeContentView — the
+// verified recipe from the macOS 26.2 feasibility study). History: a .bottom
+// accessory was tried first and measured wrong (with native tabs EVERY tabbed
+// window's bottom accessory stacked into the shared titlebar at once — two
+// tabs rendered two bars, 72 pt of chrome — and AppKit forced the height to
+// 36); a content-view strip under the tab bar shipped as the fallback until
+// the founder asked for workspaces on top, and the study verified .top has
+// neither problem: per-window, coexists with the .right gear accessory.
+// Caveats baked in: AppKit insets the accessory past the traffic lights
+// (~78 pt) and auto-hides the titlebar's window-title text while a .top
+// accessory is present (tab titles carry that info; see
+// TerminalWindowController.setWorkspaceBarVisible). All workspaces render as
+// chips (color dot + name): the active one visually distinct, parked ones
+// dimmed with "(parked)", plus a "+" to create one.
 //
 //   click a chip           = switch to it (reopens if parked)
 //   click the ACTIVE chip  = inline rename (label swaps for a text field —
@@ -71,10 +78,14 @@ final class WorkspaceBarView: NSVisualEffectView {
         addButton.action = #selector(MemtermAppDelegate.newWorkspaceAction(_:))
         addButton.translatesAutoresizingMaskIntoConstraints = false
 
+        // Trailing clearance 44: the .top accessory shares the titlebar row
+        // with the .right gear accessory (feasibility study) — chips must
+        // never crowd under it. Leading stays 10: AppKit already insets the
+        // accessory past the traffic lights.
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 0.5),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -10),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -44),
         ])
     }
 
@@ -82,6 +93,10 @@ final class WorkspaceBarView: NSVisualEffectView {
         super.viewDidChangeEffectiveAppearance()
         separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
     }
+
+    /// Titlebar-accessory placement: empty bar space IS titlebar — dragging
+    /// the window by it must keep working (chips opt out; they handle clicks).
+    override var mouseDownCanMoveWindow: Bool { true }
 
     /// FR-58 spirit: right-click on empty bar space still reaches "create".
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -267,6 +282,11 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     }
 
     // MARK: - Mouse
+
+    /// In the titlebar accessory, a chip click must be a click (switch /
+    /// rename), never the start of a window drag — the bar's background keeps
+    /// the drag affordance instead.
+    override var mouseDownCanMoveWindow: Bool { false }
 
     /// The whole chip is one click target: the label must never swallow
     /// clicks or right-clicks (an NSTextField would otherwise receive them
