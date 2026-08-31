@@ -13,7 +13,7 @@ if arguments.contains("--config-dump") {
     let c = Config.load()
     print("config: \(Config.configURL.path)")
     print("font_family=\(c.fontFamily ?? "(auto)") -> \(c.resolveFont(size: CGFloat(c.fontSize)).fontName) @ \(c.fontSize)pt")
-    print("copy_on_select=\(c.copyOnSelect) scrollback_lines=\(c.scrollbackLines) shell=\(c.shell ?? "(env $SHELL)")")
+    print("copy_on_select=\(c.copyOnSelect) scrollback_lines=\(c.scrollbackLines) shell=\(c.shell ?? "(env $SHELL)") shell_integration=\(c.shellIntegration)")
     print("new_tab_same_cwd=\(c.newTabSameCwd) option_as_meta=\(c.optionAsMeta) bell_style=\(c.bellStyle) cursor_style=\(c.cursorStyle) always_show_tab_bar=\(c.alwaysShowTabBar)")
     print("confirm_quit=\(c.confirmQuit) allow_mouse_reporting=\(c.allowMouseReporting) bell_sound=\(c.bellSound ?? "(system beep)") line_spacing=\(c.lineSpacing) window_opacity=\(c.windowOpacity) window_blur=\(c.windowBlur)")
     print("theme: bg=\(c.themeBackground != nil) fg=\(c.themeForeground != nil) cursor=\(c.themeCursor != nil) selection=\(c.themeSelection != nil) ansi16=\(c.ansiColors != nil) preset=\(c.themePreset ?? "(none)")")

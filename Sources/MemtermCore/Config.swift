@@ -43,6 +43,11 @@ public struct Config {
     public var alwaysShowTabBar = true
     public var scrollbackLines = 10_000
     public var shell: String?
+    /// FR-5 / per-tab history: spawn zsh panes through the ZDOTDIR wrapper
+    /// (per-tab ↑ history, OSC 7 cwd, OSC 133 prompt marks). `false` spawns
+    /// shells exactly as before the feature existed. zsh only this stage;
+    /// other shells always spawn plain.
+    public var shellIntegration = true
     /// iTerm2 parity: ⌘T/⌘N (and the tab bar's "+") open in the key pane's
     /// current directory (kernel-truth cwd — works without shell integration).
     public var newTabSameCwd = true
@@ -142,6 +147,7 @@ public struct Config {
         if let b = boolean(values["always_show_tab_bar"]) { c.alwaysShowTabBar = b }
         if case .int(let n)? = values["scrollback_lines"], n >= 0 { c.scrollbackLines = n }
         if let s = string(values["shell"]), !s.isEmpty { c.shell = s }
+        if let b = boolean(values["shell_integration"]) { c.shellIntegration = b }
         if let b = boolean(values["new_tab_same_cwd"]) { c.newTabSameCwd = b }
         if let b = boolean(values["option_as_meta"]) { c.optionAsMeta = b }
         // Unknown style values keep the defaults (never a broken terminal).
@@ -238,6 +244,7 @@ public struct Config {
         } else {
             lines.append("# shell = \"/bin/zsh\"  # default: $SHELL, run as a login shell")
         }
+        lines.append("shell_integration = \(shellIntegration)  # per-tab ↑ history + prompt marks (zsh)")
         lines.append("new_tab_same_cwd = \(newTabSameCwd)  # new tabs/windows open in the current directory")
         lines.append("option_as_meta = \(optionAsMeta)  # Option sends Esc+ (readline/emacs word keys)")
         lines.append("confirm_quit = \(confirmQuit)  # ⌘Q asks first when foreground jobs are running")
@@ -300,6 +307,11 @@ public struct Config {
 
         # Default: $SHELL, run as a login shell.
         # shell = "/bin/zsh"
+
+        # Shell integration (zsh): per-tab ↑ history, prompt marks, and
+        # directory tracking, injected at spawn — no dotfile edits. false
+        # spawns shells exactly as a plain terminal would.
+        # shell_integration = true
 
         # New tabs and windows open in the current pane's directory.
         # new_tab_same_cwd = true

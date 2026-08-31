@@ -445,14 +445,29 @@ public final class StateStore {
         invalidateWorkspaceCache()
     }
 
+    /// Removes one pane's on-disk byte trail: its scrollback file and (FR-56/57
+    /// for the per-tab shell history) its .hist file. Both live under the state
+    /// dir and both die with the same forget gestures.
+    private static func removePaneFiles(_ paneId: String, scrollbackDir: URL?,
+                                        historyDir: URL?) {
+        if let scrollbackDir {
+            try? FileManager.default.removeItem(
+                at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
+        }
+        if let historyDir {
+            try? FileManager.default.removeItem(
+                at: ShellIntegration.histFileURL(dir: historyDir, paneId: paneId))
+        }
+    }
+
     /// FR-50/57 "forget": purges the workspace's journal rows AND its panes'
-    /// scrollback files on disk — forgetting deletes bytes, not just the index.
-    /// Files are removed only after the row purge COMMITs, so a failed
-    /// transaction never leaves rows pointing at deleted scrollback.
-    public func forgetWorkspace(_ id: String, scrollbackDir: URL?) {
+    /// scrollback + shell-history files on disk — forgetting deletes bytes,
+    /// not just the index. Files are removed only after the row purge COMMITs,
+    /// so a failed transaction never leaves rows pointing at deleted files.
+    public func forgetWorkspace(_ id: String, scrollbackDir: URL?, historyDir: URL? = nil) {
         writer.async { [self] in
             var paneIds: [String] = []
-            if scrollbackDir != nil {
+            if scrollbackDir != nil || historyDir != nil {
                 query("""
                       SELECT p.id FROM panes p JOIN tabs t ON p.tab_id = t.id
                       WHERE t.workspace_id = ?
@@ -474,10 +489,10 @@ public final class StateStore {
                 ok = run("DELETE FROM workspaces WHERE id = ?", [.text(id)]) == SQLITE_OK && ok
                 return ok
             }
-            if committed, let scrollbackDir {
+            if committed {
                 for paneId in paneIds {
-                    try? FileManager.default.removeItem(
-                        at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
+                    Self.removePaneFiles(paneId, scrollbackDir: scrollbackDir,
+                                         historyDir: historyDir)
                 }
             }
         }
@@ -486,12 +501,12 @@ public final class StateStore {
 
     // MARK: Forget (FR-56/57: close = throw it away; kill memories at every granularity)
 
-    /// FR-56/57: purges the journal rows AND scrollback files for exactly
-    /// these panes. Used both by "Forget Pane Memory" (pane stays open — the
-    /// next capture starts a fresh trail) and by user-initiated pane closes
-    /// (the pane must never restore). Files are removed only after the row
-    /// purge COMMITs, mirroring forgetWorkspace.
-    public func forgetPanes(_ paneIds: [String], scrollbackDir: URL?) {
+    /// FR-56/57: purges the journal rows AND scrollback + shell-history files
+    /// for exactly these panes. Used both by "Forget Pane Memory" (pane stays
+    /// open — the next capture starts a fresh trail) and by user-initiated
+    /// pane closes (the pane must never restore). Files are removed only
+    /// after the row purge COMMITs, mirroring forgetWorkspace.
+    public func forgetPanes(_ paneIds: [String], scrollbackDir: URL?, historyDir: URL? = nil) {
         guard !paneIds.isEmpty else { return }
         writer.async { [self] in
             let marks = Array(repeating: "?", count: paneIds.count).joined(separator: ",")
@@ -502,21 +517,21 @@ public final class StateStore {
                 ok = run("DELETE FROM panes WHERE id IN (\(marks))", binds) == SQLITE_OK && ok
                 return ok
             }
-            if committed, let scrollbackDir {
+            if committed {
                 for paneId in paneIds {
-                    try? FileManager.default.removeItem(
-                        at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
+                    Self.removePaneFiles(paneId, scrollbackDir: scrollbackDir,
+                                         historyDir: historyDir)
                 }
             }
         }
     }
 
     /// FR-56: a user-initiated tab close (⌘W, close button, native tab close)
-    /// removes the tab's rows, its panes' rows + snapshots + scrollback files,
-    /// and any window row left with no tabs — those tabs must never restore.
-    /// Quit/switch/park teardown must NOT reach this (callers gate on their
-    /// isTerminating / isSwitchingWorkspaces flags).
-    public func forgetTabs(_ tabIds: [String], scrollbackDir: URL?) {
+    /// removes the tab's rows, its panes' rows + snapshots + scrollback and
+    /// shell-history files, and any window row left with no tabs — those tabs
+    /// must never restore. Quit/switch/park teardown must NOT reach this
+    /// (callers gate on their isTerminating / isSwitchingWorkspaces flags).
+    public func forgetTabs(_ tabIds: [String], scrollbackDir: URL?, historyDir: URL? = nil) {
         guard !tabIds.isEmpty else { return }
         writer.async { [self] in
             let marks = Array(repeating: "?", count: tabIds.count).joined(separator: ",")
@@ -537,10 +552,10 @@ public final class StateStore {
                 ok = run("DELETE FROM windows WHERE id NOT IN (SELECT DISTINCT window_id FROM tabs)") == SQLITE_OK && ok
                 return ok
             }
-            if committed, let scrollbackDir {
+            if committed {
                 for paneId in paneIds {
-                    try? FileManager.default.removeItem(
-                        at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
+                    Self.removePaneFiles(paneId, scrollbackDir: scrollbackDir,
+                                         historyDir: historyDir)
                 }
             }
         }
@@ -548,27 +563,31 @@ public final class StateStore {
 
     /// FR-45/57 "Forget Everything": removes the store's entire on-disk
     /// footprint — the db, its WAL/SHM sidecars, the FR-17 generation backups,
-    /// any .corrupt remnant, and every scrollback file. Call ONLY after the
-    /// StateStore instance has been released (its deinit closes the SQLite
-    /// connection); the caller then constructs a fresh StateStore and
-    /// re-captures the live layout so capture continues cleanly.
-    public static func purgeAll(dbURL: URL, scrollbackDir: URL) {
+    /// any .corrupt remnant, every scrollback file, and every per-pane shell
+    /// history file. Call ONLY after the StateStore instance has been released
+    /// (its deinit closes the SQLite connection); the caller then constructs a
+    /// fresh StateStore and re-captures the live layout so capture continues
+    /// cleanly.
+    public static func purgeAll(dbURL: URL, scrollbackDir: URL, historyDir: URL? = nil) {
         let fm = FileManager.default
         var doomed = [dbURL.path, dbURL.path + "-wal", dbURL.path + "-shm",
                       dbURL.path + ".corrupt"]
         for n in 1...generationCount { doomed.append(generationURL(dbURL, n).path) }
         for path in doomed { try? fm.removeItem(atPath: path) }
-        if let files = try? fm.contentsOfDirectory(at: scrollbackDir,
-                                                   includingPropertiesForKeys: nil) {
-            for file in files { try? fm.removeItem(at: file) }
+        for dir in [scrollbackDir, historyDir].compactMap({ $0 }) {
+            if let files = try? fm.contentsOfDirectory(at: dir,
+                                                       includingPropertiesForKeys: nil) {
+                for file in files { try? fm.removeItem(at: file) }
+            }
         }
     }
 
-    /// FR-57 hygiene: deletes scrollback files whose pane no longer has a row
-    /// in the panes table (closed panes' files used to accumulate forever).
+    /// FR-57 hygiene: deletes scrollback files (and, when `historyDir` is
+    /// given, per-pane .hist files) whose pane no longer has a row in the
+    /// panes table (closed panes' files used to accumulate forever).
     /// No-ops on a degraded store — an empty pane set there is ignorance, not
     /// evidence, and must never trigger a mass delete.
-    public func purgeOrphanScrollback(dir: URL) {
+    public func purgeOrphanScrollback(dir: URL, historyDir: URL? = nil) {
         writer.async { [self] in
             guard db != nil else { return }
             var live = Set<String>()
@@ -576,12 +595,23 @@ public final class StateStore {
                 // Compare in file-name space: fileURL sanitizes ids on write.
                 if let id = column(stmt, 0) { live.insert(ScrollbackText.safePaneId(id)) }
             }
-            guard let files = try? FileManager.default.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: nil) else { return }
-            for file in files where file.pathExtension == "txt" {
-                let paneId = file.deletingPathExtension().lastPathComponent
-                if !live.contains(paneId) {
-                    try? FileManager.default.removeItem(at: file)
+            let fm = FileManager.default
+            if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                for file in files where file.pathExtension == "txt" {
+                    let paneId = file.deletingPathExtension().lastPathComponent
+                    if !live.contains(paneId) {
+                        try? fm.removeItem(at: file)
+                    }
+                }
+            }
+            if let historyDir,
+               let files = try? fm.contentsOfDirectory(at: historyDir,
+                                                       includingPropertiesForKeys: nil) {
+                for file in files where file.pathExtension == "hist" {
+                    let paneId = file.deletingPathExtension().lastPathComponent
+                    if !live.contains(paneId) {
+                        try? fm.removeItem(at: file)
+                    }
                 }
             }
         }

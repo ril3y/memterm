@@ -42,6 +42,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let bellSoundPopUp = NSPopUpButton()
     private let optionMetaCheck = NSButton(checkboxWithTitle: "Option key sends Esc+ (meta)", target: nil, action: nil)
     private let mouseReportingCheck = NSButton(checkboxWithTitle: "Allow apps to use the mouse (vim, htop)", target: nil, action: nil)
+    private let shellIntegrationCheck = NSButton(checkboxWithTitle: "Shell integration (zsh)", target: nil, action: nil)
 
     // Memory
     private let scrollbackField = NSTextField()
@@ -116,7 +117,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildForm() {
         for check in [sameCwdCheck, copyOnSelectCheck, confirmQuitCheck, workspaceBarCheck,
-                      alwaysTabBarCheck, optionMetaCheck, mouseReportingCheck, blurCheck] {
+                      alwaysTabBarCheck, optionMetaCheck, mouseReportingCheck, blurCheck,
+                      shellIntegrationCheck] {
             wire(check)
         }
         wire(fontPopUp)
@@ -255,6 +257,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSGridCell.emptyContentView, optionMetaCheck],
             [NSGridCell.emptyContentView, mouseReportingCheck],
             [NSGridCell.emptyContentView, caption("Off forces native text selection everywhere; apps stop seeing the mouse.")],
+            [NSGridCell.emptyContentView, shellIntegrationCheck],
+            [NSGridCell.emptyContentView, caption("Per-tab ↑ history, prompt marks, and directory tracking, injected at spawn — no dotfile edits. Applies to new panes; zsh only for now.")],
         ])
 
         // -- Memory --
@@ -369,6 +373,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             || config.bellStyle == "soundAndVisual"
         optionMetaCheck.state = config.optionAsMeta ? .on : .off
         mouseReportingCheck.state = config.allowMouseReporting ? .on : .off
+        shellIntegrationCheck.state = config.shellIntegration ? .on : .off
 
         // Memory
         scrollbackField.integerValue = config.scrollbackLines
@@ -470,6 +475,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             || config.bellStyle == "soundAndVisual"
         config.optionAsMeta = optionMetaCheck.state == .on
         config.allowMouseReporting = mouseReportingCheck.state == .on
+        config.shellIntegration = shellIntegrationCheck.state == .on
 
         // Memory
         if scrollbackField.integerValue >= 100 { config.scrollbackLines = scrollbackField.integerValue }

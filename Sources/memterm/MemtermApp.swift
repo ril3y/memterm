@@ -795,6 +795,29 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 self.memory?.flushSync()
                 guard let counts = self.memory?.store.counts() else { exit(1) }
                 print("SMOKE-SAVED windows=\(counts.windows) tabs=\(counts.tabs) panes=\(counts.panes)")
+                // Per-tab shell history leg: the pane that ran 'cd /tmp' runs
+                // the REAL zsh integration (real rc files, real hooks) — its
+                // .hist file must exist and contain the command. Non-zsh
+                // shells (or integration off) skip with a note, never fail.
+                if let pane = self.controllers.first?.allPanes().first,
+                   let engine = self.memory {
+                    let shellPath = pane.shellPath ?? ""
+                    if self.config.shellIntegration,
+                       ShellIntegration.isZsh(shellPath: shellPath),
+                       engine.shellIntegrationDir != nil {
+                        let histURL = ShellIntegration.histFileURL(
+                            dir: engine.historyDir, paneId: pane.paneId)
+                        let hist = (try? String(contentsOf: histURL, encoding: .utf8)) ?? ""
+                        if hist.contains("cd /tmp") {
+                            print("SMOKE-HIST captured=true entries=\(hist.split(separator: "\n").count)")
+                        } else {
+                            print("SMOKE-FAIL pane history missing 'cd /tmp' at \(histURL.path) (contents: \(hist.prefix(200)))")
+                            exit(1)
+                        }
+                    } else {
+                        print("SMOKE-HIST skipped (shell \(shellPath) is not zsh or integration off)")
+                    }
+                }
                 // FR-59 leg: record Default's controllers, shell pids, and
                 // frame, then switch to a fresh workspace B. The switch must
                 // HIDE Default — same objects, processes untouched.
@@ -1099,9 +1122,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         let openWorkspaces = memory!.store.listWorkspaces().filter { openIds.contains($0.id) }
         let dbURL = MemoryEngine.baseDir.appendingPathComponent("state.db")
         let scrollbackDir = memory!.scrollbackDir
+        let historyDir = memory!.historyDir
         memory?.shutdown()  // timers off, writer queue drained
         memory = nil        // releases the engine → StateStore deinit closes the db
-        StateStore.purgeAll(dbURL: dbURL, scrollbackDir: scrollbackDir)
+        StateStore.purgeAll(dbURL: dbURL, scrollbackDir: scrollbackDir,
+                            historyDir: historyDir)
 
         let fresh = MemoryEngine(app: self, config: config)
         memory = fresh

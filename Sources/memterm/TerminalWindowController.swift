@@ -468,7 +468,29 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if !FileManager.default.isExecutableFile(atPath: shell) { shell = "/bin/zsh" }
         pane.shellPath = shell
         let shellName = (shell as NSString).lastPathComponent
-        pane.startProcess(executable: shell, execName: "-\(shellName)", currentDirectory: cwd)
+        // Shell integration (FR-5 / per-tab ↑ history): zsh panes spawn with
+        // the ZDOTDIR wrapper env. The base is EXACTLY what SwiftTerm uses
+        // for a nil environment (verified in LocalProcess.startProcess), so
+        // integration only ADDS variables; any other shell — or the config
+        // key off, or a failed wrapper install — passes nil and spawns
+        // exactly as before. Restored panes have their journaled paneId set
+        // before this runs, so the seeded .hist is the same tab's.
+        var environment: [String]?
+        if app.config.shellIntegration, ShellIntegration.isZsh(shellPath: shell),
+           let integrationDir = app.memory?.shellIntegrationDir,
+           let historyDir = app.memory?.historyDir {
+            let processEnv = ProcessInfo.processInfo.environment
+            let userZdotdir = processEnv["ZDOTDIR"]
+                ?? FileManager.default.homeDirectoryForCurrentUser.path
+            environment = ShellIntegration.environment(
+                base: Terminal.getEnvironmentVariables(termName: "xterm-256color"),
+                paneId: pane.paneId,
+                histDir: historyDir.path,
+                userZdotdir: userZdotdir,
+                integrationDir: integrationDir.path)
+        }
+        pane.startProcess(executable: shell, environment: environment,
+                          execName: "-\(shellName)", currentDirectory: cwd)
     }
 
     // MARK: - Restore (FR-24/25, v0 chips as feed()'d offer lines)

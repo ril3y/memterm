@@ -248,7 +248,8 @@ extension MemtermAppDelegate {
             isSwitchingWorkspaces = false
         }
         hiddenLayouts.removeValue(forKey: id)
-        engine.store.forgetWorkspace(id, scrollbackDir: engine.scrollbackDir)
+        engine.store.forgetWorkspace(id, scrollbackDir: engine.scrollbackDir,
+                                     historyDir: engine.historyDir)
         engine.store.barrier()
         materializedWorkspaceIds.remove(id)
         workspaceActivityForgotten(id)

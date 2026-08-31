@@ -14,6 +14,14 @@ final class MemoryEngine {
     /// Exposed so workspace-forget can purge scrollback files (FR-57).
     let scrollbackDir: URL
 
+    /// Per-tab shell history (.hist files, written by the zsh hooks; FR-56/57
+    /// delete them alongside scrollback).
+    let historyDir: URL
+    /// The ZDOTDIR wrapper dir panes spawn with. nil = shell_integration off,
+    /// or the install failed (never point ZDOTDIR at a half-written dir — a
+    /// missing .zshrc there would silently skip the user's rc).
+    let shellIntegrationDir: URL?
+
     private var pollTimer: Timer?
     private var scrollbackTimer: Timer?
     private var topologyDebounce: DispatchWorkItem?
@@ -40,15 +48,31 @@ final class MemoryEngine {
         self.app = app
         self.scrollbackLines = config.scrollbackLines
         self.scrollbackDir = MemoryEngine.baseDir.appendingPathComponent("scrollback")
-        try? FileManager.default.createDirectory(at: scrollbackDir,
-                                                 withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
+        self.historyDir = MemoryEngine.baseDir.appendingPathComponent("history")
+        for dir in [scrollbackDir, historyDir] {
+            try? FileManager.default.createDirectory(at: dir,
+                                                     withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
+        }
         // createDirectory applies the attributes to the leaf only; the base
         // dir (which holds state.db and its WAL sidecars) needs 0700 too
         // (NFR-10 — plaintext scrollback must not be other-user readable).
-        for dir in [MemoryEngine.baseDir, scrollbackDir] {
+        for dir in [MemoryEngine.baseDir, scrollbackDir, historyDir] {
             try? FileManager.default.setAttributes([.posixPermissions: 0o700],
                                                    ofItemAtPath: dir.path)
+        }
+        // Shell integration (FR-5 / per-tab history): the wrapper files are
+        // rewritten at every launch so they always match this build
+        // (version-stamped). Installed even with shell_integration = false so
+        // flipping it on in Settings works for new panes without a relaunch —
+        // the SPAWN path is what the config key gates. Lives under the state
+        // dir, so MEMTERM_STATE_DIR isolation covers it too.
+        let integrationDir = MemoryEngine.baseDir.appendingPathComponent("shell-integration")
+        shellIntegrationDir = ShellIntegration.install(into: integrationDir)
+            ? integrationDir : nil
+        if shellIntegrationDir == nil {
+            NSLog("memterm: shell-integration install failed at %@ — panes spawn plain",
+                  integrationDir.path)
         }
         store = StateStore(url: MemoryEngine.baseDir.appendingPathComponent("state.db"))
         let liveBootUUID = ProcessInspector.bootSessionUUID()
@@ -73,9 +97,10 @@ final class MemoryEngine {
         }
         RunLoop.main.add(scrollback, forMode: .common)
         scrollbackTimer = scrollback
-        // Launch-time sweep: scrollback files for panes the journal no longer
-        // references (closed panes, old sessions) are deleted, not hoarded.
-        store.purgeOrphanScrollback(dir: scrollbackDir)
+        // Launch-time sweep: scrollback/.hist files for panes the journal no
+        // longer references (closed panes, old sessions) are deleted, not
+        // hoarded.
+        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir)
     }
 
     // MARK: - Topology (FR-12)
@@ -243,18 +268,19 @@ final class MemoryEngine {
 
     // MARK: - Forget (FR-56/57)
 
-    /// FR-57 "Forget Pane Memory" and FR-56 pane close: rows + scrollback file
-    /// for one pane go now. For an open pane the next capture tick starts a
-    /// fresh trail (the hash reset forces the rewrite through).
+    /// FR-57 "Forget Pane Memory" and FR-56 pane close: rows + scrollback +
+    /// shell-history files for one pane go now. For an open pane the next
+    /// capture tick starts a fresh trail (the hash reset forces the rewrite
+    /// through; the zsh hook recreates the .hist on the next command).
     func forgetPane(_ paneId: String) {
-        store.forgetPanes([paneId], scrollbackDir: scrollbackDir)
+        store.forgetPanes([paneId], scrollbackDir: scrollbackDir, historyDir: historyDir)
         lastScrollbackHash[paneId] = nil
     }
 
     /// FR-56 deliberate tab close / FR-57 "Forget Tab Memory": the tab's rows,
-    /// its panes, their snapshots, and their scrollback files.
+    /// its panes, their snapshots, and their scrollback + history files.
     func forgetTab(tabId: String, paneIds: [String]) {
-        store.forgetTabs([tabId], scrollbackDir: scrollbackDir)
+        store.forgetTabs([tabId], scrollbackDir: scrollbackDir, historyDir: historyDir)
         for paneId in paneIds { lastScrollbackHash[paneId] = nil }
     }
 
@@ -296,7 +322,7 @@ final class MemoryEngine {
         // Queued after the topology rewrite on the writer queue, so the sweep
         // sees the final pane set: files for user-closed panes go now (FR-56
         // "close forgets" applies to the bytes, not just the rows).
-        store.purgeOrphanScrollback(dir: scrollbackDir)
+        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir)
         store.barrier()
     }
 }
