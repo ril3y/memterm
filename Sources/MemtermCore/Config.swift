@@ -26,6 +26,16 @@ public struct Config {
     public var workspaceBar = true
     public var scrollbackLines = 10_000
     public var shell: String?
+    /// iTerm2 parity: ⌘T/⌘N (and the tab bar's "+") open in the key pane's
+    /// current directory (kernel-truth cwd — works without shell integration).
+    public var newTabSameCwd = true
+    /// iTerm2 parity: Option sends Esc+ (meta) for readline/emacs word chords.
+    /// SwiftTerm's default; `false` restores macOS special-character typing.
+    public var optionAsMeta = true
+    /// One of `bellStyles` (SwiftTerm BellStyle tagNames).
+    public var bellStyle = "sound"
+    /// One of `cursorStyles`, mapped onto SwiftTerm's six CursorStyle cases.
+    public var cursorStyle = "blink-block"
     public var themeBackground: ConfigRGB?
     public var themeForeground: ConfigRGB?
     public var themeCursor: ConfigRGB?
@@ -41,6 +51,14 @@ public struct Config {
         "Hack Nerd Font Mono", "FiraCode Nerd Font Mono",
         "SF Mono", "SFMono-Regular", "Menlo",
     ]
+
+    /// Valid `bell_style` values — SwiftTerm's BellStyle tagNames verbatim.
+    public static let bellStyles = ["none", "sound", "visual", "soundAndVisual"]
+
+    /// Valid `cursor_style` values, in the order Settings shows them.
+    public static let cursorStyles = ["blink-block", "steady-block",
+                                      "blink-underline", "steady-underline",
+                                      "blink-bar", "steady-bar"]
 
     public static var configURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -71,6 +89,11 @@ public struct Config {
         if let b = boolean(values["workspace_bar"]) { c.workspaceBar = b }
         if case .int(let n)? = values["scrollback_lines"], n >= 0 { c.scrollbackLines = n }
         if let s = string(values["shell"]), !s.isEmpty { c.shell = s }
+        if let b = boolean(values["new_tab_same_cwd"]) { c.newTabSameCwd = b }
+        if let b = boolean(values["option_as_meta"]) { c.optionAsMeta = b }
+        // Unknown style values keep the defaults (never a broken terminal).
+        if let s = string(values["bell_style"]), bellStyles.contains(s) { c.bellStyle = s }
+        if let s = string(values["cursor_style"]), cursorStyles.contains(s) { c.cursorStyle = s }
 
         c.themeBackground = rgb(string(values["theme.background"]))
         c.themeForeground = rgb(string(values["theme.foreground"]))
@@ -142,6 +165,10 @@ public struct Config {
         } else {
             lines.append("# shell = \"/bin/zsh\"  # default: $SHELL, run as a login shell")
         }
+        lines.append("new_tab_same_cwd = \(newTabSameCwd)  # new tabs/windows open in the current directory")
+        lines.append("option_as_meta = \(optionAsMeta)  # Option sends Esc+ (readline/emacs word keys)")
+        lines.append("bell_style = \"\(bellStyle)\"  # \(Self.bellStyles.joined(separator: " | "))")
+        lines.append("cursor_style = \"\(cursorStyle)\"  # \(Self.cursorStyles.joined(separator: " | "))")
         lines.append("")
         lines.append("[theme]")
         if let themeBackground { lines.append("background = \"\(Self.hex(themeBackground))\"") }
@@ -184,6 +211,20 @@ public struct Config {
 
         # Default: $SHELL, run as a login shell.
         # shell = "/bin/zsh"
+
+        # New tabs and windows open in the current pane's directory.
+        # new_tab_same_cwd = true
+
+        # Option sends Esc+ (meta) so Opt-B/Opt-F word movement works in the
+        # shell. false makes Option type macOS special characters instead.
+        # option_as_meta = true
+
+        # What the terminal bell does: none | sound | visual | soundAndVisual.
+        # bell_style = "sound"
+
+        # Cursor: blink-block | steady-block | blink-underline |
+        # steady-underline | blink-bar | steady-bar.
+        # cursor_style = "blink-block"
 
         # [theme]
         # background = "#1d1f21"

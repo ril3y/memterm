@@ -27,6 +27,10 @@ final class PaneView: LocalProcessTerminalView {
     /// indicator). Fired from dataReceived on the main thread; the controller
     /// coalesces, so this stays cheap per chunk.
     var onOutputActivity: (() -> Void)?
+    /// Set by the host controller: BEL arrived. Fired after super applied the
+    /// configured bellStyle (sound/visual/none — SwiftTerm handles those); the
+    /// controller adds the app-level responses (tab dot, dock attention).
+    var onBell: (() -> Void)?
 
     // -- Search state (FR-4, plumbing in FindBar.swift) --
     /// This pane's ⌘F find bar, created lazily on first use.
@@ -82,6 +86,17 @@ final class PaneView: LocalProcessTerminalView {
     override func dataReceived(slice: ArraySlice<UInt8>) {
         super.dataReceived(slice: slice)
         onOutputActivity?()
+    }
+
+    /// BEL (0x07). super consults `bellStyle` (public var, default .sound —
+    /// verified in MacTerminalView.swift:3357) for the in-view response; the
+    /// hook lets the controller mark the tab and request dock attention.
+    /// Overriding the open class method (not the TerminalViewDelegate default)
+    /// keeps the dispatch real: LocalProcessTerminalView satisfies the
+    /// delegate's bell via a protocol extension, which a subclass can't hook.
+    override func bell(source: Terminal) {
+        super.bell(source: source)
+        onBell?()
     }
 
     override func otherMouseDown(with event: NSEvent) {

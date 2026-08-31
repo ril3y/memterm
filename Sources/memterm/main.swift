@@ -14,6 +14,7 @@ if arguments.contains("--config-dump") {
     print("config: \(Config.configURL.path)")
     print("font_family=\(c.fontFamily ?? "(auto)") -> \(c.resolveFont(size: CGFloat(c.fontSize)).fontName) @ \(c.fontSize)pt")
     print("copy_on_select=\(c.copyOnSelect) scrollback_lines=\(c.scrollbackLines) shell=\(c.shell ?? "(env $SHELL)")")
+    print("new_tab_same_cwd=\(c.newTabSameCwd) option_as_meta=\(c.optionAsMeta) bell_style=\(c.bellStyle) cursor_style=\(c.cursorStyle)")
     print("theme: bg=\(c.themeBackground != nil) fg=\(c.themeForeground != nil) cursor=\(c.themeCursor != nil) ansi16=\(c.ansiColors != nil)")
     exit(0)
 }

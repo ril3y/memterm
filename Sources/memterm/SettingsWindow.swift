@@ -13,6 +13,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let sizeField = NSTextField()
     private let sizeStepper = NSStepper()
     private let copyOnSelectCheck = NSButton(checkboxWithTitle: "Selecting text copies it", target: nil, action: nil)
+    private let sameCwdCheck = NSButton(checkboxWithTitle: "New tabs open in the current directory", target: nil, action: nil)
+    private let optionMetaCheck = NSButton(checkboxWithTitle: "Option key sends Esc+ (meta)", target: nil, action: nil)
+    private let bellPopUp = NSPopUpButton()
+    private let cursorPopUp = NSPopUpButton()
     private let scrollbackField = NSTextField()
     private let shellField = NSTextField()
     private let bgWell = NSColorWell()
@@ -59,6 +63,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         sizeStepper.action = #selector(sizeStepped)
         copyOnSelectCheck.target = self
         copyOnSelectCheck.action = #selector(controlChanged)
+        sameCwdCheck.target = self
+        sameCwdCheck.action = #selector(controlChanged)
+        optionMetaCheck.target = self
+        optionMetaCheck.action = #selector(controlChanged)
+        // Popup rows mirror Config's valid-value lists index-for-index.
+        bellPopUp.addItems(withTitles: ["None", "Sound", "Visual", "Sound and Visual"])
+        bellPopUp.target = self
+        bellPopUp.action = #selector(controlChanged)
+        cursorPopUp.addItems(withTitles: ["Blinking Block", "Steady Block",
+                                          "Blinking Underline", "Steady Underline",
+                                          "Blinking Bar", "Steady Bar"])
+        cursorPopUp.target = self
+        cursorPopUp.action = #selector(controlChanged)
         let scrollbackFormatter = NumberFormatter()
         scrollbackFormatter.minimum = 100
         scrollbackFormatter.maximum = 200_000
@@ -100,6 +117,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSTextField(labelWithString: "Font:"), fontPopUp],
             [NSTextField(labelWithString: "Size:"), sizeRow],
             [NSGridCell.emptyContentView, copyOnSelectCheck],
+            [NSGridCell.emptyContentView, sameCwdCheck],
+            [NSGridCell.emptyContentView, optionMetaCheck],
+            [NSTextField(labelWithString: "Cursor:"), cursorPopUp],
+            [NSTextField(labelWithString: "Bell:"), bellPopUp],
             [NSTextField(labelWithString: "Scrollback:"), scrollbackField],
             [NSGridCell.emptyContentView, caption("Lines kept and restored. Applies to new panes.")],
             [NSTextField(labelWithString: "Shell:"), shellField],
@@ -149,6 +170,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         sizeField.stringValue = String(Int(config.fontSize))
         sizeStepper.integerValue = Int(config.fontSize)
         copyOnSelectCheck.state = config.copyOnSelect ? .on : .off
+        sameCwdCheck.state = config.newTabSameCwd ? .on : .off
+        optionMetaCheck.state = config.optionAsMeta ? .on : .off
+        bellPopUp.selectItem(at: Config.bellStyles.firstIndex(of: config.bellStyle) ?? 1)
+        cursorPopUp.selectItem(at: Config.cursorStyles.firstIndex(of: config.cursorStyle) ?? 0)
         scrollbackField.integerValue = config.scrollbackLines
         shellField.stringValue = config.shell ?? ""
         bgWell.color = config.themeBackgroundColor ?? .black
@@ -180,6 +205,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             sizeStepper.integerValue = Int(size)
         }
         config.copyOnSelect = copyOnSelectCheck.state == .on
+        config.newTabSameCwd = sameCwdCheck.state == .on
+        config.optionAsMeta = optionMetaCheck.state == .on
+        if Config.bellStyles.indices.contains(bellPopUp.indexOfSelectedItem) {
+            config.bellStyle = Config.bellStyles[bellPopUp.indexOfSelectedItem]
+        }
+        if Config.cursorStyles.indices.contains(cursorPopUp.indexOfSelectedItem) {
+            config.cursorStyle = Config.cursorStyles[cursorPopUp.indexOfSelectedItem]
+        }
         if scrollbackField.integerValue >= 100 { config.scrollbackLines = scrollbackField.integerValue }
         let shell = shellField.stringValue.trimmingCharacters(in: .whitespaces)
         config.shell = shell.isEmpty ? nil : shell

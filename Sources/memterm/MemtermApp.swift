@@ -402,8 +402,23 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu actions
 
+    /// `new_tab_same_cwd` (iTerm2's "reuse previous session's directory"):
+    /// the key pane's kernel-truth cwd, for ⌘T/⌘N to inherit. Kernel poll
+    /// first (works with zero shell integration), OSC 7 fallback for a pane
+    /// younger than the first 2 s poll tick.
+    private func inheritedCwd() -> String? {
+        guard config.newTabSameCwd, let pane = keyController()?.currentPane()
+        else { return nil }
+        return pane.lastKnownCwd ?? pane.currentLocalDirectory
+    }
+
     @objc func newWindow(_ sender: Any?) {
-        openNewWindow()
+        let controller = TerminalWindowController(app: self, workspaceId: activeWorkspaceId,
+                                                  initialCwd: inheritedCwd())
+        controllers.append(controller)
+        controller.showWindow(nil)
+        memory?.scheduleTopologySave()
+        refreshWorkspaceChips()
     }
 
     /// Standard tab mechanism: ⌘T and the native tab bar's "+" both land here.
@@ -411,7 +426,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     @objc func newWindowForTab(_ sender: Any?) {
         let hostController = keyController()
         let controller = TerminalWindowController(
-            app: self, workspaceId: hostController?.workspaceId ?? activeWorkspaceId)
+            app: self, workspaceId: hostController?.workspaceId ?? activeWorkspaceId,
+            initialCwd: inheritedCwd())
         controllers.append(controller)
         if let host = hostController?.window, let newWindow = controller.window {
             host.addTabbedWindow(newWindow, ordered: .above)

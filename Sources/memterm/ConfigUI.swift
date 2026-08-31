@@ -29,4 +29,23 @@ extension Config {
     var themeForegroundColor: NSColor? { themeForeground?.nsColor }
     var themeCursorColor: NSColor? { themeCursor?.nsColor }
     var terminalAnsiColors: [SwiftTerm.Color]? { ansiColors?.map(\.terminalColor) }
+
+    /// `bell_style` — the config strings ARE BellStyle tagNames (verified in
+    /// SwiftTerm's Apple/BellStyle.swift; parse() already validated them).
+    var terminalBellStyle: BellStyle {
+        BellStyle(tagName: bellStyle) ?? .sound
+    }
+
+    /// `cursor_style` — Config's kebab names onto SwiftTerm's CursorStyle
+    /// (TerminalOptions.swift; setCursorStyle exists for live re-apply).
+    var terminalCursorStyle: CursorStyle {
+        switch cursorStyle {
+        case "steady-block": return .steadyBlock
+        case "blink-underline": return .blinkUnderline
+        case "steady-underline": return .steadyUnderline
+        case "blink-bar": return .blinkBar
+        case "steady-bar": return .steadyBar
+        default: return .blinkBlock
+        }
+    }
 }

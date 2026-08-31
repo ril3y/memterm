@@ -50,8 +50,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     private var activity = TabActivityTracker()
     private var activityRefreshWork: DispatchWorkItem?
 
+    /// `initialCwd`: where the first pane's shell starts (nil = home). ⌘T/⌘N
+    /// pass the key pane's kernel-truth cwd here when `new_tab_same_cwd` is on
+    /// (iTerm2's "reuse previous session's directory"); restore paths ignore
+    /// it (each restored pane carries its own journaled cwd).
     init(app: MemtermAppDelegate, workspaceId: String = StateStore.defaultWorkspaceId,
-         restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil) {
+         restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil,
+         initialCwd: String? = nil) {
         self.app = app
         self.workspaceId = workspaceId
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
@@ -99,7 +104,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             root = buildNode(restoredTab.tree, frame: terminalContainer.bounds,
                              panes: restoredTab.panes)
         } else {
-            root = makePane(frame: terminalContainer.bounds, cwd: nil)
+            // A vanished inherited cwd falls back like a restore would —
+            // never a broken pane (FR-25 spirit).
+            let cwd = initialCwd.map { CwdFallback.resolve($0).path }
+            root = makePane(frame: terminalContainer.bounds, cwd: cwd)
         }
         terminalContainer.addSubview(root)
         if let restoredTab, !restoredTab.title.isEmpty {
@@ -267,17 +275,32 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
     private func constructPane(frame: NSRect) -> PaneView {
         let config = app.config
-        let options = TerminalOptions(scrollback: config.scrollbackLines)
+        let options = TerminalOptions(cursorStyle: config.terminalCursorStyle,
+                                      scrollback: config.scrollbackLines)
         let pane = PaneView(frame: frame, font: app.currentFont(), options: options)
         pane.autoresizingMask = [.width, .height]
         pane.copyOnSelect = config.copyOnSelect
+        pane.optionAsMetaKey = config.optionAsMeta
+        pane.bellStyle = config.terminalBellStyle
         pane.processDelegate = self
         if let bg = config.themeBackgroundColor { pane.nativeBackgroundColor = bg }
         if let fg = config.themeForegroundColor { pane.nativeForegroundColor = fg }
         if let cursor = config.themeCursorColor { pane.caretColor = cursor }
         if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
         pane.onOutputActivity = { [weak self] in self?.paneProducedOutput() }
+        pane.onBell = { [weak self] in self?.paneRangBell() }
         return pane
+    }
+
+    /// BEL beyond the in-view sound/flash (SwiftTerm's bellStyle handled
+    /// those in the pane): a bell on a non-selected tab marks its activity
+    /// indicator, and a bell while memterm is in the background bounces the
+    /// dock once — the classic "long build finished" signal.
+    private func paneRangBell() {
+        paneProducedOutput()
+        if !NSApp.isActive {
+            NSApp.requestUserAttention(.informationalRequest)
+        }
     }
 
     // MARK: - Tab activity (founder UX: spinner / unseen dot on the tab)
@@ -473,7 +496,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     func splitCurrentPane(vertical: Bool) {
         guard let pane = currentPane() else { return }
         let oldFrame = pane.frame
-        let newPane = makePane(frame: oldFrame, cwd: pane.currentLocalDirectory)
+        // Kernel-truth cwd first (works without shell integration), OSC 7 as
+        // the fallback for a pane the 2 s poll hasn't visited yet.
+        let inherited = pane.lastKnownCwd ?? pane.currentLocalDirectory
+        let newPane = makePane(frame: oldFrame,
+                               cwd: inherited.map { CwdFallback.resolve($0).path })
         let split = NSSplitView(frame: oldFrame)
         split.isVertical = vertical  // vertical divider = panes side by side
         split.dividerStyle = .thin
@@ -584,6 +611,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         window?.backgroundColor = bg
         for pane in allPanes() {
             pane.copyOnSelect = config.copyOnSelect
+            pane.optionAsMetaKey = config.optionAsMeta
+            pane.bellStyle = config.terminalBellStyle
+            // Live cursor restyle (Terminal.setCursorStyle is public —
+            // verified in SwiftTerm's Terminal.swift:4123).
+            pane.getTerminal().setCursorStyle(config.terminalCursorStyle)
             pane.nativeBackgroundColor = bg
             pane.nativeForegroundColor = fg
             pane.caretColor = config.themeCursorColor ?? fg

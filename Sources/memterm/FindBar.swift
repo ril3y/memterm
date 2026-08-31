@@ -19,12 +19,22 @@ final class PaneFindBar: NSVisualEffectView, NSSearchFieldDelegate {
     var onNext: (() -> Void)?
     var onPrevious: (() -> Void)?
     var onClose: (() -> Void)?
+    /// A search-option toggle flipped: the host re-runs the current term.
+    var onOptionsChanged: (() -> Void)?
 
     private let searchField = NSSearchField()
     private let countLabel = NSTextField(labelWithString: "")
+    private let caseButton = NSButton()
+    private let regexButton = NSButton()
     private let previousButton = NSButton()
     private let nextButton = NSButton()
     private let closeButton = NSButton()
+
+    /// Search options for SwiftTerm's SearchOptions (fields verified in
+    /// SearchOptions.swift: caseSensitive/regex/wholeWord). Per-bar state —
+    /// deliberately not config keys.
+    var caseSensitive: Bool { caseButton.state == .on }
+    var useRegex: Bool { regexButton.state == .on }
 
     var searchText: String {
         get { searchField.stringValue }
@@ -65,6 +75,14 @@ final class PaneFindBar: NSVisualEffectView, NSSearchFieldDelegate {
         countLabel.textColor = .secondaryLabelColor
         countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        configureButton(caseButton, symbol: "textformat", tooltip: "Match Case",
+                        action: #selector(optionToggled))
+        configureButton(regexButton, symbol: "asterisk.circle", tooltip: "Regular Expression",
+                        action: #selector(optionToggled))
+        for toggle in [caseButton, regexButton] {
+            toggle.setButtonType(.pushOnPushOff)
+            toggle.state = .off
+        }
         configureButton(previousButton, symbol: "chevron.up", tooltip: "Previous Match (⌘⇧G)",
                         action: #selector(previousTapped))
         configureButton(nextButton, symbol: "chevron.down", tooltip: "Next Match (⌘G)",
@@ -72,8 +90,8 @@ final class PaneFindBar: NSVisualEffectView, NSSearchFieldDelegate {
         configureButton(closeButton, symbol: "xmark", tooltip: "Close (Esc)",
                         action: #selector(closeTapped))
 
-        let stack = NSStackView(views: [searchField, countLabel, previousButton,
-                                        nextButton, closeButton])
+        let stack = NSStackView(views: [searchField, countLabel, caseButton, regexButton,
+                                        previousButton, nextButton, closeButton])
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 6
@@ -103,6 +121,7 @@ final class PaneFindBar: NSVisualEffectView, NSSearchFieldDelegate {
     @objc private func previousTapped() { onPrevious?() }
     @objc private func nextTapped() { onNext?() }
     @objc private func closeTapped() { onClose?() }
+    @objc private func optionToggled() { onOptionsChanged?() }
 
     func controlTextDidChange(_ obj: Notification) {
         onSearchChanged?(searchField.stringValue)
@@ -174,9 +193,11 @@ extension PaneView {
     }
 
     private func runSearch(term: String, forward: Bool) {
-        // Case-insensitive by default (SearchOptions() default); the search
-        // selects the match and scrolls to it — read-only on buffer and pty.
-        let options = SearchOptions()
+        // Options come from the bar's toggles (case-insensitive plain text by
+        // default); the search selects the match and scrolls to it —
+        // read-only on buffer and pty.
+        let options = SearchOptions(caseSensitive: findBar?.caseSensitive ?? false,
+                                    regex: findBar?.useRegex ?? false)
         withSearchDrivenSelection {
             if forward {
                 findNext(term, options: options)
@@ -201,6 +222,10 @@ extension PaneView {
         let bar = PaneFindBar()
         bar.translatesAutoresizingMaskIntoConstraints = false
         bar.onSearchChanged = { [weak self] term in self?.findBarSearchChanged(term) }
+        bar.onOptionsChanged = { [weak self] in
+            guard let self, let bar = self.findBar else { return }
+            self.findBarSearchChanged(bar.searchText)
+        }
         bar.onNext = { [weak self] in self?.findNextMatch() }
         bar.onPrevious = { [weak self] in self?.findPreviousMatch() }
         bar.onClose = { [weak self] in self?.closeFindBar() }

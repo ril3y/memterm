@@ -25,6 +25,10 @@ final class ConfigTests: XCTestCase {
         c.workspaceBar = false
         c.scrollbackLines = 4321
         c.shell = "/opt/homebrew/bin/fish"
+        c.newTabSameCwd = false
+        c.optionAsMeta = false
+        c.bellStyle = "visual"
+        c.cursorStyle = "steady-bar"
         c.themeBackground = ConfigRGB(red: 0x1d, green: 0x1f, blue: 0x21)
         c.themeForeground = ConfigRGB(red: 0xc5, green: 0xc8, blue: 0xc6)
         c.themeCursor = ConfigRGB(red: 0xff, green: 0x00, blue: 0x7f)
@@ -37,6 +41,10 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(parsed.workspaceBar, c.workspaceBar)
         XCTAssertEqual(parsed.scrollbackLines, c.scrollbackLines)
         XCTAssertEqual(parsed.shell, c.shell)
+        XCTAssertEqual(parsed.newTabSameCwd, c.newTabSameCwd)
+        XCTAssertEqual(parsed.optionAsMeta, c.optionAsMeta)
+        XCTAssertEqual(parsed.bellStyle, c.bellStyle)
+        XCTAssertEqual(parsed.cursorStyle, c.cursorStyle)
         XCTAssertEqual(parsed.themeBackground, c.themeBackground)
         XCTAssertEqual(parsed.themeForeground, c.themeForeground)
         XCTAssertEqual(parsed.themeCursor, c.themeCursor)
@@ -51,8 +59,29 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(parsed.workspaceBar, "the workspace bar shows by default")
         XCTAssertEqual(parsed.scrollbackLines, 10_000)
         XCTAssertNil(parsed.shell)
+        XCTAssertTrue(parsed.newTabSameCwd, "new tabs inherit the cwd by default")
+        XCTAssertTrue(parsed.optionAsMeta, "Option is meta by default (SwiftTerm's default)")
+        XCTAssertEqual(parsed.bellStyle, "sound")
+        XCTAssertEqual(parsed.cursorStyle, "blink-block")
         XCTAssertNil(parsed.themeBackground)
         XCTAssertNil(parsed.ansiColors)
+    }
+
+    func testInvalidStyleValuesKeepDefaults() {
+        let c = Config.parse("""
+        bell_style = "airhorn"
+        cursor_style = "lava-lamp"
+        """)
+        XCTAssertEqual(c.bellStyle, "sound", "unknown bell_style must not stick")
+        XCTAssertEqual(c.cursorStyle, "blink-block", "unknown cursor_style must not stick")
+
+        // Every advertised value round-trips through parse.
+        for style in Config.bellStyles {
+            XCTAssertEqual(Config.parse("bell_style = \"\(style)\"").bellStyle, style)
+        }
+        for style in Config.cursorStyles {
+            XCTAssertEqual(Config.parse("cursor_style = \"\(style)\"").cursorStyle, style)
+        }
     }
 
     func testLoadCreatesAndParsesDefaultsFile() {
