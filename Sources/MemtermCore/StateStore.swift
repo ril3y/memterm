@@ -44,6 +44,25 @@ public indirect enum SplitNode: Equatable {
     }
 }
 
+// FR-49: workspace entity — a named, colored group of tabs. `isParked` means
+// closed-but-kept: the journal rows stay, the windows don't restore on launch.
+// A non-parked workspace is "open" whether or not it is on screen right now.
+public struct WorkspaceRow: Equatable {
+    public var id: String
+    public var name: String
+    public var color: String  // "#rrggbb"
+    public var ord: Int
+    public var isParked: Bool
+
+    public init(id: String, name: String, color: String, ord: Int, isParked: Bool) {
+        self.id = id
+        self.name = name
+        self.color = color
+        self.ord = ord
+        self.isParked = isParked
+    }
+}
+
 public struct PaneSnap {
     public var id: String
     public var shell: String?
@@ -77,12 +96,17 @@ public struct WindowSnap {
     public var frame: String  // "x,y,w,h"
     public var focusedTab: String?
     public var tabs: [TabSnap]
+    /// FR-49: every tab belongs to exactly one workspace; a window (native tab
+    /// group) is homogeneous, so the workspace hangs off the window snap.
+    public var workspaceId: String
 
-    public init(id: String, frame: String, focusedTab: String?, tabs: [TabSnap]) {
+    public init(id: String, frame: String, focusedTab: String?, tabs: [TabSnap],
+                workspaceId: String = StateStore.defaultWorkspaceId) {
         self.id = id
         self.frame = frame
         self.focusedTab = focusedTab
         self.tabs = tabs
+        self.workspaceId = workspaceId
     }
 }
 
@@ -142,6 +166,11 @@ public final class StateStore {
     private var db: OpaquePointer?
     private let writer = DispatchQueue(label: "memterm.state-store")
 
+    /// Stable id of the auto-created workspace (FR-49): single-context users
+    /// never see the concept until they want it.
+    public static let defaultWorkspaceId = "default"
+    public static let defaultWorkspaceColor = "#8e8e93"
+
     public init(url: URL) {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true,
@@ -156,17 +185,63 @@ public final class StateStore {
         exec("PRAGMA synchronous = NORMAL")
         exec("""
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, name TEXT, color TEXT,
+                                               ord INTEGER, is_parked INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS windows (id TEXT PRIMARY KEY, frame TEXT, ord INTEGER,
-                                            focused_tab TEXT, updated_at INTEGER);
+                                            focused_tab TEXT, workspace_id TEXT,
+                                            updated_at INTEGER);
         CREATE TABLE IF NOT EXISTS tabs (id TEXT PRIMARY KEY, window_id TEXT, ord INTEGER,
-                                         title TEXT, split_tree TEXT, updated_at INTEGER);
+                                         title TEXT, split_tree TEXT, workspace_id TEXT,
+                                         updated_at INTEGER);
         CREATE TABLE IF NOT EXISTS panes (id TEXT PRIMARY KEY, tab_id TEXT, shell TEXT,
                                           cwd TEXT, cwd_source TEXT, updated_at INTEGER);
         CREATE TABLE IF NOT EXISTS pane_snapshot (pane_id TEXT PRIMARY KEY, exe TEXT,
                                                   argv TEXT, pid INTEGER, adapter TEXT,
                                                   adapter_state TEXT, updated_at INTEGER);
         """)
-        setMeta("schema_version", "1")
+        migrateSchema()
+    }
+
+    /// v1 → v2 (Group G): tabs/windows gain workspace_id, a "Default" workspace
+    /// is auto-created, and existing rows are adopted into it in place —
+    /// existing users' state must survive the upgrade. Idempotent; on a
+    /// degraded (corrupt) open every statement no-ops.
+    private func migrateSchema() {
+        if !columnExists("tabs", "workspace_id") {
+            exec("ALTER TABLE tabs ADD COLUMN workspace_id TEXT")
+        }
+        if !columnExists("windows", "workspace_id") {
+            exec("ALTER TABLE windows ADD COLUMN workspace_id TEXT")
+        }
+        run("""
+            INSERT INTO workspaces (id, name, color, ord, is_parked)
+            SELECT ?, 'Default', ?, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM workspaces)
+            """, [.text(Self.defaultWorkspaceId), .text(Self.defaultWorkspaceColor)])
+        // Orphan tabs/windows (pre-workspace rows, or rows whose workspace was
+        // lost) are adopted by the first workspace, never dropped.
+        var adopter: String?
+        query("SELECT id FROM workspaces ORDER BY ord LIMIT 1", []) { stmt in
+            adopter = column(stmt, 0)
+        }
+        if let adopter {
+            for table in ["tabs", "windows"] {
+                run("""
+                    UPDATE \(table) SET workspace_id = ?
+                    WHERE workspace_id IS NULL
+                       OR workspace_id NOT IN (SELECT id FROM workspaces)
+                    """, [.text(adopter)])
+            }
+        }
+        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2')")
+    }
+
+    private func columnExists(_ table: String, _ name: String) -> Bool {
+        var found = false
+        query("PRAGMA table_info(\(table))", []) { stmt in
+            if column(stmt, 1) == name { found = true }
+        }
+        return found
     }
 
     deinit {
@@ -191,22 +266,125 @@ public final class StateStore {
         }
     }
 
+    // MARK: Workspaces (FR-49/50/51)
+
+    public func listWorkspaces() -> [WorkspaceRow] {
+        writer.sync {
+            var rows: [WorkspaceRow] = []
+            query("SELECT id, name, color, ord, is_parked FROM workspaces ORDER BY ord", []) { stmt in
+                guard let id = column(stmt, 0) else { return }
+                rows.append(WorkspaceRow(id: id,
+                                         name: column(stmt, 1) ?? "",
+                                         color: column(stmt, 2) ?? Self.defaultWorkspaceColor,
+                                         ord: Int(sqlite3_column_int64(stmt, 3)),
+                                         isParked: sqlite3_column_int64(stmt, 4) != 0))
+            }
+            return rows
+        }
+    }
+
+    /// Appends the workspace at the end of the switcher order. Returns the id.
+    @discardableResult
+    public func createWorkspace(id: String = UUID().uuidString, name: String,
+                                color: String) -> String {
+        writer.async { [self] in
+            run("""
+                INSERT OR REPLACE INTO workspaces (id, name, color, ord, is_parked)
+                VALUES (?,?,?,(SELECT COALESCE(MAX(ord) + 1, 0) FROM workspaces),0)
+                """, [.text(id), .text(name), .text(color)])
+        }
+        return id
+    }
+
+    public func renameWorkspace(_ id: String, name: String) {
+        writer.async { [self] in
+            run("UPDATE workspaces SET name = ? WHERE id = ?", [.text(name), .text(id)])
+        }
+    }
+
+    public func recolorWorkspace(_ id: String, color: String) {
+        writer.async { [self] in
+            run("UPDATE workspaces SET color = ? WHERE id = ?", [.text(color), .text(id)])
+        }
+    }
+
+    /// Parked = closed-but-kept (FR-51): rows stay, launch restore skips it.
+    public func setWorkspaceParked(_ id: String, parked: Bool) {
+        writer.async { [self] in
+            run("UPDATE workspaces SET is_parked = ? WHERE id = ?",
+                [.int(parked ? 1 : 0), .text(id)])
+        }
+    }
+
+    /// FR-50/57 "forget": purges the workspace's journal rows AND its panes'
+    /// scrollback files on disk — forgetting deletes bytes, not just the index.
+    public func forgetWorkspace(_ id: String, scrollbackDir: URL?) {
+        writer.async { [self] in
+            if let scrollbackDir {
+                var paneIds: [String] = []
+                query("""
+                      SELECT p.id FROM panes p JOIN tabs t ON p.tab_id = t.id
+                      WHERE t.workspace_id = ?
+                      """, [.text(id)]) { stmt in
+                    if let paneId = column(stmt, 0) { paneIds.append(paneId) }
+                }
+                for paneId in paneIds {
+                    try? FileManager.default.removeItem(
+                        at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
+                }
+            }
+            run("BEGIN IMMEDIATE")
+            run("""
+                DELETE FROM pane_snapshot WHERE pane_id IN
+                  (SELECT p.id FROM panes p JOIN tabs t ON p.tab_id = t.id
+                   WHERE t.workspace_id = ?)
+                """, [.text(id)])
+            run("DELETE FROM panes WHERE tab_id IN (SELECT id FROM tabs WHERE workspace_id = ?)",
+                [.text(id)])
+            run("DELETE FROM tabs WHERE workspace_id = ?", [.text(id)])
+            run("DELETE FROM windows WHERE workspace_id = ?", [.text(id)])
+            run("DELETE FROM workspaces WHERE id = ?", [.text(id)])
+            run("COMMIT")
+        }
+    }
+
     // MARK: Topology
 
+    /// Full rewrite: every workspace's rows are replaced by `windows`.
     public func saveTopology(_ windows: [WindowSnap]) {
+        saveTopology(windows, forWorkspaces: nil)
+    }
+
+    /// Scoped rewrite: only rows belonging to `scope` workspaces are replaced,
+    /// so parked / off-screen workspaces' journal rows survive a capture of
+    /// the windows that are actually open. nil scope = full rewrite.
+    public func saveTopology(_ windows: [WindowSnap], forWorkspaces scope: Set<String>?) {
         let now = Int(Date().timeIntervalSince1970)
         writer.async { [self] in
             run("BEGIN IMMEDIATE")
-            run("DELETE FROM windows")
-            run("DELETE FROM tabs")
-            run("DELETE FROM panes")
+            if let scope {
+                let marks = Array(repeating: "?", count: scope.count).joined(separator: ",")
+                let binds = scope.sorted().map { Bind.text($0) }
+                run("""
+                    DELETE FROM panes WHERE tab_id IN
+                      (SELECT id FROM tabs WHERE workspace_id IN (\(marks)))
+                    """, binds)
+                run("DELETE FROM tabs WHERE workspace_id IN (\(marks))", binds)
+                run("DELETE FROM windows WHERE workspace_id IN (\(marks))", binds)
+            } else {
+                run("DELETE FROM windows")
+                run("DELETE FROM tabs")
+                run("DELETE FROM panes")
+            }
             for (wi, win) in windows.enumerated() {
-                run("INSERT INTO windows (id, frame, ord, focused_tab, updated_at) VALUES (?,?,?,?,?)",
-                    [.text(win.id), .text(win.frame), .int(wi), .textOrNull(win.focusedTab), .int(now)])
+                run("INSERT INTO windows (id, frame, ord, focused_tab, workspace_id, updated_at) VALUES (?,?,?,?,?,?)",
+                    [.text(win.id), .text(win.frame), .int(wi), .textOrNull(win.focusedTab),
+                     .text(win.workspaceId), .int(now)])
                 for (ti, tab) in win.tabs.enumerated() {
                     let tree = jsonString(tab.tree.toJSONObject()) ?? "{}"
-                    run("INSERT INTO tabs (id, window_id, ord, title, split_tree, updated_at) VALUES (?,?,?,?,?,?)",
-                        [.text(tab.id), .text(win.id), .int(ti), .text(tab.title), .text(tree), .int(now)])
+                    run("INSERT INTO tabs (id, window_id, ord, title, split_tree, workspace_id, updated_at) VALUES (?,?,?,?,?,?,?)",
+                        [.text(tab.id), .text(win.id), .int(ti), .text(tab.title), .text(tree),
+                         .text(win.workspaceId), .int(now)])
                     for pane in tab.panes {
                         run("INSERT INTO panes (id, tab_id, shell, cwd, cwd_source, updated_at) VALUES (?,?,?,?,?,?)",
                             [.text(pane.id), .text(tab.id), .textOrNull(pane.shell),
@@ -250,7 +428,9 @@ public final class StateStore {
 
     // MARK: Load (launch path, synchronous)
 
-    public func loadState() -> [WindowRestore] {
+    /// `workspaceId` scopes the load to one workspace's windows (the launch
+    /// path restores each non-parked workspace this way); nil loads everything.
+    public func loadState(workspaceId: String? = nil) -> [WindowRestore] {
         writer.sync {
             var snapshots: [String: SnapshotRow] = [:]
             query("SELECT pane_id, exe, argv, adapter, adapter_state FROM pane_snapshot", []) { stmt in
@@ -280,7 +460,11 @@ public final class StateStore {
             }
 
             var windows: [WindowRestore] = []
-            query("SELECT id, frame, focused_tab FROM windows ORDER BY ord", []) { stmt in
+            let (sql, binds): (String, [Bind]) = workspaceId.map {
+                ("SELECT id, frame, focused_tab FROM windows WHERE workspace_id = ? ORDER BY ord",
+                 [Bind.text($0)])
+            } ?? ("SELECT id, frame, focused_tab FROM windows ORDER BY ord", [])
+            query(sql, binds) { stmt in
                 guard let id = column(stmt, 0) else { return }
                 let tabs = tabsByWindow[id] ?? []
                 guard !tabs.isEmpty else { return }

@@ -78,7 +78,7 @@ final class StateStoreTests: XCTestCase {
         let store = StateStore(url: dbURL)
         store.setMeta("boot_session_uuid", "ABC-123")
         XCTAssertEqual(store.getMeta("boot_session_uuid"), "ABC-123")
-        XCTAssertEqual(store.getMeta("schema_version"), "1")
+        XCTAssertEqual(store.getMeta("schema_version"), "2")
         XCTAssertNil(store.getMeta("nope"))
     }
 

@@ -14,6 +14,28 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     private(set) var isTerminating = false
     private let smokeMode: Bool
 
+    // -- Workspaces (Group G) --
+    /// The workspace whose tabs the user is working in right now.
+    var activeWorkspaceId = StateStore.defaultWorkspaceId
+    /// Workspaces with windows on screen this session; scopes topology saves
+    /// so switched-away / parked workspaces' journal rows are never erased.
+    var materializedWorkspaceIds: Set<String> = []
+    /// Set while a switch/park tears windows down so the closes aren't
+    /// captured as topology mutations (same idea as isTerminating).
+    var isSwitchingWorkspaces = false
+    /// Shell ▸ Workspace submenu; rebuilt in place whenever workspaces change
+    /// so its ⌃⌘n key equivalents stay live (FR-52).
+    let workspaceMenu = NSMenu(title: "Workspace")
+
+    /// The workspaces a topology capture may rewrite: everything that is (or
+    /// was, this session) on screen. Parked and never-opened workspaces stay out.
+    func captureScope() -> Set<String> {
+        var scope = materializedWorkspaceIds
+        scope.insert(activeWorkspaceId)
+        for controller in controllers { scope.insert(controller.workspaceId) }
+        return scope
+    }
+
     init(smokeMode: Bool = false) {
         self.smokeMode = smokeMode
         fontSize = CGFloat(config.fontSize)
@@ -30,12 +52,37 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // FR-24: one restore pipeline, exercised on every normal launch.
         let engine = MemoryEngine(app: self, config: config)
         memory = engine
-        let restored = engine.loadStateForRestore()
-        if restored.isEmpty {
+
+        // FR-51: reboot-restore restores workspaces, not bare tabs — every
+        // non-parked workspace's windows come back; parked ones stay in the
+        // switcher menu, ready to reopen.
+        let workspaces = engine.store.listWorkspaces()
+        var active = engine.store.getMeta("active_workspace_id")
+            ?? StateStore.defaultWorkspaceId
+        if !workspaces.contains(where: { $0.id == active && !$0.isParked }) {
+            active = workspaces.first(where: { !$0.isParked })?.id
+                ?? workspaces.first?.id ?? StateStore.defaultWorkspaceId
+        }
+        activeWorkspaceId = active
+        if workspaces.first(where: { $0.id == active })?.isParked == true {
+            // Everything was parked: the active one reopens so a window exists.
+            engine.store.setWorkspaceParked(active, parked: false)
+        }
+        var restoredAnything = false
+        for workspace in engine.store.listWorkspaces() where !workspace.isParked {
+            let restored = engine.store.loadState(workspaceId: workspace.id)
+            guard !restored.isEmpty else { continue }
+            restoreWindows(restored, workspaceId: workspace.id)
+            materializedWorkspaceIds.insert(workspace.id)
+            restoredAnything = true
+        }
+        materializedWorkspaceIds.insert(activeWorkspaceId)
+        if controllers.isEmpty {
             openNewWindow()
         } else {
-            restoreWindows(restored)
+            focusWindows(ofWorkspace: activeWorkspaceId)
         }
+        rebuildWorkspaceMenu()
         engine.start()
         engine.scheduleTopologySave()
 
@@ -44,7 +91,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.willPowerOffNotification, object: nil)
 
         NSApp.activate(ignoringOtherApps: true)
-        if smokeMode { runSmoke(restoredWindows: restored) }
+        if smokeMode { runSmoke(restoredAnything: restoredAnything) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -61,13 +108,14 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Restore
 
-    private func restoreWindows(_ windows: [WindowRestore]) {
+    func restoreWindows(_ windows: [WindowRestore], workspaceId: String) {
         var focusTarget: TerminalWindowController?
         for win in windows {
             var host: TerminalWindowController?
             for (i, tab) in win.tabs.enumerated() {
                 let frame = i == 0 ? parseFrame(win.frame) : nil
-                let controller = TerminalWindowController(app: self, restoredTab: tab,
+                let controller = TerminalWindowController(app: self, workspaceId: workspaceId,
+                                                          restoredTab: tab,
                                                           restoredFrame: frame)
                 controllers.append(controller)
                 if i == 0 {
@@ -82,6 +130,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         focusTarget?.window?.makeKeyAndOrderFront(nil)
+        refreshWorkspaceChips()
     }
 
     private func parseFrame(_ s: String?) -> NSRect? {
@@ -93,8 +142,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Smoke test (deterministic capture/restore gate, no interaction)
 
-    private func runSmoke(restoredWindows: [WindowRestore]) {
-        if restoredWindows.isEmpty {
+    private func runSmoke(restoredAnything: Bool) {
+        if !restoredAnything {
             // Run 1: build 1 window / 2 tabs / 3 panes, cd one pane, let the
             // 2 s poll capture it, flush, report what the store holds.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
@@ -102,10 +151,30 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 self.newWindowForTab(nil)
                 self.controllers.first?.allPanes().first?.send(txt: "cd /tmp\r")
             }
+            var workspaceB: String?
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) {
                 self.memory?.flushSync()
                 guard let counts = self.memory?.store.counts() else { exit(1) }
                 print("SMOKE-SAVED windows=\(counts.windows) tabs=\(counts.tabs) panes=\(counts.panes)")
+                // Workspace leg (FR-49..51): create B and switch to it — the
+                // switch captures + closes Default's windows and opens B fresh.
+                workspaceB = self.createWorkspace(named: "B")
+                if let b = workspaceB { self.switchToWorkspace(b) }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.3) {
+                // Switch back: Default's tabs come back through the standard
+                // restore pipeline (ghost scrollback + offers included).
+                self.switchToWorkspace(StateStore.defaultWorkspaceId)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.1) {
+                guard let engine = self.memory, let b = workspaceB else { exit(1) }
+                self.parkWorkspace(b)
+                engine.flushSync()
+                let list = engine.store.listWorkspaces()
+                let parked = list.filter(\.isParked).count
+                let activeTabs = engine.store.loadState(workspaceId: self.activeWorkspaceId)
+                    .reduce(0) { $0 + $1.tabs.count }
+                print("SMOKE-WS workspaces=\(list.count) parked=\(parked) active_tabs=\(activeTabs)")
                 exit(0)
             }
         } else {
@@ -115,6 +184,19 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 let panes = self.controllers.flatMap { $0.allPanes() }
                 let cwds = panes.compactMap { $0.lastKnownCwd }
                 print("SMOKE-RESTORED windows=\(windows) tabs=\(self.controllers.count) panes=\(panes.count) cwds=\(cwds)")
+                // Workspace assertions: parked B is listed but NOT restored.
+                guard let store = self.memory?.store else { exit(1) }
+                let list = store.listWorkspaces()
+                guard let b = list.first(where: { $0.name == "B" }), b.isParked else {
+                    print("SMOKE-FAIL workspace B missing or not parked")
+                    exit(1)
+                }
+                if self.controllers.contains(where: { $0.workspaceId == b.id }) {
+                    print("SMOKE-FAIL parked workspace B was restored")
+                    exit(1)
+                }
+                let parked = list.filter(\.isParked).count
+                print("SMOKE-WS workspaces=\(list.count) parked=\(parked) active_tabs=\(self.controllers.count)")
                 exit(0)
             }
         }
@@ -123,11 +205,13 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Window / tab plumbing
 
     @discardableResult
-    private func openNewWindow() -> TerminalWindowController {
-        let controller = TerminalWindowController(app: self)
+    func openNewWindow(in workspaceId: String? = nil) -> TerminalWindowController {
+        let controller = TerminalWindowController(app: self,
+                                                  workspaceId: workspaceId ?? activeWorkspaceId)
         controllers.append(controller)
         controller.showWindow(nil)
         memory?.scheduleTopologySave()
+        refreshWorkspaceChips()
         return controller
     }
 
@@ -135,7 +219,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         controllers.removeAll { $0 === controller }
     }
 
-    private func keyController() -> TerminalWindowController? {
+    func keyController() -> TerminalWindowController? {
         if let window = NSApp.keyWindow ?? NSApp.mainWindow,
            let controller = controllers.first(where: { $0.window === window }) {
             return controller
@@ -150,15 +234,18 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Standard tab mechanism: ⌘T and the native tab bar's "+" both land here.
+    /// The new tab joins the host window's workspace (FR-49).
     @objc func newWindowForTab(_ sender: Any?) {
-        let host = keyController()?.window
-        let controller = TerminalWindowController(app: self)
+        let hostController = keyController()
+        let controller = TerminalWindowController(
+            app: self, workspaceId: hostController?.workspaceId ?? activeWorkspaceId)
         controllers.append(controller)
-        if let host, let newWindow = controller.window {
+        if let host = hostController?.window, let newWindow = controller.window {
             host.addTabbedWindow(newWindow, ordered: .above)
         }
         controller.showWindow(nil)
         memory?.scheduleTopologySave()
+        refreshWorkspaceChips()
     }
 
     @objc func splitRight(_ sender: Any?) {

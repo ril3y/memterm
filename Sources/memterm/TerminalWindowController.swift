@@ -15,13 +15,19 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     private unowned let app: MemtermAppDelegate
     /// Stable tab identity for the state store (one controller = one tab row).
     let tabId = UUID().uuidString
+    /// FR-49: the workspace this tab belongs to (exactly one, for life).
+    let workspaceId: String
     private weak var focusedPane: PaneView?
     // SwiftTerm's becomeFirstResponder is not open, so focus changes are
     // tracked by observing the window's firstResponder instead.
     private var firstResponderObservation: NSKeyValueObservation?
+    /// Titlebar workspace chip (color dot + name; click = switcher menu).
+    private let workspaceChipButton = NSButton()
 
-    init(app: MemtermAppDelegate, restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil) {
+    init(app: MemtermAppDelegate, workspaceId: String = StateStore.defaultWorkspaceId,
+         restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil) {
         self.app = app
+        self.workspaceId = workspaceId
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
         let window = NSWindow(
             contentRect: rect,
@@ -39,6 +45,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let bg = app.config.themeBackgroundColor { window.backgroundColor = bg }
         super.init(window: window)
         window.delegate = self
+        installWorkspaceChip(on: window)
         firstResponderObservation = window.observe(\.firstResponder) { [weak self] window, _ in
             if let pane = window.firstResponder as? PaneView {
                 self?.paneFocused(pane)
@@ -61,6 +68,47 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: - Workspace chip (FR-50: titlebar control)
+
+    private func installWorkspaceChip(on window: NSWindow) {
+        workspaceChipButton.isBordered = false
+        workspaceChipButton.setButtonType(.momentaryChange)
+        workspaceChipButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        workspaceChipButton.target = self
+        workspaceChipButton.action = #selector(showWorkspaceMenu(_:))
+        workspaceChipButton.frame = NSRect(x: 0, y: 0, width: 90, height: 20)
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 98, height: 22))
+        workspaceChipButton.setFrameOrigin(NSPoint(x: 4, y: 1))
+        container.addSubview(workspaceChipButton)
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.view = container
+        accessory.layoutAttribute = .right
+        window.addTitlebarAccessoryViewController(accessory)
+    }
+
+    func updateWorkspaceChip(name: String, color: NSColor) {
+        let title = NSMutableAttributedString(
+            string: "● ",
+            attributes: [.foregroundColor: color,
+                         .font: NSFont.systemFont(ofSize: 10)])
+        title.append(NSAttributedString(
+            string: name,
+            attributes: [.foregroundColor: NSColor.secondaryLabelColor,
+                         .font: NSFont.systemFont(ofSize: 11, weight: .medium)]))
+        workspaceChipButton.attributedTitle = title
+        workspaceChipButton.sizeToFit()
+        workspaceChipButton.superview?.frame.size.width =
+            workspaceChipButton.frame.width + 8
+    }
+
+    @objc private func showWorkspaceMenu(_ sender: NSButton) {
+        let menu = app.makeWorkspacePopUpMenu()
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
 
     // MARK: - Panes
 

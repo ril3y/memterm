@@ -11,7 +11,8 @@ final class MemoryEngine {
     let store: StateStore
     private unowned let app: MemtermAppDelegate
     private let scrollbackLines: Int
-    private let scrollbackDir: URL
+    /// Exposed so workspace-forget can purge scrollback files (FR-57).
+    let scrollbackDir: URL
 
     private var pollTimer: Timer?
     private var scrollbackTimer: Timer?
@@ -49,7 +50,7 @@ final class MemoryEngine {
     // MARK: - Topology (FR-12)
 
     func scheduleTopologySave() {
-        guard !app.isTerminating else { return }
+        guard !app.isTerminating, !app.isSwitchingWorkspaces else { return }
         topologyDebounce?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.saveTopologyNow() }
         topologyDebounce = work
@@ -59,16 +60,18 @@ final class MemoryEngine {
 
     /// Window move/resize (debounced ~1 s).
     func scheduleFrameSave() {
-        guard !app.isTerminating else { return }
+        guard !app.isTerminating, !app.isSwitchingWorkspaces else { return }
         frameDebounce?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.saveTopologyNow() }
         frameDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
 
+    /// Saves are scoped to the workspaces whose windows can be on screen, so
+    /// a capture never erases a parked / switched-away workspace's rows.
     func saveTopologyNow() {
-        guard !app.isTerminating else { return }
-        store.saveTopology(snapshotTopology())
+        guard !app.isTerminating, !app.isSwitchingWorkspaces else { return }
+        store.saveTopology(snapshotTopology(), forWorkspaces: app.captureScope())
     }
 
     /// Native tabs are separate NSWindows sharing a tab group, so a "window"
@@ -102,7 +105,8 @@ final class MemoryEngine {
             let frame = "\(Int(f.origin.x)),\(Int(f.origin.y)),\(Int(f.width)),\(Int(f.height))"
             let focused = members.first { $0.window?.tabGroup?.selectedWindow === $0.window
                                           || members.count == 1 }?.tabId
-            return WindowSnap(id: tabs[0].id, frame: frame, focusedTab: focused, tabs: tabs)
+            return WindowSnap(id: tabs[0].id, frame: frame, focusedTab: focused, tabs: tabs,
+                              workspaceId: members[0].workspaceId)
         }
     }
 
@@ -174,7 +178,7 @@ final class MemoryEngine {
     }
 
     func scrollbackURL(for paneId: String) -> URL {
-        scrollbackDir.appendingPathComponent("\(paneId).txt")
+        ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId)
     }
 
     func loadScrollback(for paneId: String) -> String? {
@@ -193,7 +197,7 @@ final class MemoryEngine {
     /// final topology snapshot captures them, not their teardown.
     func flushSync() {
         pollNow()
-        store.saveTopology(snapshotTopology())
+        store.saveTopology(snapshotTopology(), forWorkspaces: app.captureScope())
         saveScrollback(force: true)
         store.barrier()
     }

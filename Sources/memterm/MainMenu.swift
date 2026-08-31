@@ -49,6 +49,11 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Split Down", to: shellMenu, #selector(MemtermAppDelegate.splitDown(_:)), "d",
         modifiers: [.command, .shift], target: app)
     shellMenu.addItem(.separator())
+    // Workspace section (FR-50): the submenu is app.workspaceMenu, rebuilt in
+    // place by the delegate so the ⌃⌘n key equivalents track the live list.
+    let workspaceItem = shellMenu.addItem(withTitle: "Workspace", action: nil, keyEquivalent: "")
+    shellMenu.setSubmenu(app.workspaceMenu, for: workspaceItem)
+    shellMenu.addItem(.separator())
     add("Type Resume Command", to: shellMenu,
         #selector(MemtermAppDelegate.typeResumeCommand(_:)), "r", target: app)
     shellMenu.addItem(.separator())
@@ -97,10 +102,39 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Minimize", to: windowMenu, #selector(NSWindow.performMiniaturize(_:)), "m")
     add("Zoom", to: windowMenu, #selector(NSWindow.performZoom(_:)), "", modifiers: [])
     windowMenu.addItem(.separator())
-    add("Show Previous Tab", to: windowMenu, #selector(NSWindow.selectPreviousTab(_:)), "\t",
-        modifiers: [.control, .shift])
-    add("Show Next Tab", to: windowMenu, #selector(NSWindow.selectNextTab(_:)), "\t",
-        modifiers: [.control])
+    // FR-52: ⌘1–⌘8 jump to tab N in the active workspace; ⌘9 = last tab.
+    for i in 1...8 {
+        let item = NSMenuItem(title: "Tab \(i)",
+                              action: #selector(MemtermAppDelegate.selectTab(_:)),
+                              keyEquivalent: "\(i)")
+        item.target = app
+        item.tag = i
+        windowMenu.addItem(item)
+    }
+    let lastTab = NSMenuItem(title: "Last Tab",
+                             action: #selector(MemtermAppDelegate.selectTab(_:)),
+                             keyEquivalent: "9")
+    lastTab.target = app
+    lastTab.tag = 9
+    windowMenu.addItem(lastTab)
+    windowMenu.addItem(.separator())
+    // FR-52: ⌘⇧[ / ⌘⇧] previous/next tab, with ⌃Tab / ⌃⇧Tab as hidden aliases.
+    add("Show Previous Tab", to: windowMenu, #selector(NSWindow.selectPreviousTab(_:)), "[",
+        modifiers: [.command, .shift])
+    add("Show Next Tab", to: windowMenu, #selector(NSWindow.selectNextTab(_:)), "]",
+        modifiers: [.command, .shift])
+    let prevTabAlias = NSMenuItem(title: "Show Previous Tab",
+                                  action: #selector(NSWindow.selectPreviousTab(_:)),
+                                  keyEquivalent: "\t")
+    prevTabAlias.keyEquivalentModifierMask = [.control, .shift]
+    prevTabAlias.isHidden = true
+    windowMenu.addItem(prevTabAlias)
+    let nextTabAlias = NSMenuItem(title: "Show Next Tab",
+                                  action: #selector(NSWindow.selectNextTab(_:)),
+                                  keyEquivalent: "\t")
+    nextTabAlias.keyEquivalentModifierMask = [.control]
+    nextTabAlias.isHidden = true
+    windowMenu.addItem(nextTabAlias)
     add("Move Tab to New Window", to: windowMenu, #selector(NSWindow.moveTabToNewWindow(_:)),
         "", modifiers: [])
     add("Merge All Windows", to: windowMenu, #selector(NSWindow.mergeAllWindows(_:)),

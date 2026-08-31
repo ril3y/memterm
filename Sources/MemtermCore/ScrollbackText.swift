@@ -32,6 +32,13 @@ public enum ScrollbackText {
         return lines.joined(separator: "\n")
     }
 
+    /// On-disk location of one pane's serialized scrollback. Single source of
+    /// the naming scheme: the capture engine writes here and workspace-forget
+    /// (FR-57) deletes here.
+    public static func fileURL(dir: URL, paneId: String) -> URL {
+        dir.appendingPathComponent("\(paneId).txt")
+    }
+
     /// LF-joined serialized scrollback → CRLF text safe to feed() into a
     /// terminal view as ghost history (display only — never written to a pty).
     public static func ghostFeedText(_ serialized: String) -> String {
