@@ -66,6 +66,17 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Paste", to: editMenu, #selector(NSText.paste(_:)), "v")
     editMenu.addItem(.separator())
     add("Select All", to: editMenu, #selector(NSText.selectAll(_:)), "a")
+    editMenu.addItem(.separator())
+    // FR-4: per-pane search over the buffer, restored ghost scrollback included.
+    let findItem = editMenu.addItem(withTitle: "Find", action: nil, keyEquivalent: "")
+    let findMenu = NSMenu(title: "Find")
+    editMenu.setSubmenu(findMenu, for: findItem)
+    add("Find…", to: findMenu, #selector(MemtermAppDelegate.findInPane(_:)), "f",
+        target: app)
+    add("Find Next", to: findMenu, #selector(MemtermAppDelegate.findNextInPane(_:)), "g",
+        target: app)
+    add("Find Previous", to: findMenu, #selector(MemtermAppDelegate.findPreviousInPane(_:)),
+        "g", modifiers: [.command, .shift], target: app)
 
     // View
     let viewMenu = submenu("View")

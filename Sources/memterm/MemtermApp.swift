@@ -282,6 +282,21 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         keyController()?.currentPane()?.clearScrollback()
     }
 
+    // FR-4: ⌘F/⌘G/⌘⇧G route to the focused pane's find bar (FindBar.swift).
+    // While the search field has focus, currentPane() still resolves to its
+    // host pane via the controller's focusedPane tracking.
+    @objc func findInPane(_ sender: Any?) {
+        keyController()?.currentPane()?.openFindBar()
+    }
+
+    @objc func findNextInPane(_ sender: Any?) {
+        keyController()?.currentPane()?.findNextMatch()
+    }
+
+    @objc func findPreviousInPane(_ sender: Any?) {
+        keyController()?.currentPane()?.findPreviousMatch()
+    }
+
     /// ⌘R: types the captured resume command into the pty WITHOUT a newline —
     /// the user must press Enter themselves (FR-29, no exceptions).
     @objc func typeResumeCommand(_ sender: Any?) {

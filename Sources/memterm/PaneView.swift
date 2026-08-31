@@ -24,6 +24,13 @@ final class PaneView: LocalProcessTerminalView {
     /// Shell executable this pane spawned; restored panes respawn the same one.
     var shellPath: String?
 
+    // -- Search state (FR-4, plumbing in FindBar.swift) --
+    /// This pane's ⌘F find bar, created lazily on first use.
+    var findBar: PaneFindBar?
+    /// Set while search moves the selection to highlight a match, so
+    /// copy-on-select doesn't clobber the clipboard on every jump.
+    var searchIsDrivingSelection = false
+
     /// Whole buffer (scrollback + visible grid) as plain text, wrapped rows
     /// re-joined, trailing blank grid rows trimmed, capped to maxLines
     /// (assembly logic lives in MemtermCore.ScrollbackText).
@@ -40,7 +47,7 @@ final class PaneView: LocalProcessTerminalView {
     }
     override func selectionChanged(source: Terminal) {
         super.selectionChanged(source: source)
-        if copyOnSelect, let text = getSelection(), !text.isEmpty {
+        if copyOnSelect, !searchIsDrivingSelection, let text = getSelection(), !text.isEmpty {
             let pb = NSPasteboard.general
             pb.clearContents()
             pb.setString(text, forType: .string)
