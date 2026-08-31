@@ -43,6 +43,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let optionMetaCheck = NSButton(checkboxWithTitle: "Option key sends Esc+ (meta)", target: nil, action: nil)
     private let mouseReportingCheck = NSButton(checkboxWithTitle: "Allow apps to use the mouse (vim, htop)", target: nil, action: nil)
     private let shellIntegrationCheck = NSButton(checkboxWithTitle: "Shell integration (zsh)", target: nil, action: nil)
+    // feature/serial: defaults for NEW serial connections (per-device
+    // profiles override once a device has been connected).
+    private let serialLineEndingPopUp = NSPopUpButton()
+    private let serialEchoCheck = NSButton(checkboxWithTitle: "Local echo in serial panes", target: nil, action: nil)
 
     // Memory
     private let scrollbackField = NSTextField()
@@ -167,6 +171,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                                           "Blinking Underline", "Steady Underline",
                                           "Blinking Bar", "Steady Bar"])
         wire(cursorPopUp)
+        serialLineEndingPopUp.addItems(withTitles: SerialLineEnding.labels)
+        wire(serialLineEndingPopUp)
+        wire(serialEchoCheck)
 
         let scrollbackFormatter = NumberFormatter()
         scrollbackFormatter.minimum = 100
@@ -259,6 +266,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSGridCell.emptyContentView, caption("Off forces native text selection everywhere; apps stop seeing the mouse.")],
             [NSGridCell.emptyContentView, shellIntegrationCheck],
             [NSGridCell.emptyContentView, caption("Per-tab ↑ history, prompt marks, and directory tracking, injected at spawn — no dotfile edits. Applies to new panes; zsh only for now.")],
+            [label("Serial line ending:"), serialLineEndingPopUp],
+            [NSGridCell.emptyContentView, serialEchoCheck],
+            [NSGridCell.emptyContentView, caption("Defaults for Shell ▸ New Serial Connection…. Each device remembers what you last used with it.")],
         ])
 
         // -- Memory --
@@ -374,6 +384,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         optionMetaCheck.state = config.optionAsMeta ? .on : .off
         mouseReportingCheck.state = config.allowMouseReporting ? .on : .off
         shellIntegrationCheck.state = config.shellIntegration ? .on : .off
+        serialLineEndingPopUp.selectItem(
+            at: Config.serialLineEndings.firstIndex(of: config.serialTxLineEnding) ?? 2)
+        serialEchoCheck.state = config.serialLocalEcho ? .on : .off
 
         // Memory
         scrollbackField.integerValue = config.scrollbackLines
@@ -476,6 +489,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         config.optionAsMeta = optionMetaCheck.state == .on
         config.allowMouseReporting = mouseReportingCheck.state == .on
         config.shellIntegration = shellIntegrationCheck.state == .on
+        if Config.serialLineEndings.indices.contains(serialLineEndingPopUp.indexOfSelectedItem) {
+            config.serialTxLineEnding = Config.serialLineEndings[serialLineEndingPopUp.indexOfSelectedItem]
+        }
+        config.serialLocalEcho = serialEchoCheck.state == .on
 
         // Memory
         if scrollbackField.integerValue >= 100 { config.scrollbackLines = scrollbackField.integerValue }

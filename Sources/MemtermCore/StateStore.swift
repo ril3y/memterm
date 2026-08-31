@@ -155,6 +155,28 @@ public struct TabRestore {
     }
 }
 
+/// Per-device serial line settings (feature/serial UX): remembered at connect
+/// time keyed by the port's stable identity, so replugging the same board
+/// pre-fills the sheet with what worked last time.
+public struct SerialProfileRow: Equatable {
+    public var identity: String
+    public var settings: String       // SerialSettings.compactString
+    public var txLineEnding: String   // SerialLineEnding.rawValue
+    public var localEcho: Bool
+    public var lastPath: String
+    public var label: String
+
+    public init(identity: String, settings: String, txLineEnding: String,
+                localEcho: Bool, lastPath: String, label: String) {
+        self.identity = identity
+        self.settings = settings
+        self.txLineEnding = txLineEnding
+        self.localEcho = localEcho
+        self.lastPath = lastPath
+        self.label = label
+    }
+}
+
 public struct WindowRestore {
     public var frame: String?
     public var focusedTab: String?
@@ -225,6 +247,11 @@ public final class StateStore {
                                                   argv TEXT, pid INTEGER, proc_start INTEGER,
                                                   adapter TEXT, adapter_state TEXT,
                                                   updated_at INTEGER);
+        CREATE TABLE IF NOT EXISTS serial_profiles (identity TEXT PRIMARY KEY,
+                                                    settings TEXT, tx TEXT,
+                                                    local_echo INTEGER,
+                                                    last_path TEXT, label TEXT,
+                                                    updated_at INTEGER);
         """)
         migrateSchema()
     }
@@ -342,7 +369,10 @@ public final class StateStore {
                     """, [.text(adopter)])
             }
         }
-        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')")
+        // v4 → v5: serial_profiles (feature/serial UX — per-device remembered
+        // line settings, keyed by the port's stable identity). New table only,
+        // created in the init exec above; nothing to migrate in place.
+        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')")
     }
 
     private func columnExists(_ table: String, _ name: String) -> Bool {
@@ -704,6 +734,40 @@ public final class StateStore {
     public func clearSnapshot(_ paneId: String) {
         writer.async { [self] in
             run("DELETE FROM pane_snapshot WHERE pane_id = ?", [.text(paneId)])
+        }
+    }
+
+    // MARK: Serial profiles (feature/serial UX: per-device remembered settings)
+
+    public func upsertSerialProfile(_ profile: SerialProfileRow) {
+        let now = Int(Date().timeIntervalSince1970)
+        writer.async { [self] in
+            run("""
+                INSERT OR REPLACE INTO serial_profiles
+                  (identity, settings, tx, local_echo, last_path, label, updated_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                [.text(profile.identity), .text(profile.settings),
+                 .text(profile.txLineEnding), .int(profile.localEcho ? 1 : 0),
+                 .text(profile.lastPath), .text(profile.label), .int(now)])
+        }
+    }
+
+    public func serialProfile(identity: String) -> SerialProfileRow? {
+        writer.sync {
+            var row: SerialProfileRow?
+            query("""
+                  SELECT identity, settings, tx, local_echo, last_path, label
+                  FROM serial_profiles WHERE identity = ?
+                  """, [.text(identity)]) { stmt in
+                guard let id = column(stmt, 0), let settings = column(stmt, 1) else { return }
+                row = SerialProfileRow(identity: id, settings: settings,
+                                       txLineEnding: column(stmt, 2) ?? "crlf",
+                                       localEcho: sqlite3_column_int64(stmt, 3) != 0,
+                                       lastPath: column(stmt, 4) ?? "",
+                                       label: column(stmt, 5) ?? "")
+            }
+            return row
         }
     }
 

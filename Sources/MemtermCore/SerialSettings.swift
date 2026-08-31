@@ -83,3 +83,44 @@ public struct SerialSettings: Equatable, Codable {
                               stopBits: stopBits, flow: flow)
     }
 }
+
+/// What the Enter key transmits from a serial pane. The terminal view emits a
+/// bare CR (0x0D) for Return; devices disagree about what a "line" is, so the
+/// TX ending is per-pane configurable (research: CRLF is the least-surprising
+/// default for Arduino/ESP monitors). `.none` swallows Return entirely —
+/// useful against binary protocols where a stray 0x0D corrupts a frame.
+public enum SerialLineEnding: String, CaseIterable, Codable {
+    case cr, lf, crlf, none
+
+    /// Config/journal value list, in UI order.
+    public static let configValues = ["cr", "lf", "crlf", "none"]
+
+    /// Human labels, index-matched to `configValues`.
+    public static let labels = ["CR", "LF", "CRLF", "None"]
+
+    public var bytes: [UInt8] {
+        switch self {
+        case .cr: return [0x0D]
+        case .lf: return [0x0A]
+        case .crlf: return [0x0D, 0x0A]
+        case .none: return []
+        }
+    }
+
+    /// Maps every CR in the outgoing keystroke bytes to this ending. Only CR
+    /// is rewritten — Ctrl-C and every other byte pass through untouched
+    /// (serial panes have no signal semantics, bytes are bytes).
+    public func transformOutgoing(_ data: [UInt8]) -> [UInt8] {
+        if self == .cr { return data }
+        var out: [UInt8] = []
+        out.reserveCapacity(data.count + 4)
+        for b in data {
+            if b == 0x0D {
+                out.append(contentsOf: bytes)
+            } else {
+                out.append(b)
+            }
+        }
+        return out
+    }
+}

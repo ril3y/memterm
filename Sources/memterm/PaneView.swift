@@ -6,7 +6,7 @@ import SwiftTerm
 // (copy-on-select, middle-click paste, focus dimming) and per-pane state the
 // window controller reads for titles and split inheritance.
 
-final class PaneView: LocalProcessTerminalView {
+class PaneView: LocalProcessTerminalView {
     var copyOnSelect = true
     var paneTitle = ""
     /// Local filesystem path from OSC 7, when the shell reports one.

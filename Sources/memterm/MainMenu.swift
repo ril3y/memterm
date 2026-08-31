@@ -50,6 +50,10 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
         target: app)
     // nil target so the native tab bar's "+" shares the same plumbing
     add("New Tab", to: shellMenu, #selector(MemtermAppDelegate.newWindowForTab(_:)), "t")
+    // feature/serial: ⌘⇧K verified unclaimed (⌘K = View ▸ Clear).
+    add("New Serial Connection…", to: shellMenu,
+        #selector(MemtermAppDelegate.newSerialConnection(_:)), "k",
+        modifiers: [.command, .shift], target: app)
     shellMenu.addItem(.separator())
     add("Split Right", to: shellMenu, #selector(MemtermAppDelegate.splitRight(_:)), "d",
         target: app)
@@ -107,6 +111,11 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
         target: app)
     viewMenu.addItem(.separator())
     add("Clear", to: viewMenu, #selector(MemtermAppDelegate.clearBuffer(_:)), "k", target: app)
+    viewMenu.addItem(.separator())
+    // feature/serial: the hex lens over a serial pane's stream (⌘⇧X —
+    // unclaimed; validated + check-marked by the app delegate).
+    add("Hex View", to: viewMenu, #selector(MemtermAppDelegate.toggleHexView(_:)), "x",
+        modifiers: [.command, .shift], target: app)
     viewMenu.addItem(.separator())
     let left = String(UnicodeScalar(NSLeftArrowFunctionKey)!)
     let right = String(UnicodeScalar(NSRightArrowFunctionKey)!)

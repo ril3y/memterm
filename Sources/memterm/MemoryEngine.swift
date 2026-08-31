@@ -182,6 +182,16 @@ final class MemoryEngine {
     }
 
     private func pollPane(_ pane: PaneView) {
+        // feature/serial: a serial pane has no shell/pty — its snapshot is the
+        // 'serial' adapter with port identity + line settings, so restore can
+        // surface the consent-gated reconnect offer. Journaled whether or not
+        // the device is currently attached (the identity is the memory).
+        if let serial = pane as? SerialPaneView {
+            store.upsertSnapshot(pane.paneId, exe: "", argv: [], pid: 0, procStart: 0,
+                                 adapter: SerialAdapter.name,
+                                 adapterState: serial.adapterStateForJournal())
+            return
+        }
         guard let process = pane.process, process.running else { return }
         let shellPid = process.shellPid
 

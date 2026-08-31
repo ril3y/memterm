@@ -20,6 +20,14 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// across every restore path (launch, workspace switch, unpark).
     let claudeClaims = ClaudeSessionClaims()
 
+    // -- Serial (feature/serial UX) --
+    /// One app-wide hotplug watcher, started lazily by the first serial pane
+    /// or connect sheet. Watching never opens a device (IOKit registry only);
+    /// events route to serial panes (live reconnect) and the open sheet.
+    private var serialHotplug: SerialHotplugWatcher?
+    /// The open connect sheet, if any (its port list follows hotplug live).
+    private var serialSheet: SerialConnectSheetController?
+
     // -- Workspaces (Group G) --
     /// The workspace whose tabs the user is working in right now.
     var activeWorkspaceId = StateStore.defaultWorkspaceId
@@ -481,6 +489,150 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             print("UIPROBE-CLOSEPANE window_alive=\(windowAlive) panes=\(panes.count) frame=\(Int(frame.width))x\(Int(frame.height)) shell_alive=\(shellAlive)")
             if !windowAlive || panes.count != 1 || frame.width < 50 || frame.height < 50 || !shellAlive {
                 print("UIPROBE-FAIL close-pane blanked the tab"); exit(1)
+            }
+        }
+        // Serial leg (feature/serial): a pty pair stands in for a device —
+        // real /dev/cu.* nodes are NEVER touched from the probe. Covers the
+        // full loop: open a serial pane on the slave, loopback RX (master →
+        // pane render), TX with the CRLF line-ending transform (pane → master
+        // bytes), the hex lens, the journaled 'serial' adapter_state, and the
+        // EOF disconnect banner.
+        var serialMasterFD: Int32 = -1
+        var serialPane: SerialPaneView?
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) {
+            let master = posix_openpt(O_RDWR | O_NOCTTY)
+            guard master >= 0, grantpt(master) == 0, unlockpt(master) == 0,
+                  let slaveC = ptsname(master),
+                  case let slavePath = String(cString: slaveC), !slavePath.isEmpty else {
+                print("UIPROBE-FAIL serial leg: pty pair"); exit(1)
+            }
+            serialMasterFD = master
+            // Raw master: no kernel echo/translation between the two ends.
+            var t = termios()
+            tcgetattr(master, &t)
+            cfmakeraw(&t)
+            tcsetattr(master, TCSANOW, &t)
+            _ = fcntl(master, F_SETFL, O_NONBLOCK)
+            let setup = SerialPaneView.Setup(
+                path: slavePath, identity: "path:\(slavePath)", label: "probe-pty",
+                settings: SerialSettings(), txLineEnding: .crlf, localEcho: false)
+            let controller = self.openSerialTab(setup: setup)
+            guard let pane = controller.allPanes().first as? SerialPaneView else {
+                print("UIPROBE-FAIL serial leg: no serial pane"); exit(1)
+            }
+            serialPane = pane
+            print("UIPROBE-SERIAL connected=\(pane.isConnected) title=\(pane.paneTitle)")
+            if !pane.isConnected || !pane.paneTitle.contains("@ 115200") {
+                print("UIPROBE-FAIL serial pane did not connect (title=\(pane.paneTitle))")
+                exit(1)
+            }
+            let rx = Array("hello-serial\r\n".utf8)
+            _ = rx.withUnsafeBytes { write(master, $0.baseAddress, $0.count) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.6) {
+            guard let pane = serialPane else { print("UIPROBE-FAIL serial pane lost"); exit(1) }
+            let text = pane.scrollbackText(maxLines: 200)
+            let rxOK = text.contains("hello-serial")
+            print("UIPROBE-SERIAL rx_rendered=\(rxOK)")
+            if !rxOK { print("UIPROBE-FAIL serial RX not rendered: \(text.suffix(300))"); exit(1) }
+            pane.send(txt: "ping\r")  // keystroke path → send override → fd
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 16.1) {
+            guard let pane = serialPane else { exit(1) }
+            var buf = [UInt8](repeating: 0, count: 512)
+            let n = read(serialMasterFD, &buf, buf.count)
+            let received = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
+            // CRLF TX transform: the pane's Enter (CR) must arrive as CRLF.
+            let txOK = received.contains("ping\r\n")
+            print("UIPROBE-SERIAL tx_bytes=\(n) crlf_transform=\(txOK)")
+            if !txOK { print("UIPROBE-FAIL serial TX/line-ending (got: \(received.debugDescription))"); exit(1) }
+            pane.setHexMode(true)
+            let bytes: [UInt8] = [0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
+                                  0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef]
+            _ = bytes.withUnsafeBytes { write(serialMasterFD, $0.baseAddress, $0.count) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 16.7) {
+            guard let pane = serialPane else { exit(1) }
+            let text = pane.scrollbackText(maxLines: 200)
+            let hexOK = text.contains("de ad be ef") && text.contains("hex view on")
+            print("UIPROBE-SERIAL hex_lens=\(hexOK)")
+            if !hexOK { print("UIPROBE-FAIL hex lens: \(text.suffix(300))"); exit(1) }
+            // Journal the pane (2 s poll may not have ticked yet): poll + flush.
+            self.memory?.pollNow()
+            self.memory?.flushSync()
+            var journaled = false
+            for window in self.memory?.store.loadState() ?? [] {
+                for tab in window.tabs {
+                    for (_, paneRestore) in tab.panes {
+                        if let snap = paneRestore.snapshot, snap.adapter == SerialAdapter.name,
+                           snap.adapterState[SerialAdapter.settingsKey] == "115200-8N1",
+                           snap.adapterState[SerialAdapter.pathKey]?.isEmpty == false {
+                            journaled = true
+                        }
+                    }
+                }
+            }
+            print("UIPROBE-SERIAL adapter_journaled=\(journaled)")
+            if !journaled { print("UIPROBE-FAIL serial adapter_state not journaled"); exit(1) }
+            // "Unplug": closing the pty master REVOKES the slave. macOS can
+            // swallow the kevent on revoke (probe-verified: no read event
+            // ever fires), so the banner arrives via SerialConnection's
+            // 0.5 s liveness probe — the assert below waits > 2 ticks.
+            _ = Darwin.close(serialMasterFD)
+        }
+        var restoredSerialController: TerminalWindowController?
+        DispatchQueue.main.asyncAfter(deadline: .now() + 18.0) {
+            guard let pane = serialPane else { exit(1) }
+            let text = pane.scrollbackText(maxLines: 200)
+            let bannerOK = text.contains("device disconnected — will reconnect when it returns")
+            print("UIPROBE-SERIAL disconnect_banner=\(bannerOK) still_connected=\(pane.isConnected)")
+            if !bannerOK || pane.isConnected {
+                print("UIPROBE-FAIL serial disconnect handling"); exit(1)
+            }
+            // Restore-offer leg: drive the EXACT restore path with a journaled
+            // serial snapshot for an absent device. The pane must come back
+            // NOT connected (never auto-open on restore) with the standard
+            // consent-gated offer line.
+            let state = SerialAdapter.journalState(
+                path: "/dev/cu.memterm-probe-absent", identity: "usb:0000:0000:probe",
+                label: "probe-restore", settings: SerialSettings(),
+                txLineEnding: .crlf, localEcho: false)
+            let snap = SnapshotRow(exe: "", argv: [], adapter: SerialAdapter.name,
+                                   adapterState: state)
+            let tab = TabRestore(title: "", tree: .pane("probe-serial-restore"),
+                                 panes: ["probe-serial-restore":
+                                            PaneRestore(cwd: nil, shell: nil, snapshot: snap)])
+            let controller = TerminalWindowController(app: self,
+                                                      workspaceId: self.activeWorkspaceId,
+                                                      restoredTab: tab)
+            self.controllers.append(controller)
+            controller.showWindow(nil)
+            controller.window?.makeKeyAndOrderFront(nil)
+            restoredSerialController = controller
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 18.4) {
+            guard let controller = restoredSerialController,
+                  let pane = controller.allPanes().first as? SerialPaneView else {
+                print("UIPROBE-FAIL serial restore did not build a serial pane"); exit(1)
+            }
+            let text = pane.scrollbackText(maxLines: 100)
+            let offerOK = text.contains("was connected: memterm-probe-absent @ 115200-8N1 — press ⌘R to reconnect")
+            print("UIPROBE-SERIAL restore_offer=\(offerOK) auto_opened=\(pane.isConnected) pending=\(pane.pendingReconnectOffer)")
+            if !offerOK || pane.isConnected || !pane.pendingReconnectOffer {
+                print("UIPROBE-FAIL serial restore offer (consent gate)"); exit(1)
+            }
+            // The ⌘R gesture with the device absent: an honest line, no open.
+            self.typeResumeCommand(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 18.8) {
+            guard let controller = restoredSerialController,
+                  let pane = controller.allPanes().first as? SerialPaneView else { exit(1) }
+            let text = pane.scrollbackText(maxLines: 100)
+            let honestOK = text.contains("device not connected — memterm-probe-absent @ 115200-8N1")
+            print("UIPROBE-SERIAL reconnect_absent=\(honestOK) still_closed=\(!pane.isConnected)")
+            if !honestOK || pane.isConnected {
+                print("UIPROBE-FAIL ⌘R with absent device must report honestly and not open")
+                exit(1)
             }
             exit(0)
         }
@@ -1180,12 +1332,86 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// ⌘R: types the captured resume command into the pty WITHOUT a newline —
-    /// the user must press Enter themselves (FR-29, no exceptions).
+    /// the user must press Enter themselves (FR-29, no exceptions). For a
+    /// serial pane the same gesture performs the reconnect ACTION instead:
+    /// no command is composed or typed (consent story: the gesture is the
+    /// consent; the denylist path is never involved).
     @objc func typeResumeCommand(_ sender: Any?) {
-        guard let pane = keyController()?.currentPane(),
-              let command = pane.pendingResumeCommand else { return }
+        guard let pane = keyController()?.currentPane() else { return }
+        if let serial = pane as? SerialPaneView, !serial.isConnected {
+            serial.performReconnectGesture()
+            return
+        }
+        guard let command = pane.pendingResumeCommand else { return }
         pane.send(txt: command)
         pane.pendingResumeCommand = nil
+    }
+
+    // MARK: - Serial (feature/serial UX)
+
+    /// Shell ▸ New Serial Connection… (⌘⇧K — verified unclaimed in MainMenu).
+    @objc func newSerialConnection(_ sender: Any?) {
+        guard let window = keyController()?.window else { return }
+        ensureSerialHotplug()
+        let sheet = SerialConnectSheetController(app: self)
+        sheet.onConnect = { [weak self] setup in self?.openSerialTab(setup: setup) }
+        serialSheet = sheet
+        sheet.present(on: window)
+    }
+
+    func serialSheetClosed(_ sheet: SerialConnectSheetController) {
+        if serialSheet === sheet { serialSheet = nil }
+    }
+
+    /// Opens a new tab whose root pane is a serial pane (joins the key
+    /// window's tab group, like ⌘T). The Connect click that got us here is
+    /// the consent gesture — the controller opens the device immediately.
+    @discardableResult
+    func openSerialTab(setup: SerialPaneView.Setup) -> TerminalWindowController {
+        let hostController = keyController()
+        let controller = TerminalWindowController(
+            app: self, workspaceId: hostController?.workspaceId ?? activeWorkspaceId,
+            initialSerial: setup)
+        controllers.append(controller)
+        if let host = hostController?.window, let newWindow = controller.window {
+            host.addTabbedWindow(newWindow, ordered: .above)
+        }
+        controller.showWindow(nil)
+        memory?.scheduleTopologySave()
+        refreshWorkspaceChips()
+        return controller
+    }
+
+    /// View ▸ Hex View (⌘⇧X) — the per-pane hex lens; serial panes only.
+    @objc func toggleHexView(_ sender: Any?) {
+        guard let serial = keyController()?.currentPane() as? SerialPaneView else {
+            NSSound.beep()
+            return
+        }
+        serial.setHexMode(!serial.hexMode)
+    }
+
+    /// Starts the app-wide hotplug watcher once. Registry watching only —
+    /// devices are never opened from here.
+    func ensureSerialHotplug() {
+        guard serialHotplug == nil else { return }
+        let watcher = SerialHotplugWatcher()
+        watcher.onAttach = { [weak self] ports in self?.serialPortsChanged(attached: ports) }
+        watcher.onDetach = { [weak self] ports in self?.serialPortsChanged(detached: ports) }
+        _ = watcher.start()
+        serialHotplug = watcher
+    }
+
+    private func serialPortsChanged(attached: [SerialPortInfo] = [],
+                                    detached: [SerialPortInfo] = []) {
+        for controller in controllers {
+            for pane in controller.allPanes() {
+                guard let serial = pane as? SerialPaneView else { continue }
+                if !detached.isEmpty { serial.hotplugDetached(detached) }
+                if !attached.isEmpty { serial.hotplugAttached(attached) }
+            }
+        }
+        serialSheet?.reloadPorts()
     }
 }
 

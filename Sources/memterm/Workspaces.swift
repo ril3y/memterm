@@ -718,6 +718,12 @@ final class MoveTabRequest: NSObject {
 
 extension MemtermAppDelegate: NSMenuItemValidation {
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        // feature/serial: the hex lens reflects and requires a serial pane.
+        if item.action == #selector(toggleHexView(_:)) {
+            let serial = keyController()?.currentPane() as? SerialPaneView
+            item.state = serial?.hexMode == true ? .on : .off
+            return serial != nil
+        }
         guard let store = memory?.store else { return true }
         switch item.action {
         case #selector(parkActiveWorkspaceAction(_:)):

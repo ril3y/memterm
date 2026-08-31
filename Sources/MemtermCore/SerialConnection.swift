@@ -55,6 +55,13 @@ public final class SerialConnection {
     private let lock = NSLock()
     private var fd: Int32 = -1
     private var readSource: DispatchSourceRead?
+    /// Disconnect safety net (probe-verified on macOS 26.2): closing a pty
+    /// master REVOKES the slave vnode, and revoke can DETACH the kqueue knote
+    /// instead of firing it — the read source then never reports EOF. Real
+    /// USB unplugs revoke /dev/cu.* the same way. This timer probes the fd
+    /// with tcgetattr (side-effect free) every half second; a revoked fd
+    /// errors and surfaces as the disconnect the kevent swallowed.
+    private var livenessTimer: DispatchSourceTimer?
     private var closed = false     // set once; close() is idempotent
 
     public init(path: String, callbackQueue: DispatchQueue = .main) {
@@ -106,10 +113,17 @@ public final class SerialConnection {
         // Cancel handler owns the close(2): it runs strictly after the last
         // event handler, so the fd can never be reused under a live read.
         source.setCancelHandler { _ = Darwin.close(newFD) }
+        // Liveness probe on the same serial queue as the read pump (no
+        // fd-touching races): catches revoked fds whose kevent never fired.
+        let timer = DispatchSource.makeTimerSource(queue: readQueue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in self?.checkLiveness(of: newFD) }
         lock.lock()
         readSource = source
+        livenessTimer = timer
         lock.unlock()
         source.resume()
+        timer.resume()
     }
 
     /// Idempotent: the first call cancels the source (whose cancel handler
@@ -119,10 +133,13 @@ public final class SerialConnection {
         guard !closed else { lock.unlock(); return }
         closed = true
         let source = readSource
+        let timer = livenessTimer
         let openFD = fd
         readSource = nil
+        livenessTimer = nil
         fd = -1
         lock.unlock()
+        timer?.cancel()
         if let source {
             source.cancel()
         } else if openFD >= 0 {
@@ -142,18 +159,45 @@ public final class SerialConnection {
                 collected.append(contentsOf: buf[0..<n])
                 continue
             }
-            if n == 0 { sawEOF = true }           // peer closed — disconnect
-            break                                  // 0, EAGAIN, or error
+            if n == 0 {
+                sawEOF = true                      // peer closed — disconnect
+            } else if errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
+                sawEOF = true                      // EIO/ENXIO: revoked/vanished
+            }
+            break
         }
         if !collected.isEmpty, let handler = onData {
             let data = collected
             callbackQueue.async { handler(data) }
         }
-        if sawEOF {
-            close()
-            if let handler = onDisconnect {
-                callbackQueue.async { handler() }
-            }
+        if sawEOF { disconnectNow() }
+    }
+
+    /// Runs on readQueue (serial with the pump — no races): a device that
+    /// stopped answering tcgetattr is gone. read errors surface here too when
+    /// the revoke swallowed the kevent (see `livenessTimer`).
+    private func checkLiveness(of fd: Int32) {
+        lock.lock()
+        let live = !closed && self.fd == fd
+        lock.unlock()
+        guard live else { return }
+        var t = termios()
+        if tcgetattr(fd, &t) != 0 {
+            disconnectNow()
+        }
+    }
+
+    /// Tears the connection down (idempotent via close()) and fires
+    /// onDisconnect exactly once — the close() guard makes the second caller
+    /// a no-op before it can reach the handler.
+    private func disconnectNow() {
+        lock.lock()
+        let alreadyClosed = closed
+        lock.unlock()
+        guard !alreadyClosed else { return }
+        close()
+        if let handler = onDisconnect {
+            callbackQueue.async { handler() }
         }
     }
 

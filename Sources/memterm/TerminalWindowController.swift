@@ -71,9 +71,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     /// pass the key pane's kernel-truth cwd here when `new_tab_same_cwd` is on
     /// (iTerm2's "reuse previous session's directory"); restore paths ignore
     /// it (each restored pane carries its own journaled cwd).
+    /// `initialSerial` (feature/serial): the tab's root pane is a serial pane
+    /// opened on this setup instead of a shell (Shell ▸ New Serial
+    /// Connection…). Mutually exclusive with restoredTab/initialCwd.
     init(app: MemtermAppDelegate, workspaceId: String = StateStore.defaultWorkspaceId,
          restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil,
-         initialCwd: String? = nil) {
+         initialCwd: String? = nil, initialSerial: SerialPaneView.Setup? = nil) {
         self.app = app
         self.workspaceId = workspaceId
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
@@ -155,6 +158,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let restoredTab {
             root = buildNode(restoredTab.tree, frame: terminalContainer.bounds,
                              panes: restoredTab.panes)
+        } else if let initialSerial {
+            root = makeSerialPane(frame: terminalContainer.bounds, setup: initialSerial,
+                                  connectNow: true)
         } else {
             // A vanished inherited cwd falls back like a restore would —
             // never a broken pane (FR-25 spirit).
@@ -325,6 +331,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             represented: pane)
         menu.addItem(.separator())
 
+        // feature/serial: line control + lenses, grouped under one submenu.
+        if let serial = pane as? SerialPaneView {
+            let serialItem = NSMenuItem(title: "Serial", action: nil, keyEquivalent: "")
+            serialItem.submenu = makeSerialSubmenu(for: serial)
+            menu.addItem(serialItem)
+            menu.addItem(.separator())
+        }
+
         // FR-58: creating a workspace must be reachable by right-click alone.
         let workspaceItem = NSMenuItem(title: "Workspace", action: nil, keyEquivalent: "")
         workspaceItem.submenu = app.makeWorkspaceContextMenu(for: self)
@@ -332,6 +346,112 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         menu.addItem(.separator())
         add("Close Pane", #selector(ctxClosePane(_:)), target: self, represented: pane)
         return menu
+    }
+
+    /// feature/serial: the pane's Serial submenu. Built fresh per click so the
+    /// line-state checkmarks and connect state are live. On a device with no
+    /// modem lines (ENOTTY) the line items degrade to disabled, never guess.
+    private func makeSerialSubmenu(for pane: SerialPaneView) -> NSMenu {
+        let menu = NSMenu(title: "Serial")
+
+        func add(_ title: String, _ action: Selector?, checked: Bool = false,
+                 enabled: Bool = true) {
+            let item = NSMenuItem(title: title, action: enabled ? action : nil,
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = pane
+            item.state = checked ? .on : .off
+            menu.addItem(item)
+        }
+
+        let status = NSMenuItem(title: pane.isConnected
+                                    ? "Connected — \(pane.setup.offer.displayName)"
+                                    : "Not connected — \(pane.setup.offer.displayName)",
+                                action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+        menu.addItem(.separator())
+
+        if pane.isConnected {
+            let lines = pane.currentModemLines()
+            add("Toggle DTR" + (lines.map { $0.dtr ? " (asserted)" : " (deasserted)" } ?? ""),
+                #selector(ctxSerialToggleDTR(_:)), checked: lines?.dtr == true,
+                enabled: lines != nil)
+            add("Toggle RTS" + (lines.map { $0.rts ? " (asserted)" : " (deasserted)" } ?? ""),
+                #selector(ctxSerialToggleRTS(_:)), checked: lines?.rts == true,
+                enabled: lines != nil)
+            if lines == nil {
+                let note = NSMenuItem(title: "No modem lines on this device",
+                                      action: nil, keyEquivalent: "")
+                note.isEnabled = false
+                menu.addItem(note)
+            }
+            add("Send Break", #selector(ctxSerialBreak(_:)))
+            add("Reset Board (EN pulse)", #selector(ctxSerialReset(_:)),
+                enabled: lines != nil)
+            menu.addItem(.separator())
+            add("Send Hex…", #selector(ctxSerialSendHex(_:)))
+        } else {
+            add("Reconnect (⌘R)", #selector(ctxSerialReconnect(_:)))
+        }
+        add("Hex View", #selector(ctxSerialHexView(_:)), checked: pane.hexMode)
+        return menu
+    }
+
+    @objc private func ctxSerialToggleDTR(_ sender: NSMenuItem) {
+        (sender.representedObject as? SerialPaneView)?.toggleDTR()
+    }
+
+    @objc private func ctxSerialToggleRTS(_ sender: NSMenuItem) {
+        (sender.representedObject as? SerialPaneView)?.toggleRTS()
+    }
+
+    @objc private func ctxSerialBreak(_ sender: NSMenuItem) {
+        (sender.representedObject as? SerialPaneView)?.sendBreakSignal()
+    }
+
+    @objc private func ctxSerialReset(_ sender: NSMenuItem) {
+        (sender.representedObject as? SerialPaneView)?.resetBoard()
+    }
+
+    @objc private func ctxSerialReconnect(_ sender: NSMenuItem) {
+        (sender.representedObject as? SerialPaneView)?.performReconnectGesture()
+    }
+
+    @objc private func ctxSerialHexView(_ sender: NSMenuItem) {
+        guard let pane = sender.representedObject as? SerialPaneView else { return }
+        pane.setHexMode(!pane.hexMode)
+    }
+
+    @objc private func ctxSerialSendHex(_ sender: NSMenuItem) {
+        guard let pane = sender.representedObject as? SerialPaneView else { return }
+        promptSendHex(for: pane)
+    }
+
+    /// "Send Hex…": one field, parsed by SerialHex.parseInput (forgiving —
+    /// "DE AD", "0xde,0xad", "dead" all work); what was sent echoes as a dim
+    /// line in the pane. Sheet, not modal, matching the rename pattern.
+    func promptSendHex(for pane: SerialPaneView) {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Send Hex Bytes"
+        alert.informativeText = "e.g. “DE AD BE EF”, “0x01,0x02”, or “deadbeef”. Sent raw — no line ending appended."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.placeholderString = "DE AD BE EF"
+        field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Send")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak pane] response in
+            guard response == .alertFirstButtonReturn, let pane else { return }
+            guard let bytes = SerialHex.parseInput(field.stringValue), !bytes.isEmpty else {
+                pane.feedDim("memterm: not valid hex: \(field.stringValue)")
+                return
+            }
+            pane.writeRaw(bytes)
+        }
+        alert.window.makeFirstResponder(field)
     }
 
     @objc private func ctxSplitRight(_ sender: Any?) { splitCurrentPane(vertical: true) }
@@ -362,11 +482,45 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         return pane
     }
 
+    private func terminalOptions() -> TerminalOptions {
+        TerminalOptions(cursorStyle: app.config.terminalCursorStyle,
+                        scrollback: app.config.scrollbackLines)
+    }
+
     private func constructPane(frame: NSRect) -> PaneView {
+        let pane = PaneView(frame: frame, font: app.currentFont(),
+                            options: terminalOptions())
+        stylePane(pane)
+        return pane
+    }
+
+    /// feature/serial: a pane whose byte source is a SerialConnection.
+    /// Identical chrome/config to a shell pane; `connectNow` opens the device
+    /// immediately (the caller's Connect click IS the consent gesture) and
+    /// surfaces a failure as a dim line + pending ⌘R retry, never an alert.
+    func makeSerialPane(frame: NSRect, setup: SerialPaneView.Setup,
+                        connectNow: Bool) -> SerialPaneView {
+        let pane = SerialPaneView(setup: setup, frame: frame, font: app.currentFont(),
+                                  options: terminalOptions())
+        stylePane(pane)
+        pane.onSerialStateChanged = { [weak self, weak pane] in
+            if let pane { self?.refreshTitle(for: pane) }
+        }
+        if connectNow {
+            pane.feedDim("memterm: serial \(setup.offer.displayName) (\(setup.path))")
+            do {
+                try pane.connect()
+            } catch {
+                pane.pendingReconnectOffer = true
+                pane.feedDim("memterm: could not open \(setup.path) (\(SerialPaneView.describe(error))) — press ⌘R to retry")
+            }
+        }
+        app.ensureSerialHotplug()
+        return pane
+    }
+
+    private func stylePane(_ pane: PaneView) {
         let config = app.config
-        let options = TerminalOptions(cursorStyle: config.terminalCursorStyle,
-                                      scrollback: config.scrollbackLines)
-        let pane = PaneView(frame: frame, font: app.currentFont(), options: options)
         pane.autoresizingMask = [.width, .height]
         pane.copyOnSelect = config.copyOnSelect
         pane.optionAsMetaKey = config.optionAsMeta
@@ -393,7 +547,6 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
         pane.onOutputActivity = { [weak self] in self?.paneProducedOutput() }
         pane.onBell = { [weak self] in self?.paneRangBell() }
-        return pane
     }
 
     /// BEL beyond the in-view sound/flash (SwiftTerm's bellStyle handled
@@ -526,22 +679,48 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         return f
     }()
 
-    private func makeRestoredPane(frame: NSRect, id: String, restore: PaneRestore?) -> PaneView {
-        let (cwd, fellBack) = CwdFallback.resolve(restore?.cwd)
-        let pane = constructPane(frame: frame)
-        pane.paneId = id
-        pane.lastKnownCwd = cwd
-        pane.cwdSource = "restore"
-
-        // Ghost scrollback: history the user can scroll/search. feed() only —
-        // nothing here ever reaches the pty.
-        if let ghost = app.memory?.loadScrollback(for: id), !ghost.isEmpty {
+    /// Ghost scrollback + restored divider, shared by shell and serial
+    /// restores. feed() only — nothing here ever reaches a pty or a device.
+    private func feedRestoredPreamble(into pane: PaneView, paneId: String) {
+        if let ghost = app.memory?.loadScrollback(for: paneId), !ghost.isEmpty {
             let crlf = ScrollbackText.ghostFeedText(ghost)
             pane.feed(text: "\u{1b}[2m" + crlf + "\u{1b}[0m\r\n")
         }
         let stamp = Self.restoreDateFormatter.string(from: Date())
         pane.feed(text: "\u{1b}[36m── restored — \(stamp) ──\u{1b}[0m\r\n")
         pane.restoredDividerCount += 1
+    }
+
+    /// feature/serial restore: serial sessions are RECONNECTABLE. The pane
+    /// comes back with its ghost scrollback and the standard consent-gated
+    /// offer — the device is NEVER opened here; only the ⌘R gesture (a
+    /// reconnect action, not a typed command) opens it.
+    private func makeRestoredSerialPane(frame: NSRect, id: String,
+                                        offer: SerialAdapter.ReconnectOffer) -> SerialPaneView {
+        let setup = SerialPaneView.Setup(path: offer.path, identity: offer.identity,
+                                         label: offer.label, settings: offer.settings,
+                                         txLineEnding: offer.txLineEnding,
+                                         localEcho: offer.localEcho)
+        let pane = makeSerialPane(frame: frame, setup: setup, connectNow: false)
+        pane.paneId = id
+        pane.cwdSource = "restore"
+        feedRestoredPreamble(into: pane, paneId: id)
+        pane.pendingReconnectOffer = true
+        pane.feed(text: "\u{1b}[36mmemterm: was connected: \(offer.displayName) — press ⌘R to reconnect\u{1b}[0m\r\n")
+        return pane
+    }
+
+    private func makeRestoredPane(frame: NSRect, id: String, restore: PaneRestore?) -> PaneView {
+        if let snap = restore?.snapshot, snap.adapter == SerialAdapter.name,
+           let offer = SerialAdapter.reconnectOffer(from: snap.adapterState) {
+            return makeRestoredSerialPane(frame: frame, id: id, offer: offer)
+        }
+        let (cwd, fellBack) = CwdFallback.resolve(restore?.cwd)
+        let pane = constructPane(frame: frame)
+        pane.paneId = id
+        pane.lastKnownCwd = cwd
+        pane.cwdSource = "restore"
+        feedRestoredPreamble(into: pane, paneId: id)
         if fellBack, let saved = restore?.cwd {
             pane.feed(text: "\u{1b}[2mmemterm: directory not available: \(saved)\u{1b}[0m\r\n")
         }
@@ -654,6 +833,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     func close(pane: PaneView) {
         pane.processDelegate = nil
         app.claudeClaims.release(paneId: pane.paneId)
+        (pane as? SerialPaneView)?.shutdown()  // serial fd, no process to kill
         if pane.process.running { pane.terminate() }
 
         guard let split = pane.superview as? NSSplitView else {
@@ -907,6 +1087,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         for pane in allPanes() {
             pane.processDelegate = nil
             app.claudeClaims.release(paneId: pane.paneId)
+            (pane as? SerialPaneView)?.shutdown()
             if pane.process.running { pane.terminate() }
         }
         app.controllerClosed(self)

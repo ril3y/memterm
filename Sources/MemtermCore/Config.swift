@@ -69,6 +69,14 @@ public struct Config {
     /// Terminal mouse reporting (vim/htop capture the mouse). SwiftTerm's
     /// allowMouseReporting; false forces native selection everywhere.
     public var allowMouseReporting = true
+    /// feature/serial: what Enter transmits in NEW serial panes — one of
+    /// `serialLineEndings` (per-pane override in the connect sheet; per-device
+    /// profiles remember the last choice). CRLF is the research consensus
+    /// default for Arduino/ESP-class monitors.
+    public var serialTxLineEnding = "crlf"
+    /// feature/serial: local echo default for NEW serial panes (most firmware
+    /// echoes for itself, so off by default).
+    public var serialLocalEcho = false
     /// Window background opacity, 0.3–1.0 (1.0 = opaque). Applied as
     /// background-color alpha, never window alpha — text stays crisp.
     public var windowOpacity = 1.0
@@ -117,6 +125,9 @@ public struct Config {
                                       "blink-underline", "steady-underline",
                                       "blink-bar", "steady-bar"]
 
+    /// Valid `serial_tx_line_ending` values (SerialLineEnding raw values).
+    public static let serialLineEndings = SerialLineEnding.configValues
+
     public static var configURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/memterm/config.toml")
@@ -154,6 +165,10 @@ public struct Config {
         if let s = string(values["bell_style"]), bellStyles.contains(s) { c.bellStyle = s }
         if let s = string(values["bell_sound"]), bellSounds.contains(s) { c.bellSound = s }
         if let s = string(values["cursor_style"]), cursorStyles.contains(s) { c.cursorStyle = s }
+        if let s = string(values["serial_tx_line_ending"]), serialLineEndings.contains(s) {
+            c.serialTxLineEnding = s
+        }
+        if let b = boolean(values["serial_local_echo"]) { c.serialLocalEcho = b }
         if let b = boolean(values["confirm_quit"]) { c.confirmQuit = b }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
@@ -256,6 +271,8 @@ public struct Config {
             lines.append("# bell_sound = \"Glass\"  # \(Self.bellSounds.joined(separator: " | ")); unset = system beep")
         }
         lines.append("cursor_style = \"\(cursorStyle)\"  # \(Self.cursorStyles.joined(separator: " | "))")
+        lines.append("serial_tx_line_ending = \"\(serialTxLineEnding)\"  # \(Self.serialLineEndings.joined(separator: " | ")) — Enter in serial panes")
+        lines.append("serial_local_echo = \(serialLocalEcho)  # echo typed bytes locally in serial panes")
         lines.append("line_spacing = \(Self.twoDecimals(lineSpacing))  # 1.0–1.6 line-height multiplier")
         lines.append("window_opacity = \(Self.twoDecimals(windowOpacity))  # 0.3–1.0 background opacity (1.0 = opaque)")
         lines.append("window_blur = \(windowBlur)  # blur what's behind a translucent window")
@@ -335,6 +352,11 @@ public struct Config {
         # Cursor: blink-block | steady-block | blink-underline |
         # steady-underline | blink-bar | steady-bar.
         # cursor_style = "blink-block"
+
+        # Serial panes (Shell > New Serial Connection): what Enter transmits
+        # (cr | lf | crlf | none) and whether typed bytes echo locally.
+        # serial_tx_line_ending = "crlf"
+        # serial_local_echo = false
 
         # Line-height multiplier, 1.0–1.6.
         # line_spacing = 1.0

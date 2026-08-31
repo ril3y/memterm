@@ -36,6 +36,8 @@ final class ConfigTests: XCTestCase {
         c.lineSpacing = 1.25
         c.windowOpacity = 0.85
         c.windowBlur = true
+        c.serialTxLineEnding = "lf"
+        c.serialLocalEcho = true
         c.themeBackground = ConfigRGB(red: 0x1d, green: 0x1f, blue: 0x21)
         c.themeForeground = ConfigRGB(red: 0xc5, green: 0xc8, blue: 0xc6)
         c.themeCursor = ConfigRGB(red: 0xff, green: 0x00, blue: 0x7f)
@@ -61,6 +63,8 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(parsed.lineSpacing, c.lineSpacing)
         XCTAssertEqual(parsed.windowOpacity, c.windowOpacity)
         XCTAssertEqual(parsed.windowBlur, c.windowBlur)
+        XCTAssertEqual(parsed.serialTxLineEnding, c.serialTxLineEnding)
+        XCTAssertEqual(parsed.serialLocalEcho, c.serialLocalEcho)
         XCTAssertEqual(parsed.themeBackground, c.themeBackground)
         XCTAssertEqual(parsed.themeForeground, c.themeForeground)
         XCTAssertEqual(parsed.themeCursor, c.themeCursor)
@@ -88,6 +92,9 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(parsed.lineSpacing, 1.0)
         XCTAssertEqual(parsed.windowOpacity, 1.0, "opaque by default")
         XCTAssertFalse(parsed.windowBlur)
+        XCTAssertEqual(parsed.serialTxLineEnding, "crlf",
+                       "CRLF is the serial TX default (research consensus)")
+        XCTAssertFalse(parsed.serialLocalEcho, "serial local echo off by default")
         XCTAssertNil(parsed.themeBackground)
         XCTAssertNil(parsed.themeSelection)
         XCTAssertNil(parsed.themePreset)
@@ -130,6 +137,16 @@ final class ConfigTests: XCTestCase {
         for style in Config.cursorStyles {
             XCTAssertEqual(Config.parse("cursor_style = \"\(style)\"").cursorStyle, style)
         }
+    }
+
+    func testSerialLineEndingValidation() {
+        XCTAssertEqual(Config.parse("serial_tx_line_ending = \"semaphore\"").serialTxLineEnding,
+                       "crlf", "unknown serial_tx_line_ending must not stick")
+        for ending in Config.serialLineEndings {
+            XCTAssertEqual(Config.parse("serial_tx_line_ending = \"\(ending)\"").serialTxLineEnding,
+                           ending)
+        }
+        XCTAssertTrue(Config.parse("serial_local_echo = true").serialLocalEcho)
     }
 
     func testLoadCreatesAndParsesDefaultsFile() {
