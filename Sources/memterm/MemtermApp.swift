@@ -546,6 +546,15 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             let txOK = received.contains("ping\r\n")
             print("UIPROBE-SERIAL tx_bytes=\(n) crlf_transform=\(txOK)")
             if !txOK { print("UIPROBE-FAIL serial TX/line-ending (got: \(received.debugDescription))"); exit(1) }
+            // Local echo honored, both ways: echo OFF + raw master (no kernel
+            // echo) means the typed "ping" must NOT have rendered; flipping
+            // echo ON must render the next keystrokes locally even though the
+            // master never echoes a byte back.
+            let echoOffOK = !pane.scrollbackText(maxLines: 200).contains("ping")
+            print("UIPROBE-SERIAL echo_off_honored=\(echoOffOK)")
+            if !echoOffOK { print("UIPROBE-FAIL local-echo-off keystrokes rendered"); exit(1) }
+            pane.updateLocalEcho(true)
+            pane.send(txt: "echo-on-test")
             pane.setHexMode(true)
             let bytes: [UInt8] = [0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
                                   0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef]
@@ -557,6 +566,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             let hexOK = text.contains("de ad be ef") && text.contains("hex view on")
             print("UIPROBE-SERIAL hex_lens=\(hexOK)")
             if !hexOK { print("UIPROBE-FAIL hex lens: \(text.suffix(300))"); exit(1) }
+            let echoOnOK = text.contains("echo-on-test")
+            print("UIPROBE-SERIAL echo_on_rendered=\(echoOnOK)")
+            if !echoOnOK { print("UIPROBE-FAIL local-echo-on keystrokes did not render"); exit(1) }
             // Journal the pane (2 s poll may not have ticked yet): poll + flush.
             self.memory?.pollNow()
             self.memory?.flushSync()
