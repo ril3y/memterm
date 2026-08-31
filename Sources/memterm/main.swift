@@ -20,4 +20,5 @@ if arguments.contains("--config-dump") {
 let mode: RunMode = arguments.contains("--latency") ? .latency
                   : arguments.contains("--flood") ? .flood
                   : .interactive
-runApp(mode: mode)
+// --smoke: deterministic capture/restore self-test (see MemtermApp.runSmoke).
+runApp(mode: mode, smoke: arguments.contains("--smoke"))

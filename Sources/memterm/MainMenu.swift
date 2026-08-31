@@ -49,6 +49,9 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Split Down", to: shellMenu, #selector(MemtermAppDelegate.splitDown(_:)), "d",
         modifiers: [.command, .shift], target: app)
     shellMenu.addItem(.separator())
+    add("Type Resume Command", to: shellMenu,
+        #selector(MemtermAppDelegate.typeResumeCommand(_:)), "r", target: app)
+    shellMenu.addItem(.separator())
     add("Close Pane/Tab", to: shellMenu, #selector(MemtermAppDelegate.closePane(_:)), "w",
         target: app)
 

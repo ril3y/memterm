@@ -144,6 +144,22 @@ MoSCoW: **M** = Must (v0.1), **S** = Should (v0.1 if schedule holds, else v0.2),
 - **FR-47 (M)** — **Graceful-update flush** (mitigates the app-update regression vs iTerm2): Sparkle installs on quit, never mid-session; the pre-update quit path performs a full journal + scrollback flush, so an update is exactly a clean quit/relaunch — everything restores, with resume chips for what was running. Release notes and onboarding state the limitation honestly until the v0.4 holder layer closes it.
 - **FR-48 (S)** — ⌘K command palette as the primary settings surface (Raycast/Linear style): every setting searchable and togglable inline with live preview, writing to the TOML file. No multi-pane preferences window, ever; at most a one-page General sheet (font/theme/default shell).
 
+### Group G — Workspaces (tab groups) — first-class citizen
+
+*Founder decision 2026-08-30: promoted to MUST. A workspace is a named, colored group of tabs (with their pane trees). It is the natural unit of the memory engine: parking a workspace and restoring after a reboot are the same journal → restore pipeline, which turns memterm's persistence from a disaster-recovery feature into a daily driver ("close the infra workspace, reopen it Thursday, everything — cwds, ghost scrollback, resumable Claude/SSH sessions — comes back"). tmux-session semantics, native macOS UI; no competing terminal has this.*
+
+- **FR-49 (M)** — Workspace entity: every tab belongs to exactly one workspace; workspaces have a name and a color chip; a default workspace exists so single-context users never see the concept until they want it.
+- **FR-50 (M)** — Workspace switcher: create / rename / recolor / delete from the titlebar control and the Shell menu; switching swaps the window's tab set in place. Deleting offers "park" vs "forget."
+- **FR-51 (M)** — Park / reopen: closing a workspace parks it — full layout, per-pane cwd, scrollback, and adapter state (Claude session IDs, SSH argv) stay in the journal; reopening runs the standard restore pipeline (ghost scrollback + consent-gated resume offers). Reboot-restore restores workspaces, not bare tabs.
+- **FR-52 (M)** — Keyboard model (founder-specified):
+  - **⌘1–⌘8** — jump to tab N in the active workspace; **⌘9** — last tab (browser convention).
+  - **⌃⌘1–9** — jump to workspace N; **⌃⌘← / ⌃⌘→** — cycle workspaces.
+  - **⌘⇧[ / ⌘⇧]** (and ⌃Tab / ⌃⇧Tab) — previous / next tab.
+  - ⌘⌥arrows stay pane-focus navigation (FR-3). All bindings rebindable in config; defaults must not collide with common shell/tmux/vim chords beyond macOS conventions.
+- **FR-53 (S)** — Auto-workspace suggestion: when a window's cwds cluster under one repo root, offer to name the workspace after it (never rename silently).
+- **FR-54 (S)** — Session timeline (FR-43) groups by workspace; a parked workspace appears as one reopenable card.
+- **FR-55 (C)** — Per-workspace defaults: starting cwd, profile/theme tint, env.
+
 ---
 
 ## 6. Non-Functional Requirements
@@ -331,7 +347,7 @@ protocol ResurrectionAdapter {
 
 **v0.1 = "a clean, native terminal that brings your Claude and SSH sessions back after reboot."**
 
-**In:** SwiftTerm engine behind `TerminalEngine`, stock CoreText renderer, AppKit windows/tabs/splits, ⌘F (incl. ghost), auto-injected shell integration (zsh first, bash/fish before beta ends), full capture→SQLite WAL→restore pipeline with boot-UUID stamping, ghost scrollback, chips + HUD + ⌘⇧R, adapters: claude (with live badge) + ssh + watchers + plain shell, denylist, vanished-cwd handling, duplicate-UUID disambiguation, crash-loop safe mode, graceful-update flush, TOML config, "Forget everything," signed/notarized DMG + Sparkle + Homebrew cask.
+**In:** SwiftTerm engine behind `TerminalEngine`, stock CoreText renderer, AppKit windows/tabs/splits, workspaces (named tab groups with park/reopen + ⌘1–9 / ⌃⌘1–9 switching, FR-49..52), ⌘F (incl. ghost), auto-injected shell integration (zsh first, bash/fish before beta ends), full capture→SQLite WAL→restore pipeline with boot-UUID stamping, ghost scrollback, chips + HUD + ⌘⇧R, adapters: claude (with live badge) + ssh + watchers + plain shell, denylist, vanished-cwd handling, duplicate-UUID disambiguation, crash-loop safe mode, graceful-update flush, TOML config, "Forget everything," signed/notarized DMG + Sparkle + Homebrew cask.
 
 **Out (deferred):** Metal renderer (v0.3), ⌘K palette (v0.2), timeline browser (v0.2), hotkey window (v0.2), triggers-lite (v0.3), profiles (v0.2), tmux -CC (post-1.0), pty-holder layer (v0.4), user-extensible adapters (v0.3), at-rest encryption (fast-follow; privacy toggle is the v0.1 mitigation).
 

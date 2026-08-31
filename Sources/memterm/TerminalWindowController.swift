@@ -12,12 +12,14 @@ enum FocusDirection {
 
 final class TerminalWindowController: NSWindowController, NSWindowDelegate, LocalProcessTerminalViewDelegate {
     private unowned let app: MemtermAppDelegate
+    /// Stable tab identity for the state store (one controller = one tab row).
+    let tabId = UUID().uuidString
     private weak var focusedPane: PaneView?
     // SwiftTerm's becomeFirstResponder is not open, so focus changes are
     // tracked by observing the window's firstResponder instead.
     private var firstResponderObservation: NSKeyValueObservation?
 
-    init(app: MemtermAppDelegate) {
+    init(app: MemtermAppDelegate, restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil) {
         self.app = app
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
         let window = NSWindow(
@@ -28,7 +30,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         )
         window.title = "memterm"
         window.tabbingIdentifier = "memterm-terminal"
-        window.center()
+        if let restoredFrame {
+            window.setFrame(restoredFrame, display: false)
+        } else {
+            window.center()
+        }
         if let bg = app.config.themeBackground { window.backgroundColor = bg }
         super.init(window: window)
         window.delegate = self
@@ -38,11 +44,18 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             }
         }
 
-        let content = NSView(frame: rect)
+        let content = NSView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
         window.contentView = content
-        let pane = makePane(frame: content.bounds, cwd: nil)
-        content.addSubview(pane)
-        window.makeFirstResponder(pane)
+        let root: NSView
+        if let restoredTab {
+            root = buildNode(restoredTab.tree, frame: content.bounds, panes: restoredTab.panes)
+        } else {
+            root = makePane(frame: content.bounds, cwd: nil)
+        }
+        content.addSubview(root)
+        if let first = allPanes().first {
+            window.makeFirstResponder(first)
+        }
     }
 
     @available(*, unavailable)
@@ -51,6 +64,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     // MARK: - Panes
 
     private func makePane(frame: NSRect, cwd: String?) -> PaneView {
+        let pane = constructPane(frame: frame)
+        pane.lastKnownCwd = cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
+        startShell(in: pane, cwd: cwd)
+        return pane
+    }
+
+    private func constructPane(frame: NSRect) -> PaneView {
         let config = app.config
         let options = TerminalOptions(scrollback: config.scrollbackLines)
         let pane = PaneView(frame: frame, font: app.currentFont(), options: options)
@@ -61,11 +81,102 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let fg = config.themeForeground { pane.nativeForegroundColor = fg }
         if let cursor = config.themeCursor { pane.caretColor = cursor }
         if let ansi = config.ansiColors { pane.installColors(ansi) }
+        return pane
+    }
 
-        let shell = config.shell ?? ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+    private func startShell(in pane: PaneView, cwd: String?, shellOverride: String? = nil) {
+        var shell = shellOverride ?? app.config.shell
+            ?? ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        if !FileManager.default.isExecutableFile(atPath: shell) { shell = "/bin/zsh" }
+        pane.shellPath = shell
         let shellName = (shell as NSString).lastPathComponent
         pane.startProcess(executable: shell, execName: "-\(shellName)", currentDirectory: cwd)
+    }
+
+    // MARK: - Restore (FR-24/25, v0 chips as feed()'d offer lines)
+
+    private func buildNode(_ node: SplitNode, frame: NSRect, panes: [String: PaneRestore]) -> NSView {
+        switch node {
+        case .pane(let id):
+            return makeRestoredPane(frame: frame, id: id, restore: panes[id])
+        case .split(let vertical, let ratio, let first, let second):
+            let split = NSSplitView(frame: frame)
+            split.isVertical = vertical
+            split.dividerStyle = .thin
+            split.autoresizingMask = [.width, .height]
+            var fa = frame, fb = frame
+            if vertical {
+                fa.size.width = frame.width * ratio
+                fb.size.width = frame.width - fa.width
+            } else {
+                fa.size.height = frame.height * ratio
+                fb.size.height = frame.height - fa.height
+            }
+            split.addArrangedSubview(buildNode(first, frame: fa, panes: panes))
+            split.addArrangedSubview(buildNode(second, frame: fb, panes: panes))
+            split.adjustSubviews()
+            split.setPosition((vertical ? frame.width : frame.height) * ratio, ofDividerAt: 0)
+            return split
+        }
+    }
+
+    private static let restoreDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d h:mm a"
+        return f
+    }()
+
+    private func makeRestoredPane(frame: NSRect, id: String, restore: PaneRestore?) -> PaneView {
+        let (cwd, fellBack) = MemoryEngine.resolveCwd(restore?.cwd)
+        let pane = constructPane(frame: frame)
+        pane.paneId = id
+        pane.lastKnownCwd = cwd
+        pane.cwdSource = "restore"
+
+        // Ghost scrollback: history the user can scroll/search. feed() only —
+        // nothing here ever reaches the pty.
+        if let ghost = app.memory?.loadScrollback(for: id), !ghost.isEmpty {
+            let crlf = ghost.replacingOccurrences(of: "\n", with: "\r\n")
+            pane.feed(text: "\u{1b}[2m" + crlf + "\u{1b}[0m\r\n")
+        }
+        let stamp = Self.restoreDateFormatter.string(from: Date())
+        pane.feed(text: "\u{1b}[36m── restored — \(stamp) ──\u{1b}[0m\r\n")
+        if fellBack, let saved = restore?.cwd {
+            pane.feed(text: "\u{1b}[2mmemterm: directory not available: \(saved)\u{1b}[0m\r\n")
+        }
+        if let snap = restore?.snapshot, !snap.adapter.isEmpty,
+           let offer = Adapters.resumeOffer(for: snap) {
+            pane.pendingResumeCommand = offer.command
+            pane.feed(text: "\u{1b}[36mmemterm: was running \(offer.label) — press ⌘R to type: \(offer.command)\u{1b}[0m\r\n")
+        }
+        startShell(in: pane, cwd: cwd, shellOverride: restore?.shell)
         return pane
+    }
+
+    // MARK: - Capture (split tree snapshot for the state store)
+
+    func snapshotTab() -> TabSnap? {
+        guard let root = window?.contentView?.subviews.first,
+              let tree = snapshotNode(root) else { return nil }
+        let panes = allPanes().map {
+            PaneSnap(id: $0.paneId, shell: $0.shellPath, cwd: $0.lastKnownCwd,
+                     cwdSource: $0.cwdSource)
+        }
+        return TabSnap(id: tabId, title: window?.title ?? "", tree: tree, panes: panes)
+    }
+
+    private func snapshotNode(_ view: NSView) -> SplitNode? {
+        if let pane = view as? PaneView { return .pane(pane.paneId) }
+        guard let split = view as? NSSplitView else { return nil }
+        let subs = split.arrangedSubviews
+        if subs.count == 2, let a = snapshotNode(subs[0]), let b = snapshotNode(subs[1]) {
+            let total = split.isVertical ? split.bounds.width : split.bounds.height
+            let first = split.isVertical ? subs[0].frame.width : subs[0].frame.height
+            let ratio = total > 0 ? Double(first / total) : 0.5
+            return .split(vertical: split.isVertical, ratio: min(max(ratio, 0.05), 0.95),
+                          first: a, second: b)
+        }
+        return subs.count == 1 ? snapshotNode(subs[0]) : nil
     }
 
     func allPanes() -> [PaneView] {
@@ -111,6 +222,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         split.adjustSubviews()
         split.setPosition((vertical ? oldFrame.width : oldFrame.height) / 2, ofDividerAt: 0)
         window?.makeFirstResponder(newPane)
+        app.memory?.scheduleTopologySave()
     }
 
     func closeCurrentPane() {
@@ -140,6 +252,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let next = allPanes().first {
             window?.makeFirstResponder(next)
         }
+        app.memory?.scheduleTopologySave()
     }
 
     private func replace(_ old: NSView, with new: NSView) {
@@ -210,6 +323,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             if pane.process.running { pane.terminate() }
         }
         app.controllerClosed(self)
+        app.memory?.scheduleTopologySave()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        app.memory?.scheduleFrameSave()
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        app.memory?.scheduleFrameSave()
     }
 
     // MARK: - LocalProcessTerminalViewDelegate

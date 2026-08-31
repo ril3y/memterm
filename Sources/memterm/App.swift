@@ -178,11 +178,11 @@ enum RunMode {
     case interactive, latency, flood
 }
 
-func runApp(mode: RunMode) {
+func runApp(mode: RunMode, smoke: Bool = false) {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
     let delegate: NSApplicationDelegate = mode == .interactive
-        ? MemtermAppDelegate()
+        ? MemtermAppDelegate(smokeMode: smoke)
         : ProbeAppDelegate(mode: mode)
     app.delegate = delegate
     app.run()
