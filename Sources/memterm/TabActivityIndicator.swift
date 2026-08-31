@@ -1,13 +1,13 @@
 import AppKit
 import MemtermCore
 
-// Founder UX stage (2026-08-31): live activity in the native tab bar. The
-// view goes into NSWindowTab.accessoryView (public AppKit API — verified in
-// the macOS SDK's NSWindowTab.h): a small spinner while a non-selected tab's
-// pty is producing output, decaying ~1.5 s after output stops to a solid
-// "unseen output" dot that clears when the tab is selected. The pure state
-// machine (decay + coalescing) is MemtermCore.TabActivityTracker; this is
-// only its AppKit face.
+// Founder UX stage (2026-08-31): live per-tab activity. Under the custom
+// chrome the view renders FIRST-CLASS inside each TabItemView in our tab
+// strip (it used to be squeezed into NSWindowTab.accessoryView): a small
+// spinner while a non-selected tab's pty is producing output, decaying
+// ~1.5 s after output stops to a solid "unseen output" dot that clears when
+// the tab is selected. The pure state machine (decay + coalescing) is
+// MemtermCore.TabActivityTracker; this is only its AppKit face.
 
 final class TabActivityIndicatorView: NSView {
     private let spinner = NSProgressIndicator()

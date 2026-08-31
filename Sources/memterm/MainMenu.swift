@@ -48,8 +48,9 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     let shellMenu = submenu("Shell")
     add("New Window", to: shellMenu, #selector(MemtermAppDelegate.newWindow(_:)), "n",
         target: app)
-    // nil target so the native tab bar's "+" shares the same plumbing
-    add("New Tab", to: shellMenu, #selector(MemtermAppDelegate.newWindowForTab(_:)), "t")
+    // Custom chrome: the strip's "+" shares this exact action.
+    add("New Tab", to: shellMenu, #selector(MemtermAppDelegate.newWindowForTab(_:)), "t",
+        target: app)
     // feature/serial: ⌘⇧K verified unclaimed (⌘K = View ▸ Clear).
     add("New Serial Connection…", to: shellMenu,
         #selector(MemtermAppDelegate.newSerialConnection(_:)), "k",
@@ -152,29 +153,39 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     lastTab.tag = 9
     windowMenu.addItem(lastTab)
     windowMenu.addItem(.separator())
-    // FR-52: ⌘⇧[ / ⌘⇧] previous/next tab, with ⌃Tab / ⌃⇧Tab as hidden aliases.
-    add("Show Previous Tab", to: windowMenu, #selector(NSWindow.selectPreviousTab(_:)), "[",
-        modifiers: [.command, .shift])
-    add("Show Next Tab", to: windowMenu, #selector(NSWindow.selectNextTab(_:)), "]",
-        modifiers: [.command, .shift])
+    // FR-52: ⌘⇧[ / ⌘⇧] previous/next tab, with ⌃Tab / ⌃⇧Tab as hidden
+    // aliases — host actions on the app delegate now (plain windows have no
+    // native tab group; the NSWindow selectors would dead-key).
+    add("Show Previous Tab", to: windowMenu,
+        #selector(MemtermAppDelegate.selectPreviousTabAction(_:)), "[",
+        modifiers: [.command, .shift], target: app)
+    add("Show Next Tab", to: windowMenu,
+        #selector(MemtermAppDelegate.selectNextTabAction(_:)), "]",
+        modifiers: [.command, .shift], target: app)
     let prevTabAlias = NSMenuItem(title: "Show Previous Tab",
-                                  action: #selector(NSWindow.selectPreviousTab(_:)),
+                                  action: #selector(MemtermAppDelegate.selectPreviousTabAction(_:)),
                                   keyEquivalent: "\t")
     prevTabAlias.keyEquivalentModifierMask = [.control, .shift]
     prevTabAlias.isHidden = true
+    prevTabAlias.target = app
     windowMenu.addItem(prevTabAlias)
     let nextTabAlias = NSMenuItem(title: "Show Next Tab",
-                                  action: #selector(NSWindow.selectNextTab(_:)),
+                                  action: #selector(MemtermAppDelegate.selectNextTabAction(_:)),
                                   keyEquivalent: "\t")
     nextTabAlias.keyEquivalentModifierMask = [.control]
     nextTabAlias.isHidden = true
+    nextTabAlias.target = app
     windowMenu.addItem(nextTabAlias)
     add("Rename Tab…", to: windowMenu, #selector(MemtermAppDelegate.renameTab(_:)),
         "", modifiers: [], target: app)
-    add("Move Tab to New Window", to: windowMenu, #selector(NSWindow.moveTabToNewWindow(_:)),
-        "", modifiers: [])
-    add("Merge All Windows", to: windowMenu, #selector(NSWindow.mergeAllWindows(_:)),
-        "", modifiers: [])
+    // OUR re-homing implementations (native NSWindow tab selectors are gone
+    // with native tabbing): same panes, same processes, different host.
+    add("Move Tab to New Window", to: windowMenu,
+        #selector(MemtermAppDelegate.moveTabToNewWindowAction(_:)), "", modifiers: [],
+        target: app)
+    add("Merge All Windows", to: windowMenu,
+        #selector(MemtermAppDelegate.mergeAllWindowsAction(_:)), "", modifiers: [],
+        target: app)
     windowMenu.addItem(.separator())
     add("Bring All to Front", to: windowMenu, #selector(NSApplication.arrangeInFront(_:)),
         "", modifiers: [])

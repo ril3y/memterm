@@ -130,8 +130,10 @@ final class MemoryEngine {
         store.saveTopology(snapshotTopology(), forWorkspaces: app.captureScope())
     }
 
-    /// Native tabs are separate NSWindows sharing a tab group, so a "window"
-    /// row is a tab group and each controller is a tab.
+    /// NATIVE-TAB-ERA REMNANT (no callers; stage-2 deletion): grouping used
+    /// to be reverse-engineered from NSWindow tab groups. Under custom chrome
+    /// the window rows come from first-class model state —
+    /// MemtermAppDelegate.captureGroups() over hosts.
     static func groupedControllers(_ controllers: [TerminalWindowController])
         -> [[TerminalWindowController]] {
         var groups: [[TerminalWindowController]] = []

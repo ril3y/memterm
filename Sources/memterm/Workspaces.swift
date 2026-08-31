@@ -12,12 +12,12 @@ import MemtermCore
 // gone: app launch, and reopening a PARKED workspace. Park stays the explicit
 // destructive-but-remembered gesture (capture + close windows + keep rows).
 //
-// EMPIRICAL FACT (probe, macOS 26.2): orderOut() dissolves native tab groups —
-// each hidden window lands in its own single-window group (frames survive).
-// So hiding records each group's tab order + selected tab (hiddenLayouts on
-// the delegate), showing regroups via addTabbedWindow, and topology capture of
-// hidden workspaces uses the recorded layout (captureGroups), never the
-// dissolved live tabGroups.
+// CUSTOM-TAB-CHROME NOTE: under our own chrome a "window" is a
+// WindowHostController displaying its tab set — orderOut() hides a PLAIN
+// window and dissolves nothing, so hiding/showing needs no tab-group
+// bookkeeping (the native-tab era's hiddenLayouts machinery is a dead remnant
+// slated for stage-2 deletion). Hidden hosts keep their tabs, order, and
+// selection; capture reads them from the model (captureGroups over hosts).
 
 extension MemtermAppDelegate {
 
@@ -59,7 +59,7 @@ extension MemtermAppDelegate {
         // workspace's primary tab group takes over the frame the user is
         // looking at, Safari-tab-groups style. No window movement, ever.
         let adoptFrame = (NSApp.keyWindow
-            ?? controllers.first { $0.workspaceId == outgoingId }?.window)?.frame
+            ?? hosts.first { $0.workspaceId == outgoingId }?.window)?.frame
         let fade = switchFadeEnabled
         isSwitchingWorkspaces = true
         fadeInPending = fade
@@ -83,8 +83,8 @@ extension MemtermAppDelegate {
             // outgoing are ordered out only after the fade, alphas restored
             // while hidden. orderOut fires no delegate events, so nothing
             // here needs the isSwitchingWorkspaces guard once the fade ends.
-            let incoming = controllers.filter { $0.workspaceId == id }.compactMap(\.window)
-            let outgoing = controllers.filter { $0.workspaceId == outgoingId }.compactMap(\.window)
+            let incoming = hosts.filter { $0.workspaceId == id }.compactMap(\.window)
+            let outgoing = hosts.filter { $0.workspaceId == outgoingId }.compactMap(\.window)
             NSAnimationContext.runAnimationGroup({ context in
                 context.duration = 0.16
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -96,8 +96,8 @@ extension MemtermAppDelegate {
                 if self.activeWorkspaceId != outgoingId {
                     self.hideWindows(of: outgoingId)
                 }
-                for controller in self.controllers where controller.workspaceId == outgoingId {
-                    controller.window?.alphaValue = 1
+                for host in self.hosts where host.workspaceId == outgoingId {
+                    host.window?.alphaValue = 1
                 }
             })
         } else {
@@ -118,87 +118,33 @@ extension MemtermAppDelegate {
         engine.scheduleTopologySave()
     }
 
-    /// Orders out every window of `workspaceId` after recording its tab-group
-    /// layout (order + selection), because orderOut dissolves native tab
-    /// groups (see the header note). Nothing is closed; nothing is forgotten.
+    /// Orders out every window of `workspaceId`. Plain windows under custom
+    /// chrome: nothing dissolves — each hidden host keeps its tab order and
+    /// selection. Nothing is closed; nothing is forgotten.
     func hideWindows(of workspaceId: String) {
-        let members = controllers.filter { $0.workspaceId == workspaceId }
-        guard !members.isEmpty else { return }
-        let keyWindow = NSApp.keyWindow
-        var layout = HiddenWorkspaceLayout(
-            groups: [], keyTabId: members.first { $0.window === keyWindow }?.tabId)
-        for group in MemoryEngine.groupedControllers(members) {
-            // Strip order from the live tab group while it still exists.
-            let ordered: [TerminalWindowController]
-            if let tabWindows = group.first?.window?.tabGroup?.windows, tabWindows.count > 1 {
-                ordered = tabWindows.compactMap { w in group.first { $0.window === w } }
-            } else {
-                ordered = group
-            }
-            let selected = group.first { $0.window?.tabGroup?.selectedWindow === $0.window }
-            layout.groups.append(HiddenWorkspaceLayout.Group(
-                tabIds: ordered.map(\.tabId),
-                selectedTabId: (selected ?? ordered.first)?.tabId))
-            for controller in ordered { controller.window?.orderOut(nil) }
+        for host in hosts where host.workspaceId == workspaceId {
+            host.window?.orderOut(nil)
         }
-        hiddenLayouts[workspaceId] = layout
     }
 
-    /// Shows the hidden live windows of `workspaceId`, regrouping tabs from
-    /// the recorded layout and restoring the selected tab. Returns false when
-    /// the workspace has no live windows (caller falls back to resurrect).
-    /// Windows keep their frames — nothing here centers, cascades, or moves.
+    /// Shows the hidden live windows (hosts) of `workspaceId`. Returns false
+    /// when the workspace has no live windows (caller falls back to
+    /// resurrect). Windows keep their frames — nothing here centers,
+    /// cascades, or moves; the PRIMARY host (in-place switch, founder
+    /// decision) adopts the outgoing key window's frame.
     @discardableResult
     func showHiddenWindows(of workspaceId: String, adoptingFrame: NSRect? = nil) -> Bool {
-        let members = controllers.filter { $0.workspaceId == workspaceId }
+        let members = hosts.filter { $0.workspaceId == workspaceId }
         guard !members.isEmpty else { return false }
         if fadeInPending {
             for member in members { member.window?.alphaValue = 0 }
         }
-        let layout = hiddenLayouts.removeValue(forKey: workspaceId)
-        var byTab: [String: TerminalWindowController] = [:]
-        for member in members { byTab[member.tabId] = member }
-        // In-place switch: the primary group (the one holding the workspace's
-        // last key tab, else the first) adopts the outgoing window's frame;
-        // secondary windows keep their own frames.
-        let groups = layout?.groups ?? []
-        let primaryIndex = groups.firstIndex {
-            $0.tabIds.contains(layout?.keyTabId ?? "")
-        } ?? (groups.isEmpty ? nil : 0)
-        var shown = Set<ObjectIdentifier>()
-        var focusTarget: TerminalWindowController?
-        for (index, group) in groups.enumerated() {
-            let live = group.tabIds.compactMap { byTab[$0] }
-            guard let host = live.first, let hostWindow = host.window else { continue }
-            if index == primaryIndex, let adoptingFrame {
-                hostWindow.setFrame(adoptingFrame, display: false)
-            }
-            hostWindow.orderFront(nil)
-            shown.insert(ObjectIdentifier(host))
-            var anchor = hostWindow
-            for controller in live.dropFirst() {
-                guard let window = controller.window else { continue }
-                if hostWindow.tabGroup?.windows.contains(window) != true {
-                    // orderOut dissolved the group: re-tab in strip order.
-                    anchor.addTabbedWindow(window, ordered: .above)
-                }
-                window.orderFront(nil)
-                anchor = window
-                shown.insert(ObjectIdentifier(controller))
-            }
-            let selected = group.selectedTabId.flatMap { byTab[$0] } ?? host
-            selected.window?.makeKeyAndOrderFront(nil)
-            if focusTarget == nil || group.tabIds.contains(layout?.keyTabId ?? "") {
-                focusTarget = selected
-            }
+        let primary = members[0]
+        if let adoptingFrame {
+            primary.window?.setFrame(adoptingFrame, display: false)
         }
-        // Members the layout doesn't cover (a tab moved into this hidden
-        // workspace, or a layout lost to a close): just bring them forward.
-        for member in members where !shown.contains(ObjectIdentifier(member)) {
-            member.window?.orderFront(nil)
-            if focusTarget == nil { focusTarget = member }
-        }
-        focusTarget?.window?.makeKeyAndOrderFront(nil)
+        for member in members { member.window?.orderFront(nil) }
+        primary.window?.makeKeyAndOrderFront(nil)
         return true
     }
 
@@ -267,7 +213,7 @@ extension MemtermAppDelegate {
     }
 
     func focusWindows(ofWorkspace id: String) {
-        controllers.first { $0.workspaceId == id }?.window?.makeKeyAndOrderFront(nil)
+        hosts.first { $0.workspaceId == id }?.window?.makeKeyAndOrderFront(nil)
     }
 
     /// FR-58: reassigns a live tab to another workspace, then FOLLOWS the tab
@@ -295,23 +241,18 @@ extension MemtermAppDelegate {
                 restoreWindows(stored, workspaceId: id)
             }
         }
-        if let window = controller.window, let group = window.tabGroup,
-           group.windows.count > 1 {
-            group.removeWindow(window)
-        }
+        // Re-home the TabController: detach from its current host (an emptied
+        // host closes its window — no teardown, the tab just moved) and join
+        // the target workspace's host, or a fresh one.
+        controller.host?.detach(controller)
         controller.setWorkspace(id)
-        // Join the target's tab group when one exists (hidden hosts count:
-        // the switch below will show the whole group, moved tab included).
-        if let host = controllers.first(where: { $0 !== controller && $0.workspaceId == id })?.window,
-           let moved = controller.window {
-            host.addTabbedWindow(moved, ordered: .above)
+        if let target = hosts.first(where: { $0.workspaceId == id }) {
+            target.attach(controller, select: true)
+        } else {
+            let fresh = makeHost(frame: nil)
+            fresh.attach(controller, select: true)
+            fresh.showWindow(nil)
         }
-        // A moved tab joining a hidden group must be part of that group's
-        // recorded layout, or showHiddenWindows would strand it ungrouped.
-        // Simplest correct fix: drop the stale layout; the show path's
-        // fallback loop brings every member forward and live grouping (just
-        // re-established by addTabbedWindow) is intact again.
-        hiddenLayouts.removeValue(forKey: id)
         materializedWorkspaceIds.insert(id)
         rebuildWorkspaceMenu()
         engine.scheduleTopologySave()
@@ -405,11 +346,9 @@ extension MemtermAppDelegate {
     // MARK: - Tabs (FR-52: ⌘1–⌘8 tab N, ⌘9 last tab)
 
     @objc func selectTab(_ sender: NSMenuItem) {
-        guard let window = keyController()?.window else { return }
-        let tabWindows = window.tabGroup?.windows ?? [window]
-        let index = sender.tag == 9 ? tabWindows.count - 1 : sender.tag - 1
-        guard tabWindows.indices.contains(index) else { return }
-        tabWindows[index].makeKeyAndOrderFront(nil)
+        guard let host = keyHost() else { return }
+        let index = sender.tag == 9 ? host.tabs.count - 1 : sender.tag - 1
+        host.selectTab(at: index)
     }
 
     // MARK: - Switcher menu
@@ -530,7 +469,7 @@ extension MemtermAppDelegate {
 
     @objc func chipRenameWorkspaceItem(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        keyController()?.beginWorkspaceRename(id)
+        keyHost()?.beginWorkspaceRename(id)
     }
 
     @objc func recolorWorkspaceTargetItem(_ sender: NSMenuItem) {
@@ -641,13 +580,13 @@ extension MemtermAppDelegate {
         let activity = workspaceActivityStates()
         var byId: [String: WorkspaceRow] = [:]
         for workspace in list { byId[workspace.id] = workspace }
-        for controller in controllers {
-            let workspace = byId[controller.workspaceId]
-            controller.updateWorkspaceChip(
+        for host in hosts {
+            let workspace = host.workspaceId.flatMap { byId[$0] }
+            host.updateWorkspaceChip(
                 name: workspace?.name ?? "Workspace",
                 color: Self.nsColor(hex: workspace?.color ?? StateStore.defaultWorkspaceColor))
-            controller.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId,
-                                          activity: activity)
+            host.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId,
+                                    activity: activity)
         }
     }
 

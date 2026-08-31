@@ -5,22 +5,18 @@ import MemtermCore
 // workspaces and then click on the name to change vs right clicking" — and
 // then: "workspaces should be on top then tabs below it".
 //
-// The workspace bar: a 26 pt strip hosted in a .top
-// NSTitlebarAccessoryViewController, one per window, rendering ABOVE the
-// native tab strip (window styleMask includes .fullSizeContentView — the
-// verified recipe from the macOS 26.2 feasibility study). History: a .bottom
-// accessory was tried first and measured wrong (with native tabs EVERY tabbed
-// window's bottom accessory stacked into the shared titlebar at once — two
-// tabs rendered two bars, 72 pt of chrome — and AppKit forced the height to
-// 36); a content-view strip under the tab bar shipped as the fallback until
-// the founder asked for workspaces on top, and the study verified .top has
-// neither problem: per-window, coexists with the .right gear accessory.
-// Caveats baked in: AppKit insets the accessory past the traffic lights
-// (~78 pt) and auto-hides the titlebar's window-title text while a .top
-// accessory is present (tab titles carry that info; see
-// TerminalWindowController.setWorkspaceBarVisible). All workspaces render as
-// chips (color dot + name): the active one visually distinct, parked ones
-// dimmed with "(parked)", plus a "+" to create one.
+// The workspace bar: a 26 pt strip, row 1 of the custom chrome
+// (WindowHostController hosts it as a PLAIN subview above our TabStripView —
+// the custom-tab-chrome stage). History: under native tabs it lived in a
+// .top NSTitlebarAccessoryViewController (a .bottom accessory measured
+// broken — with native tabs EVERY tabbed window's bottom accessory stacked
+// into the shared titlebar at once, and AppKit forced the height to 36; and
+// the .top placement auto-hid the titlebar's window-title text). Custom
+// chrome deleted both caveats: the host passes the traffic-light clearance
+// as leadingInset (AppKit used to inset accessories ~78 pt for free) and
+// window.title stays synced on the host. All workspaces render as chips
+// (color dot + name): the active one visually distinct, parked ones dimmed
+// with "(parked)", plus a "+" to create one.
 //
 //   click a chip           = switch to it (reopens if parked)
 //   click the ACTIVE chip  = inline rename (label swaps for a text field —
@@ -46,9 +42,15 @@ final class WorkspaceBarView: NSVisualEffectView {
         return label
     }()
     private var chipsById: [String: WorkspaceChipView] = [:]
+    private let leadingInset: CGFloat
 
-    init(app: MemtermAppDelegate) {
+    /// `leadingInset`: where the chip row starts. Under the custom chrome the
+    /// bar is the TOP chrome row of a plain window, so the host passes the
+    /// traffic-light clearance (the titlebar-accessory era got that inset
+    /// from AppKit for free).
+    init(app: MemtermAppDelegate, leadingInset: CGFloat = 10) {
         self.app = app
+        self.leadingInset = leadingInset
         super.init(frame: NSRect(x: 0, y: 0, width: 600, height: Self.height))
         material = .headerView
         blendingMode = .withinWindow
@@ -78,12 +80,12 @@ final class WorkspaceBarView: NSVisualEffectView {
         addButton.action = #selector(MemtermAppDelegate.newWorkspaceAction(_:))
         addButton.translatesAutoresizingMaskIntoConstraints = false
 
-        // Trailing clearance 44: the .top accessory shares the titlebar row
-        // with the .right gear accessory (feasibility study) — chips must
-        // never crowd under it. Leading stays 10: AppKit already insets the
-        // accessory past the traffic lights.
+        // Trailing clearance 44: the bar row shares its trailing edge with
+        // the gear button (the old .right accessory, now a chrome subview) —
+        // chips must never crowd under it. Leading comes from the host
+        // (traffic-light clearance when this is the top chrome row).
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leadingInset),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 0.5),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -44),
         ])
@@ -433,8 +435,8 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
 
     private func endEditingReturningFocusToPane() {
         guard let window else { return }
-        if let controller = window.delegate as? TerminalWindowController,
-           let pane = controller.currentPane() {
+        if let host = window.delegate as? WindowHostController,
+           let pane = host.selectedTab?.currentPane() {
             window.makeFirstResponder(pane)
         } else {
             window.makeFirstResponder(nil)
@@ -460,8 +462,8 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self, let window = self.window,
                   window.firstResponder === window,
-                  let controller = window.delegate as? TerminalWindowController,
-                  let pane = controller.currentPane() else { return }
+                  let host = window.delegate as? WindowHostController,
+                  let pane = host.selectedTab?.currentPane() else { return }
             window.makeFirstResponder(pane)
         }
     }

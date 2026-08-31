@@ -2,17 +2,28 @@ import AppKit
 import MemtermCore
 import SwiftTerm
 
-// One tab/window hosting a pane tree. Splits are plain nested NSSplitViews:
-// splitting always wraps the target pane and the new pane in a fresh two-child
-// split view, which gives arbitrary nesting with no separate tree model —
-// the view hierarchy IS the tree (FR-3 groundwork).
+// One TAB hosting a pane tree (custom-tab-chrome stage: this class is the
+// TabModel — it no longer owns an NSWindow; a WindowHostController displays
+// one tab at a time and owns the window, chrome, and window-delegate duties).
+// The name is kept from the native-tab era to minimize churn; the journal's
+// identifiers (tabId, panes) are unchanged, so state.db needs no migration.
+//
+// Splits are plain nested NSSplitViews inside `paneRoot`: splitting always
+// wraps the target pane and the new pane in a fresh two-child split view,
+// which gives arbitrary nesting with no separate tree model — the view
+// hierarchy IS the tree (FR-3 groundwork).
 
 enum FocusDirection {
     case left, right, up, down
 }
 
-final class TerminalWindowController: NSWindowController, NSWindowDelegate, LocalProcessTerminalViewDelegate {
+final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDelegate {
     private unowned let app: MemtermAppDelegate
+    /// The window host currently displaying (or holding) this tab.
+    weak var host: WindowHostController?
+    /// The hosting window, while attached — kept as a computed property so
+    /// the sheet/parenting and probe call sites read naturally.
+    var window: NSWindow? { host?.window }
     /// Stable tab identity for the state store (one controller = one tab row).
     let tabId = UUID().uuidString
     /// FR-49: the workspace this tab belongs to (exactly one at a time;
@@ -21,49 +32,37 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     private(set) var workspaceId: String
 
     /// FR-58: reassigns the tab to another workspace. Pure bookkeeping — the
-    /// caller (MemtermAppDelegate.moveTab) handles tab-group membership and
-    /// the topology save that rewrites both workspaces' rows.
+    /// caller (MemtermAppDelegate.moveTab) handles host membership and the
+    /// topology save that rewrites both workspaces' rows.
     func setWorkspace(_ id: String) {
         workspaceId = id
     }
-    /// User-chosen tab name (double-click the tab to set). While set, it
-    /// pins the window/tab title — the automatic pane-title/cwd updates stop
+    /// User-chosen tab name (double-click the tab body to set). While set, it
+    /// pins the tab/window title — the automatic pane-title/cwd updates stop
     /// overwriting it. Persisted in the journal and restored (empty = auto).
     var customTitle: String? {
         didSet { refreshTitle() }
     }
     /// Founder 2026-08-31: per-tab color (hex), set via the tab's right-click
-    /// menu, shown as a dot beside the activity indicator, journaled/restored.
+    /// menu. Rendered as the FULL tab tint in the strip (the founder's
+    /// explicit ask — the attributed-title pill was the native-tab stand-in),
+    /// journaled and restored.
     var tabColor: String? {
         didSet {
-            updateTabColorDot()
+            host?.tabChanged(self)
             app.memory?.scheduleTopologySave()
         }
     }
-    private let tabColorDot = NSView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
+    /// The strip label / window title for this tab.
+    private(set) var displayTitle = "memterm"
     private weak var focusedPane: PaneView?
-    // SwiftTerm's becomeFirstResponder is not open, so focus changes are
-    // tracked by observing the window's firstResponder instead.
-    private var firstResponderObservation: NSKeyValueObservation?
-    /// Titlebar workspace chip (color dot + name; click = switcher menu).
-    /// FR-58: right-click opens the same switcher menu as left-click.
-    private let workspaceChipButton = ChipButton()
-    /// The workspace bar (WorkspaceBar.swift), hosted in a .top titlebar
-    /// accessory ABOVE the native tab strip (founder: "workspaces should be
-    /// on top then tabs below it"); the pane tree fills the full content
-    /// layout area beneath the chrome.
-    private(set) var workspaceBar: WorkspaceBarView?
-    /// The .top accessory hosting `workspaceBar`; nil while workspace_bar=false
-    /// (removing it also restores the titlebar's window title).
-    private var workspaceBarAccessory: NSTitlebarAccessoryViewController?
-    private let terminalContainer = NSView()
-    /// `window_blur`: behind-window blur, shown only while the window is
-    /// translucent (Settings 2.0). Public NSVisualEffectView — no private
-    /// CGS blur API.
-    private let blurView = NSVisualEffectView()
-    /// Per-tab activity indicator (spinner while output flows on a
-    /// non-selected tab, decaying to an unseen-output dot; TabActivity.swift).
-    private let activityIndicator = TabActivityIndicatorView()
+    /// The tab's pane-tree root container. Retained here so the views (and
+    /// their ptys/processes) stay alive while the tab is deselected and the
+    /// container is detached from any window.
+    let paneRoot = NSView()
+    /// Per-tab activity state (spinner while output flows on a non-selected
+    /// tab, decaying to an unseen-output dot; TabActivity.swift). The strip
+    /// renders it via the host.
     private var activity = TabActivityTracker()
     private var activityRefreshWork: DispatchWorkItem?
 
@@ -75,99 +74,31 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     /// opened on this setup instead of a shell (Shell ▸ New Serial
     /// Connection…). Mutually exclusive with restoredTab/initialCwd.
     init(app: MemtermAppDelegate, workspaceId: String = StateStore.defaultWorkspaceId,
-         restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil,
+         restoredTab: TabRestore? = nil,
          initialCwd: String? = nil, initialSerial: SerialPaneView.Setup? = nil) {
         self.app = app
         self.workspaceId = workspaceId
-        let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
-        // .fullSizeContentView is required for the workspace bar's .top
-        // titlebar accessory (feasibility study, macOS 26.2); the terminal
-        // never draws under the chrome because terminalContainer is pinned to
-        // contentLayoutGuide, which excludes titlebar + accessory + tab strip.
-        let window = NSWindow(
-            contentRect: rect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable,
-                        .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "memterm"
-        window.tabbingIdentifier = "memterm-terminal"
-        if let restoredFrame {
-            window.setFrame(restoredFrame, display: false)
-        } else {
-            window.center()
-        }
-        if let bg = app.config.themeBackgroundColor { window.backgroundColor = bg }
-        super.init(window: window)
-        window.delegate = self
-        installWorkspaceChip(on: window)
-        do {
-            tabColorDot.wantsLayer = true
-            tabColorDot.layer?.cornerRadius = 4
-            tabColorDot.isHidden = true
-            tabColorDot.widthAnchor.constraint(equalToConstant: 8).isActive = true
-            tabColorDot.heightAnchor.constraint(equalToConstant: 8).isActive = true
-            let accessory = NSStackView(views: [tabColorDot, activityIndicator])
-            accessory.orientation = .horizontal
-            accessory.spacing = 3
-            window.tab.accessoryView = accessory
-        }
-        // PINNED DEPENDENCY: NSWindow.firstResponder is not documented as
-        // KVO-compliant (it works on every macOS to date). If a macOS update
-        // stops emitting changes here, focusedPane stops updating and
-        // currentPane() silently degrades to its firstResponder-cast /
-        // allPanes().first fallback — check here first if multi-pane focus
-        // targeting (⌘R/⌘F/splits) regresses after an OS update.
-        firstResponderObservation = window.observe(\.firstResponder) { [weak self] window, _ in
-            if let pane = window.firstResponder as? PaneView {
-                self?.paneFocused(pane)
-            }
-        }
-
-        let content = NSView(frame: NSRect(origin: .zero, size: window.frame.size))
-        window.contentView = content
-        blurView.material = .hudWindow
-        blurView.blendingMode = .behindWindow
-        blurView.state = .active
-        blurView.isHidden = true
-        content.addSubview(blurView)
-        content.addSubview(terminalContainer)
-        applyWindowChrome(app.config)
-        let bar = WorkspaceBarView(app: app)
-        workspaceBar = bar
-        setWorkspaceBarVisible(app.config.workspaceBar)
-        // With .fullSizeContentView the content view spans the whole window;
-        // contentLayoutGuide tracks the region below titlebar + top accessory
-        // + tab strip, through tab-bar show/hide and fullscreen transitions.
-        if let guide = window.contentLayoutGuide as? NSLayoutGuide {
-            for view in [blurView, terminalContainer] {
-                view.translatesAutoresizingMaskIntoConstraints = false
-                NSLayoutConstraint.activate([
-                    view.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-                    view.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-                    view.topAnchor.constraint(equalTo: guide.topAnchor),
-                    view.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-                ])
-            }
-        }
-        // Pre-layout bounds so the initial pane/split tree is built against a
-        // realistic size (Auto Layout replaces this on the first pass).
-        terminalContainer.frame = window.contentLayoutRect
+        super.init()
+        // Pre-attach bounds so the initial pane/split tree is built against a
+        // realistic size (the host swaps in the real container bounds on
+        // select).
+        paneRoot.frame = NSRect(x: 0, y: 0, width: 980, height: 584)
+        paneRoot.autoresizesSubviews = true
         let root: NSView
         if let restoredTab {
-            root = buildNode(restoredTab.tree, frame: terminalContainer.bounds,
+            root = buildNode(restoredTab.tree, frame: paneRoot.bounds,
                              panes: restoredTab.panes)
         } else if let initialSerial {
-            root = makeSerialPane(frame: terminalContainer.bounds, setup: initialSerial,
+            root = makeSerialPane(frame: paneRoot.bounds, setup: initialSerial,
                                   connectNow: true)
         } else {
             // A vanished inherited cwd falls back like a restore would —
             // never a broken pane (FR-25 spirit).
             let cwd = initialCwd.map { CwdFallback.resolve($0).path }
-            root = makePane(frame: terminalContainer.bounds, cwd: cwd)
+            root = makePane(frame: paneRoot.bounds, cwd: cwd)
         }
-        terminalContainer.addSubview(root)
+        root.autoresizingMask = [.width, .height]
+        paneRoot.addSubview(root)
         if let restoredTab, !restoredTab.title.isEmpty {
             // Only custom names are journaled (auto titles regenerate live).
             customTitle = restoredTab.title
@@ -175,125 +106,59 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let restoredTab, let color = restoredTab.color, !color.isEmpty {
             tabColor = color
         }
-        if let first = allPanes().first {
-            window.makeFirstResponder(first)
-        }
+        refreshTitle()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    // MARK: - Tab bar policy (founder: single-tab windows must show their tab)
+    // MARK: - Close / teardown (FR-56: memory follows intent)
 
-    /// `always_show_tab_bar`: with one tab, macOS hides the tab bar, making
-    /// double-click rename unreachable — toggle it visible. The check makes
-    /// this idempotent (toggleTabBar is a flip, never call it blind), which
-    /// also means calling it for several controllers of one tab group is safe:
-    /// the first call flips, the rest see the bar already visible and no-op.
-    func applyTabBarPolicy(alwaysShow: Bool) {
-        guard let window, let group = window.tabGroup else { return }
-        if alwaysShow, !group.isTabBarVisible {
-            window.toggleTabBar(nil)
-        } else if !alwaysShow, group.isTabBarVisible, group.windows.count <= 1 {
-            window.toggleTabBar(nil)
+    /// The old windowWillClose inference, now an explicit helper: a close is a
+    /// user gesture only when the app isn't quitting, no workspace switch /
+    /// park / forget is tearing windows down, and the tab is in the ACTIVE
+    /// workspace (FR-59: a hidden workspace's tab has no on-screen UI — no
+    /// user gesture can close it).
+    func inferUserInitiatedClose() -> Bool {
+        !app.isTerminating && !app.isSwitchingWorkspaces
+            && workspaceId == app.activeWorkspaceId
+    }
+
+    /// Close this tab through its host (strip ✕, context-menu Close, smoke's
+    /// FR-56 leg, park/forget teardown — the flags make the intent).
+    func close() {
+        if let host {
+            host.close(tab: self, userInitiated: inferUserInitiatedClose())
+        } else {
+            teardown(userInitiated: inferUserInitiatedClose())
         }
     }
 
-    override func showWindow(_ sender: Any?) {
-        super.showWindow(sender)
-        if app.config.alwaysShowTabBar { applyTabBarPolicy(alwaysShow: true) }
-    }
-
-    // MARK: - Titlebar gear (founder 2026-08-31: the workspace chip duplicated
-    // the workspace bar — replaced by a gear: click opens Settings, right-click
-    // still pops the workspace switcher)
-
-    private func installWorkspaceChip(on window: NSWindow) {
-        workspaceChipButton.menuProvider = { [weak self] in
-            self.map { $0.app.makeWorkspacePopUpMenu() }
+    /// Kills the tab's panes and (only for a user gesture) forgets its
+    /// journal rows + scrollback bytes. Every close path funnels here with
+    /// explicit intent — quit is "put it down", close is "throw it away",
+    /// crash runs nothing at all.
+    func teardown(userInitiated: Bool) {
+        activityRefreshWork?.cancel()
+        activityRefreshWork = nil
+        let paneIds = allPanes().map { $0.paneId }
+        for pane in allPanes() {
+            pane.processDelegate = nil
+            app.claudeClaims.release(paneId: pane.paneId)
+            (pane as? SerialPaneView)?.shutdown()
+            if pane.process.running { pane.terminate() }
         }
-        workspaceChipButton.isBordered = false
-        workspaceChipButton.setButtonType(.momentaryChange)
-        workspaceChipButton.image = NSImage(systemSymbolName: "gearshape",
-                                            accessibilityDescription: "Settings")
-        workspaceChipButton.contentTintColor = .secondaryLabelColor
-        workspaceChipButton.toolTip = "Settings (right-click: workspaces)"
-        workspaceChipButton.target = app
-        workspaceChipButton.action = #selector(MemtermAppDelegate.openPreferences(_:))
-        workspaceChipButton.frame = NSRect(x: 0, y: 0, width: 24, height: 20)
-
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 32, height: 22))
-        workspaceChipButton.setFrameOrigin(NSPoint(x: 4, y: 1))
-        container.addSubview(workspaceChipButton)
-
-        let accessory = NSTitlebarAccessoryViewController()
-        accessory.view = container
-        accessory.layoutAttribute = .right
-        window.addTitlebarAccessoryViewController(accessory)
-    }
-
-    // MARK: - Workspace bar (founder UX: visible workspaces ABOVE the tabs)
-
-    /// Installs/removes the bar's .top titlebar accessory (one per window,
-    /// like the .right gear). Verified on macOS 26.2: with .fullSizeContentView
-    /// a .top accessory renders ABOVE the native tab strip, per-window, without
-    /// the .bottom stacking bug (see the WorkspaceBar.swift header). Known
-    /// trade-off: while a .top accessory is present AppKit auto-hides the
-    /// titlebar's window-title text — acceptable because memterm shows the tab
-    /// bar by default (tab titles carry the info); with always_show_tab_bar =
-    /// false AND workspace_bar = true the title is not visible on a single-tab
-    /// window. Removing the accessory (workspace_bar = false) restores the
-    /// native title automatically.
-    private func setWorkspaceBarVisible(_ visible: Bool) {
-        guard let window, let bar = workspaceBar else { return }
-        if visible {
-            guard workspaceBarAccessory == nil else { return }
-            bar.frame = NSRect(x: 0, y: 0, width: window.frame.width,
-                               height: WorkspaceBarView.height)
-            let accessory = NSTitlebarAccessoryViewController()
-            accessory.view = bar
-            accessory.layoutAttribute = .top
-            window.addTitlebarAccessoryViewController(accessory)
-            workspaceBarAccessory = accessory
-        } else if let accessory = workspaceBarAccessory {
-            accessory.removeFromParent()
-            workspaceBarAccessory = nil
+        app.controllerClosed(self)
+        if userInitiated {
+            // Immediate row purge + scrollback file delete: the closed tab
+            // must never restore, even if the app dies before the next
+            // debounced topology save runs.
+            app.memory?.forgetTab(tabId: tabId, paneIds: paneIds)
         }
-    }
-
-    func updateWorkspaceBar(workspaces: [WorkspaceRow], activeId: String,
-                            activity: [String: TabActivityState] = [:]) {
-        workspaceBar?.update(workspaces: workspaces, activeId: activeId, activity: activity)
-        setWorkspaceBarVisible(app.config.workspaceBar)  // follows config flips
-    }
-
-    func beginWorkspaceRename(_ workspaceId: String) {
-        workspaceBar?.beginRename(workspaceId: workspaceId)
-    }
-
-    /// Bottom edge (window coords) of the native tab strip: the top of the
-    /// content layout area — with .fullSizeContentView, contentLayoutRect
-    /// excludes ALL titlebar chrome (titlebar row, .top workspace-bar
-    /// accessory, tab strip), so its maxY is the strip's bottom edge. Shared
-    /// by the double-click-rename and right-click-menu monitors (which also
-    /// exclude the workspace bar's own frame — see tabStripController).
-    func tabStripBottomY() -> CGFloat {
-        window?.contentLayoutRect.maxY ?? 0
-    }
-
-    /// The workspace bar's frame in window coords, when it is installed in
-    /// this window's titlebar (nil while workspace_bar=false). Used by the
-    /// tab-strip gesture monitors and the UI probe.
-    func workspaceBarFrameInWindow() -> NSRect? {
-        guard let bar = workspaceBar, workspaceBarAccessory != nil,
-              bar.window === window else { return nil }
-        return bar.convert(bar.bounds, to: nil)
-    }
-
-    /// The gear replaced the name/color chip; the workspace identity lives in
-    /// the workspace bar now, so this only keeps the tooltip current.
-    func updateWorkspaceChip(name: String, color: NSColor) {
-        workspaceChipButton.toolTip = "Settings — workspace: \(name) (right-click to switch)"
+        app.memory?.scheduleTopologySave()
+        // FR-59 corollary: never leave the app windowless while other
+        // workspaces hold hidden live windows — surface the MRU one.
+        app.activeWorkspaceWindowClosed(workspaceId, userInitiated: userInitiated)
     }
 
     // MARK: - Pane context menu (FR-58: right-click is a first-class affordance)
@@ -430,7 +295,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
     /// "Send Hex…": one field, parsed by SerialHex.parseInput (forgiving —
     /// "DE AD", "0xde,0xad", "dead" all work); what was sent echoes as a dim
-    /// line in the pane. Sheet, not modal, matching the rename pattern.
+    /// line in the pane. Sheet on the HOST window, matching the rename pattern.
     func promptSendHex(for pane: SerialPaneView) {
         guard let window else { return }
         let alert = NSAlert()
@@ -563,18 +428,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     // MARK: - Tab activity (founder UX: spinner / unseen dot on the tab)
 
     /// "Selected" for activity purposes: the tab the user is looking at in its
-    /// window. A window not in a multi-tab group is its own selected tab.
+    /// host. An un-hosted tab (mid-construction/re-homing) counts as selected.
     private var isSelectedTab: Bool {
-        guard let window else { return true }
-        if let group = window.tabGroup, group.windows.count > 1 {
-            return group.selectedWindow === window
-        }
-        return true
+        guard let host else { return true }
+        return host.selectedTab === self
     }
 
     /// Called from PaneView.dataReceived (main thread — LocalProcess delivers
     /// on DispatchQueue.main). Coalesced by the tracker to ≤1 UI update per
-    /// 250 ms per tab, so flood output never churns the tab bar.
+    /// 250 ms per tab, so flood output never churns the strip.
     func paneProducedOutput() {
         let now = ProcessInfo.processInfo.systemUptime
         if activity.recordOutput(at: now, isSelected: isSelectedTab) {
@@ -588,11 +450,18 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         app.workspaceProducedOutput(workspaceId)
     }
 
+    /// The host selected this tab (or its window became key): everything is
+    /// seen, the mark clears.
+    func noteSelected() {
+        activity.recordSelected()
+        refreshActivityIndicator()
+    }
+
     private func refreshActivityIndicator() {
         activityRefreshWork?.cancel()
         activityRefreshWork = nil
         let now = ProcessInfo.processInfo.systemUptime
-        activityIndicator.apply(state: activity.state(at: now))
+        host?.tabChanged(self)
         // While active, one more repaint just past the decay boundary flips
         // the spinner to the solid unseen-output dot.
         if let decayAt = activity.nextDecay(after: now) {
@@ -600,7 +469,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         }
     }
 
-    /// MEMTERM_UI_PROBE support: the tracker's current state.
+    /// MEMTERM_UI_PROBE support (and the strip's render source): the
+    /// tracker's current state.
     func activityStateForProbe() -> TabActivityState {
         activity.state(at: ProcessInfo.processInfo.systemUptime)
     }
@@ -749,7 +619,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     // MARK: - Capture (split tree snapshot for the state store)
 
     func snapshotTab() -> TabSnap? {
-        guard let root = terminalContainer.subviews.first,
+        guard let root = paneRoot.subviews.first,
               let tree = snapshotNode(root) else { return nil }
         let panes = allPanes().map {
             PaneSnap(id: $0.paneId, shell: $0.shellPath, cwd: $0.lastKnownCwd,
@@ -775,24 +645,28 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         return subs.count == 1 ? snapshotNode(subs[0]) : nil
     }
 
+    /// Walks the tab's OWN pane tree (works while the tab is deselected and
+    /// its root view is detached from any window).
     func allPanes() -> [PaneView] {
-        guard let content = window?.contentView else { return [] }
         var result: [PaneView] = []
         func walk(_ view: NSView) {
             if let pane = view as? PaneView { result.append(pane); return }
             view.subviews.forEach(walk)
         }
-        walk(content)
+        walk(paneRoot)
         return result
     }
 
     func currentPane() -> PaneView? {
-        if let pane = window?.firstResponder as? PaneView { return pane }
+        if let pane = window?.firstResponder as? PaneView,
+           allPanes().contains(where: { $0 === pane }) { return pane }
         if let pane = focusedPane { return pane }
         return allPanes().first
     }
 
-    private func paneFocused(_ pane: PaneView) {
+    /// Called by the host's firstResponder KVO when a pane of THIS tab took
+    /// focus (the observation lives on the host window now).
+    func paneFocused(_ pane: PaneView) {
         focusedPane = pane
         let panes = allPanes()
         // Slight dimming makes the focused pane identifiable with several up.
@@ -837,19 +711,19 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if pane.process.running { pane.terminate() }
 
         guard let split = pane.superview as? NSSplitView else {
-            // Root (only) pane: close the tab/window (FR-56 forget happens in
-            // windowWillClose, which discriminates user close from teardown).
-            window?.close()
+            // Root (only) pane: close the tab (FR-56 discrimination is the
+            // explicit userInitiated parameter now; the inference matches the
+            // old windowWillClose exactly).
+            close()
             return
         }
         // FR-56: a user-initiated pane close forgets that pane NOW — journal
         // rows and scrollback bytes. Quit/park teardown never reaches here
-        // (windowWillClose detaches processDelegate before terminating), but
-        // the flags guard it anyway. FR-59: a pane in a HIDDEN workspace can
+        // (teardown detaches processDelegate before terminating), but the
+        // flags guard it anyway. FR-59: a pane in a HIDDEN workspace can
         // only get here via processTerminated (its shell died on its own) —
         // no user gesture is possible there, so it never forgets.
-        if !app.isTerminating && !app.isSwitchingWorkspaces
-            && workspaceId == app.activeWorkspaceId {
+        if inferUserInitiatedClose() {
             app.memory?.forgetPane(pane.paneId)
         }
         split.removeArrangedSubview(pane)
@@ -868,7 +742,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             remaining.needsLayout = true
             remaining.needsDisplay = true
         }
-        window?.contentView?.needsLayout = true
+        paneRoot.needsLayout = true
         if let next = allPanes().first {
             window?.makeFirstResponder(next)
             next.needsDisplay = true
@@ -897,7 +771,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         guard !panes.isEmpty else { return }
 
         func center(_ v: NSView) -> NSPoint {
-            let r = v.convert(v.bounds, to: window.contentView)
+            let r = v.convert(v.bounds, to: paneRoot)
             return NSPoint(x: r.midX, y: r.midY)
         }
         let from = center(current)
@@ -925,29 +799,16 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         for pane in allPanes() { pane.font = font }
     }
 
-    /// `window_opacity` / `window_blur`: the window's share of the theme.
-    /// Opacity is background-color alpha with isOpaque=false (never window
-    /// alphaValue — glyphs stay crisp); the blur is our NSVisualEffectView
-    /// behind the terminal, only while translucent.
-    private func applyWindowChrome(_ config: Config) {
-        guard let window else { return }
-        let bg = config.themeBackgroundColor ?? .black
-        let opaque = config.isWindowOpaque
-        window.isOpaque = opaque
-        window.backgroundColor = opaque
-            ? bg : bg.withAlphaComponent(config.effectiveOpacity)
-        blurView.isHidden = opaque || !config.windowBlur
-    }
-
-    /// Live theme application from the Settings window. Explicit defaults are
-    /// pushed when the theme is cleared so panes don't keep stale colors.
+    /// Live theme application from the Settings window — the PANE share.
+    /// (Window-level chrome — background, opacity, blur — moved to
+    /// WindowHostController.applyWindowChrome.) Explicit defaults are pushed
+    /// when the theme is cleared so panes don't keep stale colors.
     func applyTheme(_ config: Config) {
         let opaque = config.isWindowOpaque
         let opacity = config.effectiveOpacity
         let bg = config.themeBackgroundColor ?? .black
         let fg = config.themeForegroundColor
             ?? NSColor(srgbRed: 0.77, green: 0.78, blue: 0.78, alpha: 1)
-        applyWindowChrome(config)
         for pane in allPanes() {
             pane.copyOnSelect = config.copyOnSelect
             pane.optionAsMetaKey = config.optionAsMeta
@@ -980,51 +841,20 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         refreshTitle()
     }
 
+    /// Recomputes displayTitle (customTitle pins; else pane OSC title, else
+    /// ~-abbreviated cwd, else "memterm") and reports it upward — the host
+    /// syncs window.title and the strip label.
     private func refreshTitle() {
-        defer { updateTabColorDot() }  // the color pill wraps the live title
         if let customTitle {
-            window?.title = customTitle
-            return
-        }
-        guard let pane = currentPane() else {
-            window?.title = "memterm"
-            return
-        }
-        if !pane.paneTitle.isEmpty {
-            window?.title = pane.paneTitle
-        } else if let dir = pane.currentLocalDirectory {
-            window?.title = (dir as NSString).abbreviatingWithTildeInPath
+            displayTitle = customTitle
+        } else if let pane = currentPane(), !pane.paneTitle.isEmpty {
+            displayTitle = pane.paneTitle
+        } else if let dir = currentPane()?.currentLocalDirectory {
+            displayTitle = (dir as NSString).abbreviatingWithTildeInPath
         } else {
-            window?.title = "memterm"
+            displayTitle = "memterm"
         }
-    }
-
-    /// Double-click on the tab (FR: founder request 2026-08-31). Empty input
-    /// clears the custom name and automatic titles resume.
-    /// Founder (screenshot, 2026-08-31): the tab color reads as a PILL behind
-    /// the tab's title, not a dot. The native tab bar is private AppKit, so
-    /// the whole-tab tint iTerm2 draws (custom chrome) isn't reachable; the
-    /// public-API equivalent is NSWindowTab.attributedTitle with a colored
-    /// background behind padded title text — visually the pill in the
-    /// founder's screenshot. Text flips black/white by luminance.
-    private func updateTabColorDot() {
-        tabColorDot.isHidden = true  // superseded by the pill
-        guard let window else { return }
-        guard let tabColor else {
-            window.tab.attributedTitle = nil
-            return
-        }
-        let color = MemtermAppDelegate.nsColor(hex: tabColor)
-        let srgb = color.usingColorSpace(.sRGB) ?? color
-        let luminance = 0.299 * srgb.redComponent + 0.587 * srgb.greenComponent
-            + 0.114 * srgb.blueComponent
-        window.tab.attributedTitle = NSAttributedString(
-            string: "  \(window.title)  ",
-            attributes: [
-                .backgroundColor: color,
-                .foregroundColor: luminance > 0.55 ? NSColor.black : NSColor.white,
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            ])
+        host?.tabChanged(self)
     }
 
     @objc func ctxSetTabColor(_ sender: NSMenuItem) {
@@ -1032,6 +862,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         tabColor = (hex?.isEmpty ?? true) ? nil : hex
     }
 
+    /// Double-click on the tab body (FR: founder request 2026-08-31). Empty
+    /// input clears the custom name and automatic titles resume. Sheet on the
+    /// HOST window.
     func promptRenameTab() {
         guard let window else { return }
         let alert = NSAlert()
@@ -1039,7 +872,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         alert.informativeText = "Leave empty to go back to automatic titles."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         field.stringValue = customTitle ?? ""
-        field.placeholderString = window.title
+        field.placeholderString = displayTitle
         alert.accessoryView = field
         alert.addButton(withTitle: "Rename")
         alert.addButton(withTitle: "Cancel")
@@ -1055,60 +888,6 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         }
         alert.window.makeFirstResponder(field)
         field.currentEditor()?.selectAll(nil)
-    }
-
-    // MARK: - NSWindowDelegate
-
-    /// Selecting a tab makes its window key: everything is seen, the
-    /// indicator clears.
-    func windowDidBecomeKey(_ notification: Notification) {
-        activity.recordSelected()
-        refreshActivityIndicator()
-        // Re-assert only the "show" half of the policy here: closing the
-        // second-to-last tab makes AppKit hide the bar again, and the surviving
-        // tab becomes key right after. (The "hide" half runs only on an
-        // explicit settings change — never fight a user who showed it by hand.)
-        if app.config.alwaysShowTabBar { applyTabBarPolicy(alwaysShow: true) }
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        activityRefreshWork?.cancel()
-        activityRefreshWork = nil
-        // FR-56 discrimination: this fires for user closes (⌘W, close button,
-        // native tab close) AND for teardown closes (⌘Q quit, workspace
-        // park/forget). Only the user gesture forgets — quit is "put it
-        // down", close is "throw it away", crash runs nothing at all.
-        // FR-59: a hidden workspace's window has no on-screen UI, so no user
-        // gesture can close it — if macOS ever closes one behind our back,
-        // that is teardown, never a forget.
-        let userInitiated = !app.isTerminating && !app.isSwitchingWorkspaces
-            && workspaceId == app.activeWorkspaceId
-        let paneIds = allPanes().map { $0.paneId }
-        for pane in allPanes() {
-            pane.processDelegate = nil
-            app.claudeClaims.release(paneId: pane.paneId)
-            (pane as? SerialPaneView)?.shutdown()
-            if pane.process.running { pane.terminate() }
-        }
-        app.controllerClosed(self)
-        if userInitiated {
-            // Immediate row purge + scrollback file delete: the closed tab
-            // must never restore, even if the app dies before the next
-            // debounced topology save runs.
-            app.memory?.forgetTab(tabId: tabId, paneIds: paneIds)
-        }
-        app.memory?.scheduleTopologySave()
-        // FR-59 corollary: never leave the app windowless while other
-        // workspaces hold hidden live windows — surface the MRU one.
-        app.activeWorkspaceWindowClosed(workspaceId, userInitiated: userInitiated)
-    }
-
-    func windowDidResize(_ notification: Notification) {
-        app.memory?.scheduleFrameSave()
-    }
-
-    func windowDidMove(_ notification: Notification) {
-        app.memory?.scheduleFrameSave()
     }
 
     // MARK: - LocalProcessTerminalViewDelegate

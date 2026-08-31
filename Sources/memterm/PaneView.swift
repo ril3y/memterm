@@ -81,7 +81,8 @@ class PaneView: LocalProcessTerminalView {
     /// replaces nothing. The host window controller builds the menu because it
     /// owns splits, workspaces, and memory actions.
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard let controller = window?.delegate as? TerminalWindowController else {
+        guard let host = window?.delegate as? WindowHostController,
+              let controller = host.tab(containing: self) else {
             return super.menu(for: event)
         }
         return controller.contextMenu(for: self)

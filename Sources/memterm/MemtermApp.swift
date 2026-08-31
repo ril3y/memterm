@@ -8,9 +8,14 @@ import MemtermCore
 final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     private(set) var config = Config.load()
     private var settingsController: SettingsWindowController?
-    private var tabRenameClickMonitor: Any?
-    private var tabContextMenuMonitor: Any?
+    /// Every live TAB (TerminalWindowController is the TabModel now). This is
+    /// the capture/poll/scrollback iteration surface — hidden workspaces'
+    /// tabs keep being captured because iteration is over the model, not
+    /// windows (FR-59).
     private(set) var controllers: [TerminalWindowController] = []
+    /// Every live window host (custom-tab-chrome stage). Hosts of hidden
+    /// workspaces stay registered while their windows are ordered out.
+    private(set) var hosts: [WindowHostController] = []
     private var fontSize: CGFloat
     private(set) var memory: MemoryEngine?
     /// Set before windows close at quit so their teardown isn't captured.
@@ -43,11 +48,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     let workspaceMenu = NSMenu(title: "Workspace")
 
     // -- FR-59: non-destructive switching state --
-    /// Tab-group layout of each workspace hidden by switchToWorkspace, keyed
-    /// by workspace id. Needed because orderOut() dissolves native tab groups
-    /// (verified empirically on macOS 26.2): the show path regroups from this,
-    /// and captureGroups() uses it so a hidden workspace's topology keeps
-    /// journaling as the tab groups it had on screen.
+    /// NATIVE-TAB-ERA REMNANT (deleted for real in stage 2): under custom
+    /// chrome, orderOut() hides PLAIN windows and nothing dissolves — hosts
+    /// keep their tab order while hidden, so no layout bookkeeping is needed.
+    /// Kept only so stage-2's deletion list stays accurate.
     var hiddenLayouts: [String: HiddenWorkspaceLayout] = [:]
     /// Workspaces most-recently switched AWAY from, newest first — the pick
     /// order when the active workspace's last visible window closes and a
@@ -81,33 +85,23 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         return scope
     }
 
-    /// The controller groups a topology capture should treat as windows, with
-    /// the focused tab per group. Visible windows group by their live native
-    /// tab group; HIDDEN windows group by the layout recorded when they were
-    /// ordered out (their live tab groups are dissolved — see hiddenLayouts).
+    /// The tab groups a topology capture should treat as windows, with the
+    /// focused tab per group. Under custom chrome this is first-class model
+    /// state: each host's ordered tab list + its selected tab — visible or
+    /// hidden alike (hidden hosts keep their tabs; nothing dissolves).
     func captureGroups() -> [CaptureGroup] {
         var groups: [CaptureGroup] = []
         var claimed = Set<ObjectIdentifier>()
-        for workspaceId in hiddenLayouts.keys.sorted() {
-            guard let layout = hiddenLayouts[workspaceId] else { continue }
-            for group in layout.groups {
-                let members = group.tabIds.compactMap { tabId in
-                    controllers.first { $0.tabId == tabId && $0.workspaceId == workspaceId }
-                }
-                guard !members.isEmpty else { continue }
-                for member in members { claimed.insert(ObjectIdentifier(member)) }
-                let focused = group.selectedTabId.flatMap { id in
-                    members.contains { $0.tabId == id } ? id : nil
-                }
-                groups.append(CaptureGroup(members: members,
-                                           focusedTabId: focused ?? members[0].tabId))
-            }
+        for host in hosts where !host.tabs.isEmpty {
+            for tab in host.tabs { claimed.insert(ObjectIdentifier(tab)) }
+            groups.append(CaptureGroup(members: host.tabs,
+                                       focusedTabId: host.selectedTab?.tabId
+                                           ?? host.tabs[0].tabId))
         }
-        let rest = controllers.filter { !claimed.contains(ObjectIdentifier($0)) }
-        for group in MemoryEngine.groupedControllers(rest) {
-            let focused = group.first { $0.window?.tabGroup?.selectedWindow === $0.window
-                                        || group.count == 1 }?.tabId
-            groups.append(CaptureGroup(members: group, focusedTabId: focused))
+        // Safety net: a tab mid-re-homing (no host) still journals alone.
+        for controller in controllers where !claimed.contains(ObjectIdentifier(controller)) {
+            groups.append(CaptureGroup(members: [controller],
+                                       focusedTabId: controller.tabId))
         }
         return groups
     }
@@ -166,33 +160,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(workspaceWillPowerOff(_:)),
             name: NSWorkspace.willPowerOffNotification, object: nil)
 
-        // Double-click on a tab in the native tab bar renames it. The tab bar
-        // is private AppKit, so the gesture is caught with a local monitor:
-        // the first click of the double-click already selected the clicked
-        // tab (making it the key window), so renaming the key controller
-        // renames the tab the user double-clicked. Clicks in the titlebar
-        // proper (above the tab strip) keep the system zoom behavior.
-        tabRenameClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) {
-            [weak self] event in
-            guard let self, event.clickCount == 2,
-                  self.tabStripController(for: event) != nil else { return event }
-            DispatchQueue.main.async { self.keyController()?.promptRenameTab() }
-            return nil  // swallow: nothing else should react to this gesture
-        }
-
-        // Founder UX stage: right-click on the tab strip pops OUR tab menu
-        // (the native tab context menu is private AppKit — established at the
-        // FR-58 stage — so it can't be extended, only replaced). The event is
-        // swallowed so the private menu doesn't double-show; clicks outside
-        // the strip region (titlebar proper, workspace bar, content) pass
-        // through untouched, keeping any native behavior there.
-        tabContextMenuMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) {
-            [weak self] event in
-            guard let self, let controller = self.tabStripController(for: event)
-            else { return event }
-            self.showTabContextMenu(for: controller, event: event)
-            return nil
-        }
+        // Custom-tab-chrome stage: the tab strip is OURS now — double-click
+        // rename, right-click menus, hover ✕, and drag reorder are handled by
+        // TabStripView/TabItemView directly. The two NSEvent local monitors
+        // (and their tab-strip band geometry) that reverse-engineered the
+        // private native tab bar are gone.
 
         NSApp.activate(ignoringOtherApps: true)
         if smokeMode { runSmoke(restoredAnything: restoredAnything) }
@@ -204,88 +176,100 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     private func runUIProbe() {
         // Single-tab leg (always_show_tab_bar): before the second tab exists,
-        // the tab bar must already be visible and the monitors' tab-strip
-        // region (tabStripBottomY .. frame.height-28) must be non-empty, or
-        // double-click rename / right-click menu are unreachable on a fresh
-        // window. Skipped when the founder's config disables the policy.
+        // OUR tab strip row must already be visible (its height non-empty),
+        // or double-click rename / right-click menu are unreachable on a
+        // fresh window. Skipped when the founder's config disables the policy.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             guard self.config.alwaysShowTabBar else {
                 print("UIPROBE-SINGLE skipped (always_show_tab_bar=false)")
                 return
             }
-            guard let controller = self.keyController(), let window = controller.window else {
+            guard let host = self.keyHost(), host.window != nil else {
                 print("UIPROBE-FAIL no window (single-tab leg)"); exit(1)
             }
-            let visible = window.tabGroup?.isTabBarVisible == true
-            let regionHeight = window.frame.height - 28 - controller.tabStripBottomY()
+            let visible = host.isTabStripVisible
+            let regionHeight = host.tabStripFrameInWindow()?.height ?? 0
             print("UIPROBE-SINGLE tab_bar_visible=\(visible) strip_region_h=\(Int(regionHeight))")
             if !visible || regionHeight <= 0 {
-                print("UIPROBE-FAIL single-tab tab bar not reachable"); exit(1)
+                print("UIPROBE-FAIL single-tab tab strip not reachable"); exit(1)
             }
         }
         var probeWorkspaceId: String?
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            self.newWindowForTab(nil)  // second tab so the tab bar is visible
+            self.newWindowForTab(nil)  // second tab in the same host
             probeWorkspaceId = self.createWorkspace(named: "Probe")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-            guard let controller = self.keyController(), let window = controller.window else {
+            guard let host = self.keyHost(), let window = host.window else {
                 print("UIPROBE-FAIL no window"); exit(1)
             }
-            let bar = controller.workspaceBar
-            let barFrame = controller.workspaceBarFrameInWindow() ?? .zero
-            let content = window.contentLayoutRect
-            print("UIPROBE window_h=\(Int(window.frame.height)) content_maxY=\(Int(content.maxY))")
+            let bar = host.workspaceBar
+            let barFrame = host.workspaceBarFrameInWindow() ?? .zero
+            let stripFrame = host.tabStripFrameInWindow() ?? .zero
+            print("UIPROBE window_h=\(Int(window.frame.height)) strip_frame_minY=\(Int(stripFrame.minY))")
             print("UIPROBE bar_frame=\(Int(barFrame.minX)),\(Int(barFrame.minY)),\(Int(barFrame.width)),\(Int(barFrame.height)) in_window=\(bar?.window === window)")
-            print("UIPROBE tabstrip_bottom=\(Int(controller.tabStripBottomY())) tab_bar_visible=\(window.tabGroup?.isTabBarVisible == true)")
-            print("UIPROBE chips=\(bar?.chipTitlesForProbe() ?? []) accessory_set=\(window.tab.accessoryView != nil)")
+            print("UIPROBE tabs_in_strip=\(host.tabStrip.probeTabIds().count) strip_visible=\(host.isTabStripVisible)")
+            print("UIPROBE chips=\(bar?.chipTitlesForProbe() ?? [])")
+            if host.tabStrip.probeTabIds().count != 2 || !host.isTabStripVisible {
+                print("UIPROBE-FAIL both tabs must render in the strip"); exit(1)
+            }
             // Founder: "workspaces should be on top then tabs below it" — the
-            // bar (a .top titlebar accessory) must sit fully ABOVE the tab
-            // strip, whose band is [tabStripBottomY, minY of the bar]: assert
-            // the bar's bottom clears the strip's bottom edge by at least the
-            // strip's own plausible height (i.e. bar.minY > content top), and
-            // that the terminal content starts below ALL chrome.
+            // workspace row must sit fully ABOVE the tab strip row, and the
+            // two rows must not overlap.
             if self.config.workspaceBar {
-                let stripBottom = controller.tabStripBottomY()
-                print("UIPROBE bar_above_strip=\(barFrame.minY > stripBottom)")
+                print("UIPROBE bar_above_strip=\(barFrame.minY >= stripFrame.maxY - 1)")
                 if bar?.window !== window || barFrame.height < 20 {
-                    print("UIPROBE-FAIL workspace bar not installed in the titlebar"); exit(1)
+                    print("UIPROBE-FAIL workspace bar not installed in the chrome"); exit(1)
                 }
-                if barFrame.minY <= stripBottom {
+                if barFrame.minY < stripFrame.maxY - 1 {
                     print("UIPROBE-FAIL workspace bar is not above the tab strip"); exit(1)
                 }
             }
-            // Monitor-band leg: the double-click-rename and right-click-menu
-            // monitors must target the tab strip band and ONLY it. Synthesize
-            // the events the monitors would receive and run them through the
-            // shared region check: mid-strip hits, terminal content misses,
-            // the bar's interior misses, and the accessory row's side margins
-            // (the 4pt sliver beside the bar, under the traffic lights)
-            // miss — those are titlebar clicks, not tab-strip gestures.
-            func probeEvent(_ x: CGFloat, _ y: CGFloat) -> NSEvent? {
-                NSEvent.mouseEvent(with: .leftMouseDown,
-                                   location: NSPoint(x: x, y: y),
-                                   modifierFlags: [], timestamp: 0,
-                                   windowNumber: window.windowNumber,
-                                   context: nil, eventNumber: 0, clickCount: 2,
-                                   pressure: 1)
+            // Strip hit-test leg (replaces the old monitor-band leg — same
+            // meaning: rename/menu gestures target tab bodies and ONLY tab
+            // bodies): the first tab's center hits that tab, background past
+            // the last tab hits nothing, and the workspace bar row is
+            // disjoint from the strip row.
+            let strip = host.tabStrip!
+            guard let firstId = strip.probeTabIds().first,
+                  let firstFrame = strip.probeItemFrame(of: firstId) else {
+                print("UIPROBE-FAIL no strip items to hit-test"); exit(1)
             }
-            func hits(_ x: CGFloat, _ y: CGFloat) -> Bool {
-                probeEvent(x, y).flatMap { self.tabStripController(for: $0) } != nil
+            let tabHit = strip.probeTabId(atContentX: firstFrame.midX) == firstId
+            let backgroundHit = strip.probeTabId(atContentX: 10_000) != nil
+            let rowsDisjoint = !self.config.workspaceBar
+                || !barFrame.intersects(stripFrame)
+            print("UIPROBE-STRIP tab_hit=\(tabHit) background_hit=\(backgroundHit) rows_disjoint=\(rowsDisjoint)")
+            if !tabHit || backgroundHit || !rowsDisjoint {
+                print("UIPROBE-FAIL strip hit-testing targets the wrong regions"); exit(1)
             }
-            let stripBottom = controller.tabStripBottomY()
-            let bandTop = self.config.workspaceBar && barFrame.height > 0
-                ? barFrame.minY : window.frame.height - 28
-            let stripHit = hits(window.frame.width / 2, (stripBottom + bandTop) / 2)
-            let contentHit = hits(window.frame.width / 2, stripBottom - 30)
-            var barHit = false, sliverHit = false
-            if self.config.workspaceBar, barFrame.height > 0 {
-                barHit = hits(barFrame.midX, barFrame.midY)
-                sliverHit = hits(barFrame.minX - 10, barFrame.minY + 2)
+            // Full-tab tint leg (founder's ask, twice): the SELECTED tab
+            // tinted yellow must flip its label to dark text; blue to light.
+            guard let selected = host.selectedTab else {
+                print("UIPROBE-FAIL no selected tab (tint leg)"); exit(1)
             }
-            print("UIPROBE-BAND strip=\(stripHit) content=\(contentHit) bar=\(barHit) titlebar_sliver=\(sliverHit)")
-            if !stripHit || contentHit || barHit || sliverHit {
-                print("UIPROBE-FAIL tab-strip monitors target the wrong band"); exit(1)
+            selected.tabColor = "#febc2e"
+            let yellowDark = strip.probeLabelColor(of: selected.tabId) == NSColor.black
+            selected.tabColor = "#0a84ff"
+            let blueLight = strip.probeLabelColor(of: selected.tabId) == NSColor.white
+            selected.tabColor = nil
+            print("UIPROBE-TINT yellow_dark_text=\(yellowDark) blue_light_text=\(blueLight)")
+            if !yellowDark || !blueLight {
+                print("UIPROBE-FAIL full-tab tint contrast flip"); exit(1)
+            }
+            // In-strip reorder leg: reordering is model state (host.tabs) and
+            // the strip mirrors it.
+            let before = strip.probeTabIds()
+            host.reorderTab(from: 0, to: 1)
+            host.reorderCommitted()
+            let after = strip.probeTabIds()
+            let reordered = after == [before[1], before[0]]
+                && host.tabs.map(\.tabId) == after
+            host.reorderTab(from: 1, to: 0)  // put it back
+            host.reorderCommitted()
+            print("UIPROBE-REORDER swapped=\(reordered)")
+            if !reordered {
+                print("UIPROBE-FAIL strip reorder did not mirror the model"); exit(1)
             }
         }
         // Activity-indicator leg: output lands on the FIRST tab while the
@@ -299,7 +283,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.4) {
             print("UIPROBE-ACT after_decay=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
-            self.controllers.first?.window?.makeKeyAndOrderFront(nil)
+            // Selecting the tab in its host (the strip click path) clears it.
+            if let first = self.controllers.first { first.host?.select(first) }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.8) {
             print("UIPROBE-ACT after_select=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
@@ -335,7 +320,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 print("UIPROBE-FAIL expected unseen after decay, got \(state)"); exit(1)
             }
             // The rendered chip must agree with the state machine.
-            let chip = self.controllers
+            let chip = self.hosts
                 .first { $0.workspaceId == self.activeWorkspaceId }?
                 .workspaceBar?.chipActivityForProbe(workspaceId: defaultId)
             print("UIPROBE-WSACT chip_state=\(chip.map(String.init(describing:)) ?? "nil")")
@@ -359,33 +344,33 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 print("UIPROBE-FAIL settings window did not build"); exit(1)
             }
         }
-        // Inline-rename leg (.top accessory placement): the editor must take
-        // focus INSIDE the titlebar accessory, and committing (focus-loss /
-        // Enter both end editing) must hand the first responder back to the
-        // pane — the exact gate the content-view placement needed. The
-        // controller is captured per leg (not re-resolved via keyController)
-        // so key-window churn under load can't misdirect the assertions.
-        var renameController: TerminalWindowController?
+        // Inline-rename leg (chrome placement): the editor must take focus
+        // INSIDE the workspace strip, and committing (focus-loss / Enter both
+        // end editing) must hand the first responder back to the pane — the
+        // exact contract the titlebar-accessory placement needed. The host is
+        // captured per leg (not re-resolved via keyHost) so key-window churn
+        // under load can't misdirect the assertions.
+        var renameHost: WindowHostController?
         DispatchQueue.main.asyncAfter(deadline: .now() + 8.5) {
             guard self.config.workspaceBar else {
                 print("UIPROBE-RENAME skipped (workspace_bar=false)"); return
             }
-            guard let controller = self.keyController() else {
-                print("UIPROBE-FAIL no controller (rename leg)"); exit(1)
+            guard let host = self.keyHost() else {
+                print("UIPROBE-FAIL no host (rename leg)"); exit(1)
             }
-            renameController = controller
-            controller.beginWorkspaceRename(self.activeWorkspaceId)
+            renameHost = host
+            host.beginWorkspaceRename(self.activeWorkspaceId)
             // While editing, the first responder is the field editor.
-            let editorFocused = controller.window?.firstResponder is NSTextView
+            let editorFocused = host.window?.firstResponder is NSTextView
             print("UIPROBE-RENAME editor_focused=\(editorFocused)")
             if !editorFocused {
                 print("UIPROBE-FAIL rename editor did not take focus"); exit(1)
             }
-            controller.window?.makeFirstResponder(nil)  // commit via end-editing
+            host.window?.makeFirstResponder(nil)  // commit via end-editing
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 8.9) {
             guard self.config.workspaceBar else { return }
-            let focusBack = renameController?.window?.firstResponder is PaneView
+            let focusBack = renameHost?.window?.firstResponder is PaneView
             print("UIPROBE-RENAME focus_back_to_pane=\(focusBack)")
             if !focusBack {
                 print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
@@ -399,11 +384,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             guard self.config.workspaceBar else {
                 print("UIPROBE-ESC skipped (workspace_bar=false)"); return
             }
-            guard let controller = self.keyController(), let window = controller.window else {
-                print("UIPROBE-FAIL no controller (esc leg)"); exit(1)
+            guard let host = self.keyHost(), let window = host.window else {
+                print("UIPROBE-FAIL no host (esc leg)"); exit(1)
             }
-            renameController = controller
-            controller.beginWorkspaceRename(self.activeWorkspaceId)
+            renameHost = host
+            host.beginWorkspaceRename(self.activeWorkspaceId)
             guard let editor = window.firstResponder as? NSTextView else {
                 print("UIPROBE-FAIL esc leg: editor did not take focus"); exit(1)
             }
@@ -418,42 +403,42 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             guard self.config.workspaceBar else { return }
             let names = self.memory?.store.listWorkspaces().map { $0.name } ?? []
             let cancelled = !names.contains("Garbage-Name")
-            let focusBack = renameController?.window?.firstResponder is PaneView
-            print("UIPROBE-ESC cancelled=\(cancelled) focus_back_to_pane=\(focusBack) names=\(names) fr=\(String(describing: renameController?.window?.firstResponder))")
+            let focusBack = renameHost?.window?.firstResponder is PaneView
+            print("UIPROBE-ESC cancelled=\(cancelled) focus_back_to_pane=\(focusBack) names=\(names) fr=\(String(describing: renameHost?.window?.firstResponder))")
             if !cancelled || !focusBack {
                 print("UIPROBE-FAIL Esc did not cancel the rename cleanly"); exit(1)
             }
         }
-        // Fullscreen leg (.top accessory placement): enter/exit must not wedge
-        // the accessory — after the round-trip the window is out of
-        // fullscreen, the terminal content spans the restored layout area,
-        // and the bar is back in the titlebar above the tab strip.
+        // Fullscreen leg (custom chrome): enter/exit must not wedge the
+        // chrome — after the round-trip the window is out of fullscreen and
+        // the workspace row is back above the tab strip row.
         DispatchQueue.main.asyncAfter(deadline: .now() + 9.9) {
-            self.keyController()?.window?.toggleFullScreen(nil)
+            self.keyHost()?.window?.toggleFullScreen(nil)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 11.7) {
-            guard let window = self.keyController()?.window else {
+            guard let window = self.keyHost()?.window else {
                 print("UIPROBE-FAIL no window (fullscreen leg)"); exit(1)
             }
             let inFullScreen = window.styleMask.contains(.fullScreen)
-            print("UIPROBE-FS entered=\(inFullScreen) content_maxY=\(Int(window.contentLayoutRect.maxY)) frame_h=\(Int(window.frame.height))")
+            print("UIPROBE-FS entered=\(inFullScreen) frame_h=\(Int(window.frame.height))")
             if !inFullScreen {
                 print("UIPROBE-FAIL window did not enter fullscreen"); exit(1)
             }
             window.toggleFullScreen(nil)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 13.5) {
-            guard let controller = self.keyController(), let window = controller.window else {
+            guard let host = self.keyHost(), let window = host.window else {
                 print("UIPROBE-FAIL no window (fullscreen exit)"); exit(1)
             }
             let stillFullScreen = window.styleMask.contains(.fullScreen)
-            let barFrame = controller.workspaceBarFrameInWindow() ?? .zero
+            let barFrame = host.workspaceBarFrameInWindow() ?? .zero
+            let stripFrame = host.tabStripFrameInWindow() ?? .zero
             let barOK = !self.config.workspaceBar
-                || (controller.workspaceBar?.window === window
-                    && barFrame.minY > controller.tabStripBottomY())
+                || (host.workspaceBar?.window === window
+                    && barFrame.minY >= stripFrame.maxY - 1)
             print("UIPROBE-FS exited=\(!stillFullScreen) bar_restored=\(barOK)")
             if stillFullScreen || !barOK {
-                print("UIPROBE-FAIL fullscreen round-trip wedged the accessory"); exit(1)
+                print("UIPROBE-FAIL fullscreen round-trip wedged the chrome"); exit(1)
             }
         }
         // Close-pane leg (founder bug 2026-08-31: split down, close the bottom
@@ -618,8 +603,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                                                       workspaceId: self.activeWorkspaceId,
                                                       restoredTab: tab)
             self.controllers.append(controller)
-            controller.showWindow(nil)
-            controller.window?.makeKeyAndOrderFront(nil)
+            let host = self.makeHost(frame: nil)
+            host.attach(controller, select: true)
+            host.showWindow(nil)
+            host.window?.makeKeyAndOrderFront(nil)
             restoredSerialController = controller
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 18.4) {
@@ -650,53 +637,14 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Tab-strip gestures (shared region logic for both monitors)
+    // MARK: - Tab context menu (built by TabStripView per right-click)
 
-    /// The tab this gesture applies to, when the event lands on the native
-    /// tab strip of one of our windows: between the top of the content layout
-    /// area (contentLayoutRect.maxY — the strip's bottom edge under
-    /// .fullSizeContentView) and the bottom of the titlebar proper. The
-    /// workspace bar is a .top titlebar accessory now, so any point inside
-    /// its frame is the BAR's gesture (chip double-click rename, chip
-    /// right-click menu), never the tab strip's — excluded explicitly, which
-    /// stays correct wherever AppKit places the accessory. Returns the
-    /// controller of the window that received the event — the selected tab
-    /// of its group.
-    private func tabStripController(for event: NSEvent) -> TerminalWindowController? {
-        guard let window = event.window,
-              window.tabGroup?.isTabBarVisible == true,
-              let controller = controllers.first(where: { $0.window === window })
-        else { return nil }
-        let y = event.locationInWindow.y
-        let tabStripBottom = controller.tabStripBottomY()
-        // 28 is a heuristic: with .fullSizeContentView the titlebar row
-        // measures 32 on macOS 26.2 (probe-verified: chrome is 68pt with and
-        // without the bar), so without the bar installed the band overshoots
-        // ~4pt into blank titlebar — harmless (double-click there renames
-        // instead of zooming), and there is no public API for the row height.
-        // With the bar installed, its frame gives the row exactly.
-        var bandTop = window.frame.height - 28
-        if let barFrame = controller.workspaceBarFrameInWindow() {
-            if barFrame.contains(event.locationInWindow) { return nil }
-            // With the bar installed, its row IS the topmost titlebar row
-            // (traffic lights inset it on the left, the gear on the right),
-            // and the tab strip ends where that row begins. The 28pt
-            // heuristic alone overshoots ~4pt into the accessory row's side
-            // margins (x < traffic-light inset, x > bar trailing edge) —
-            // clicks there are titlebar clicks, never tab-strip gestures.
-            bandTop = min(bandTop, barFrame.minY)
-        }
-        guard y >= tabStripBottom, y <= bandTop else { return nil }
-        return controller
-    }
-
-    /// Founder UX stage: our tab context menu. A right-click can't select a
-    /// private tab item, so it applies to the SELECTED tab of the clicked
-    /// window group — the disabled header names it to keep the target
-    /// unambiguous.
-    private func showTabContextMenu(for controller: TerminalWindowController, event: NSEvent) {
+    /// Our tab context menu, now targeting the CLICKED tab directly — the
+    /// custom strip can hit-test tab bodies, which the private native bar
+    /// never allowed (right-clicks used to apply to the selected tab).
+    func makeTabContextMenu(for controller: TerminalWindowController) -> NSMenu {
         let menu = NSMenu(title: "Tab")
-        let header = NSMenuItem(title: "Tab “\(controller.window?.title ?? "memterm")”",
+        let header = NSMenuItem(title: "Tab “\(controller.displayTitle)”",
                                 action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
@@ -740,10 +688,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         add("Forget Tab Memory", #selector(ctxTabForget(_:)))
         menu.addItem(.separator())
         add("Close Tab", #selector(ctxTabClose(_:)))
-
-        guard let contentView = event.window?.contentView else { return }
-        let point = contentView.convert(event.locationInWindow, from: nil)
-        menu.popUp(positioning: nil, at: point, in: contentView)
+        return menu
     }
 
     @objc private func ctxTabRename(_ sender: NSMenuItem) {
@@ -927,30 +872,26 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// path) restores journaled frames throughout.
     func restoreWindows(_ windows: [WindowRestore], workspaceId: String,
                         adoptingFrame: NSRect? = nil) {
-        var focusTarget: TerminalWindowController?
+        var focusHost: WindowHostController?
         for (w, win) in windows.enumerated() {
-            var host: TerminalWindowController?
-            for (i, tab) in win.tabs.enumerated() {
-                let frame = i == 0
-                    ? (w == 0 ? adoptingFrame ?? parseFrame(win.frame) : parseFrame(win.frame))
-                    : nil
+            guard !win.tabs.isEmpty else { continue }
+            let frame = w == 0 ? adoptingFrame ?? parseFrame(win.frame)
+                              : parseFrame(win.frame)
+            let host = makeHost(frame: frame)
+            var focusedInHost = false
+            for tab in win.tabs {
                 let controller = TerminalWindowController(app: self, workspaceId: workspaceId,
-                                                          restoredTab: tab,
-                                                          restoredFrame: frame)
-                if fadeInPending { controller.window?.alphaValue = 0 }
+                                                          restoredTab: tab)
                 controllers.append(controller)
-                if i == 0 {
-                    host = controller
-                } else if let hostWindow = host?.window, let newWindow = controller.window {
-                    hostWindow.addTabbedWindow(newWindow, ordered: .above)
-                }
-                controller.showWindow(nil)
-                if controller.tabId == win.focusedTab || focusTarget == nil {
-                    focusTarget = controller
-                }
+                let focus = controller.tabId == win.focusedTab
+                host.attach(controller, select: focus)
+                if focus { focusedInHost = true }
             }
+            if fadeInPending { host.window?.alphaValue = 0 }
+            host.showWindow(nil)
+            if focusedInHost || focusHost == nil { focusHost = host }
         }
-        focusTarget?.window?.makeKeyAndOrderFront(nil)
+        focusHost?.window?.makeKeyAndOrderFront(nil)
         refreshWorkspaceChips()
     }
 
@@ -1107,7 +1048,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         } else {
             // Run 2: report what the restore pipeline actually rebuilt.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                let windows = MemoryEngine.groupedControllers(self.controllers).count
+                let windows = self.hosts.filter { !$0.tabs.isEmpty }.count
                 let panes = self.controllers.flatMap { $0.allPanes() }
                 let cwds = panes.compactMap { $0.lastKnownCwd }
                 print("SMOKE-RESTORED windows=\(windows) tabs=\(self.controllers.count) panes=\(panes.count) cwds=\(cwds)")
@@ -1137,12 +1078,23 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Window / tab plumbing
 
+    /// Creates and registers a new (empty) window host. The caller attaches
+    /// at least one tab before showing it.
+    @discardableResult
+    func makeHost(frame: NSRect?) -> WindowHostController {
+        let host = WindowHostController(app: self, frame: frame)
+        hosts.append(host)
+        return host
+    }
+
     @discardableResult
     func openNewWindow(in workspaceId: String? = nil) -> TerminalWindowController {
         let controller = TerminalWindowController(app: self,
                                                   workspaceId: workspaceId ?? activeWorkspaceId)
         controllers.append(controller)
-        controller.showWindow(nil)
+        let host = makeHost(frame: nil)
+        host.attach(controller, select: true)
+        host.showWindow(nil)
         memory?.scheduleTopologySave()
         refreshWorkspaceChips()
         return controller
@@ -1152,12 +1104,20 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         controllers.removeAll { $0 === controller }
     }
 
-    func keyController() -> TerminalWindowController? {
+    func hostClosed(_ host: WindowHostController) {
+        hosts.removeAll { $0 === host }
+    }
+
+    func keyHost() -> WindowHostController? {
         if let window = NSApp.keyWindow ?? NSApp.mainWindow,
-           let controller = controllers.first(where: { $0.window === window }) {
-            return controller
+           let host = hosts.first(where: { $0.window === window }) {
+            return host
         }
-        return controllers.first
+        return hosts.first { $0.workspaceId == activeWorkspaceId } ?? hosts.first
+    }
+
+    func keyController() -> TerminalWindowController? {
+        keyHost()?.selectedTab ?? controllers.first
     }
 
     // MARK: - Menu actions
@@ -1176,29 +1136,76 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         let controller = TerminalWindowController(app: self, workspaceId: activeWorkspaceId,
                                                   initialCwd: inheritedCwd())
         controllers.append(controller)
-        controller.showWindow(nil)
+        let host = makeHost(frame: nil)
+        host.attach(controller, select: true)
+        host.showWindow(nil)
         memory?.scheduleTopologySave()
         refreshWorkspaceChips()
     }
 
-    /// Standard tab mechanism: ⌘T and the native tab bar's "+" both land here.
-    /// The new tab joins the host window's workspace (FR-49).
+    /// Standard tab mechanism: ⌘T and the strip's "+" both land here. The new
+    /// tab joins the key host and its workspace (FR-49).
     @objc func newWindowForTab(_ sender: Any?) {
-        let hostController = keyController()
+        let host = keyHost()
         let controller = TerminalWindowController(
-            app: self, workspaceId: hostController?.workspaceId ?? activeWorkspaceId,
+            app: self, workspaceId: host?.workspaceId ?? activeWorkspaceId,
             initialCwd: inheritedCwd())
         controllers.append(controller)
-        if let host = hostController?.window, let newWindow = controller.window {
-            host.addTabbedWindow(newWindow, ordered: .above)
+        if let host {
+            host.attach(controller, select: true)
+        } else {
+            let fresh = makeHost(frame: nil)
+            fresh.attach(controller, select: true)
+            fresh.showWindow(nil)
         }
-        controller.showWindow(nil)
         memory?.scheduleTopologySave()
         refreshWorkspaceChips()
     }
 
     @objc func renameTab(_ sender: Any?) {
         keyController()?.promptRenameTab()
+    }
+
+    // FR-52 next/previous tab (⌘⇧[ / ⌘⇧] + hidden ⌃Tab aliases): host
+    // actions replace the NSWindow.selectNextTab/selectPreviousTab native
+    // selectors — plain windows have no native tab group to cycle.
+    @objc func selectNextTabAction(_ sender: Any?) {
+        keyHost()?.selectNextTab()
+    }
+
+    @objc func selectPreviousTabAction(_ sender: Any?) {
+        keyHost()?.selectPreviousTab()
+    }
+
+    /// OUR Move Tab to New Window: re-homes the selected TabController to a
+    /// fresh host (same panes, same processes — nothing respawns).
+    @objc func moveTabToNewWindowAction(_ sender: Any?) {
+        guard let host = keyHost(), host.tabs.count > 1,
+              let tab = host.selectedTab else { return }
+        let frame = host.window?.frame.offsetBy(dx: 28, dy: -28)
+        host.detach(tab)
+        let fresh = makeHost(frame: frame)
+        fresh.attach(tab, select: true)
+        fresh.showWindow(nil)
+        fresh.window?.makeKeyAndOrderFront(nil)
+        memory?.scheduleTopologySave()
+        refreshWorkspaceChips()
+    }
+
+    /// OUR Merge All Windows: folds the active workspace's other hosts' tabs
+    /// into the key host (emptied hosts close their windows; no teardown —
+    /// the tabs just moved).
+    @objc func mergeAllWindowsAction(_ sender: Any?) {
+        guard let target = keyHost() else { return }
+        for host in hosts where host !== target
+            && host.workspaceId == target.workspaceId {
+            for tab in host.tabs {
+                host.detach(tab)
+                target.attach(tab, select: false)
+            }
+        }
+        memory?.scheduleTopologySave()
+        refreshWorkspaceChips()
     }
 
     @objc func splitRight(_ sender: Any?) {
@@ -1241,11 +1248,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         for controller in controllers {
             controller.applyFont(font)
             controller.applyTheme(config)
-            // Safe to call per controller: applyTabBarPolicy checks the live
-            // bar state, so the first controller of a group flips it and the
-            // rest no-op.
-            controller.applyTabBarPolicy(alwaysShow: config.alwaysShowTabBar)
         }
+        // Chrome rows (workspace bar / tab strip visibility) + window-level
+        // theme are per host now.
+        for host in hosts { host.applyConfig(config) }
         refreshWorkspaceChips()  // workspace_bar visibility follows the config
         config.save()
     }
@@ -1375,20 +1381,23 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         if serialSheet === sheet { serialSheet = nil }
     }
 
-    /// Opens a new tab whose root pane is a serial pane (joins the key
-    /// window's tab group, like ⌘T). The Connect click that got us here is
-    /// the consent gesture — the controller opens the device immediately.
+    /// Opens a new tab whose root pane is a serial pane (joins the key host,
+    /// like ⌘T). The Connect click that got us here is the consent gesture —
+    /// the controller opens the device immediately.
     @discardableResult
     func openSerialTab(setup: SerialPaneView.Setup) -> TerminalWindowController {
-        let hostController = keyController()
+        let host = keyHost()
         let controller = TerminalWindowController(
-            app: self, workspaceId: hostController?.workspaceId ?? activeWorkspaceId,
+            app: self, workspaceId: host?.workspaceId ?? activeWorkspaceId,
             initialSerial: setup)
         controllers.append(controller)
-        if let host = hostController?.window, let newWindow = controller.window {
-            host.addTabbedWindow(newWindow, ordered: .above)
+        if let host {
+            host.attach(controller, select: true)
+        } else {
+            let fresh = makeHost(frame: nil)
+            fresh.attach(controller, select: true)
+            fresh.showWindow(nil)
         }
-        controller.showWindow(nil)
         memory?.scheduleTopologySave()
         refreshWorkspaceChips()
         return controller
