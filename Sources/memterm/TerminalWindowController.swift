@@ -15,14 +15,24 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     private unowned let app: MemtermAppDelegate
     /// Stable tab identity for the state store (one controller = one tab row).
     let tabId = UUID().uuidString
-    /// FR-49: the workspace this tab belongs to (exactly one, for life).
-    let workspaceId: String
+    /// FR-49: the workspace this tab belongs to (exactly one at a time;
+    /// FR-58's "Move Tab to Workspace" / "New Workspace from Tab" reassign it
+    /// through setWorkspace, never directly).
+    private(set) var workspaceId: String
+
+    /// FR-58: reassigns the tab to another workspace. Pure bookkeeping — the
+    /// caller (MemtermAppDelegate.moveTab) handles tab-group membership and
+    /// the topology save that rewrites both workspaces' rows.
+    func setWorkspace(_ id: String) {
+        workspaceId = id
+    }
     private weak var focusedPane: PaneView?
     // SwiftTerm's becomeFirstResponder is not open, so focus changes are
     // tracked by observing the window's firstResponder instead.
     private var firstResponderObservation: NSKeyValueObservation?
     /// Titlebar workspace chip (color dot + name; click = switcher menu).
-    private let workspaceChipButton = NSButton()
+    /// FR-58: right-click opens the same switcher menu as left-click.
+    private let workspaceChipButton = ChipButton()
 
     init(app: MemtermAppDelegate, workspaceId: String = StateStore.defaultWorkspaceId,
          restoredTab: TabRestore? = nil, restoredFrame: NSRect? = nil) {
@@ -78,6 +88,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     // MARK: - Workspace chip (FR-50: titlebar control)
 
     private func installWorkspaceChip(on window: NSWindow) {
+        workspaceChipButton.menuProvider = { [weak self] in
+            self.map { $0.app.makeWorkspacePopUpMenu() }
+        }
         workspaceChipButton.isBordered = false
         workspaceChipButton.setButtonType(.momentaryChange)
         workspaceChipButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
@@ -114,6 +127,69 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         let menu = app.makeWorkspacePopUpMenu()
         menu.popUp(positioning: nil,
                    at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    // MARK: - Pane context menu (FR-58: right-click is a first-class affordance)
+
+    /// Built fresh per right-click (workspace list changes). The pane is made
+    /// first responder first, so responder-chain items (copy:/paste:) and
+    /// currentPane()-based actions all target the clicked pane.
+    ///
+    /// FACT (recorded at the FR-58 investigation): SwiftTerm's MacTerminalView
+    /// overrides neither rightMouseDown nor menu(for:) — right-clicks are not
+    /// forwarded to the pty even under mouse reporting (only encodeMouseEvent
+    /// can encode .rightMouseUp, and nothing routes right-button events into
+    /// it). There is no existing right-click behavior to preserve.
+    func contextMenu(for pane: PaneView) -> NSMenu {
+        window?.makeFirstResponder(pane)
+        let menu = NSMenu(title: "Pane")
+
+        func add(_ title: String, _ action: Selector, target: AnyObject?,
+                 represented: Any? = nil) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = target
+            item.representedObject = represented
+            menu.addItem(item)
+        }
+        // nil target: copy:/paste: resolve through the responder chain to the
+        // (now focused) terminal view.
+        add("Copy", #selector(NSText.copy(_:)), target: nil)
+        add("Paste", #selector(NSText.paste(_:)), target: nil)
+        menu.addItem(.separator())
+        add("Split Right", #selector(ctxSplitRight(_:)), target: self)
+        add("Split Down", #selector(ctxSplitDown(_:)), target: self)
+        menu.addItem(.separator())
+        add("Clear", #selector(ctxClear(_:)), target: self, represented: pane)
+        add("Forget Pane Memory", #selector(ctxForgetPaneMemory(_:)), target: self,
+            represented: pane)
+        menu.addItem(.separator())
+
+        // FR-58: creating a workspace must be reachable by right-click alone.
+        let workspaceItem = NSMenuItem(title: "Workspace", action: nil, keyEquivalent: "")
+        workspaceItem.submenu = app.makeWorkspaceContextMenu(for: self)
+        menu.addItem(workspaceItem)
+        menu.addItem(.separator())
+        add("Close Pane", #selector(ctxClosePane(_:)), target: self, represented: pane)
+        return menu
+    }
+
+    @objc private func ctxSplitRight(_ sender: Any?) { splitCurrentPane(vertical: true) }
+    @objc private func ctxSplitDown(_ sender: Any?) { splitCurrentPane(vertical: false) }
+
+    @objc private func ctxClear(_ sender: NSMenuItem) {
+        (sender.representedObject as? PaneView)?.clearScrollback()
+    }
+
+    /// FR-57: rows + scrollback file for this pane; the pane stays open and
+    /// the next capture tick starts a fresh journal trail.
+    @objc private func ctxForgetPaneMemory(_ sender: NSMenuItem) {
+        guard let pane = sender.representedObject as? PaneView else { return }
+        app.memory?.forgetPane(pane.paneId)
+    }
+
+    @objc private func ctxClosePane(_ sender: NSMenuItem) {
+        guard let pane = sender.representedObject as? PaneView else { return }
+        close(pane: pane)
     }
 
     // MARK: - Panes
@@ -298,15 +374,23 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         close(pane: pane)
     }
 
-    private func close(pane: PaneView) {
+    func close(pane: PaneView) {
         pane.processDelegate = nil
         app.claudeClaims.release(paneId: pane.paneId)
         if pane.process.running { pane.terminate() }
 
         guard let split = pane.superview as? NSSplitView else {
-            // Root (only) pane: close the tab/window.
+            // Root (only) pane: close the tab/window (FR-56 forget happens in
+            // windowWillClose, which discriminates user close from teardown).
             window?.close()
             return
+        }
+        // FR-56: a user-initiated pane close forgets that pane NOW — journal
+        // rows and scrollback bytes. Quit/switch teardown never reaches here
+        // (windowWillClose detaches processDelegate before terminating), but
+        // the flags guard it anyway.
+        if !app.isTerminating && !app.isSwitchingWorkspaces {
+            app.memory?.forgetPane(pane.paneId)
         }
         split.removeArrangedSubview(pane)
         pane.removeFromSuperview()
@@ -387,12 +471,24 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     // MARK: - NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
+        // FR-56 discrimination: this fires for user closes (⌘W, close button,
+        // native tab close) AND for teardown closes (⌘Q quit, workspace
+        // switch/park). Only the user gesture forgets — quit is "put it
+        // down", close is "throw it away", crash runs nothing at all.
+        let userInitiated = !app.isTerminating && !app.isSwitchingWorkspaces
+        let paneIds = allPanes().map { $0.paneId }
         for pane in allPanes() {
             pane.processDelegate = nil
             app.claudeClaims.release(paneId: pane.paneId)
             if pane.process.running { pane.terminate() }
         }
         app.controllerClosed(self)
+        if userInitiated {
+            // Immediate row purge + scrollback file delete: the closed tab
+            // must never restore, even if the app dies before the next
+            // debounced topology save runs.
+            app.memory?.forgetTab(tabId: tabId, paneIds: paneIds)
+        }
         app.memory?.scheduleTopologySave()
     }
 
@@ -423,5 +519,16 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         guard let pane = source as? PaneView else { return }
         close(pane: pane)
+    }
+}
+
+/// Titlebar chip button whose right-click shows the same menu the left-click
+/// action pops up (FR-58). NSView's default rightMouseDown displays whatever
+/// menu(for:) returns.
+final class ChipButton: NSButton {
+    var menuProvider: (() -> NSMenu?)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        menuProvider?() ?? super.menu(for: event)
     }
 }

@@ -59,6 +59,18 @@ final class PaneView: LocalProcessTerminalView {
         }
     }
 
+    /// FR-58: right-click context menu. SwiftTerm's MacTerminalView overrides
+    /// neither rightMouseDown nor menu(for:) (verified by grep — right-clicks
+    /// never reach the pty, even under mouse reporting), so this override
+    /// replaces nothing. The host window controller builds the menu because it
+    /// owns splits, workspaces, and memory actions.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let controller = window?.delegate as? TerminalWindowController else {
+            return super.menu(for: event)
+        }
+        return controller.contextMenu(for: self)
+    }
+
     override func otherMouseDown(with event: NSEvent) {
         // Middle-click paste, unless the program asked for mouse reporting.
         if event.buttonNumber == 2 && getTerminal().mouseMode == .off {

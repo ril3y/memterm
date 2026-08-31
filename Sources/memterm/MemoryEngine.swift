@@ -236,6 +236,36 @@ final class MemoryEngine {
         lastScrollbackHash = lastScrollbackHash.filter { livePaneIds.contains($0.key) }
     }
 
+    // MARK: - Forget (FR-56/57)
+
+    /// FR-57 "Forget Pane Memory" and FR-56 pane close: rows + scrollback file
+    /// for one pane go now. For an open pane the next capture tick starts a
+    /// fresh trail (the hash reset forces the rewrite through).
+    func forgetPane(_ paneId: String) {
+        store.forgetPanes([paneId], scrollbackDir: scrollbackDir)
+        lastScrollbackHash[paneId] = nil
+    }
+
+    /// FR-56 deliberate tab close / FR-57 "Forget Tab Memory": the tab's rows,
+    /// its panes, their snapshots, and their scrollback files.
+    func forgetTab(tabId: String, paneIds: [String]) {
+        store.forgetTabs([tabId], scrollbackDir: scrollbackDir)
+        for paneId in paneIds { lastScrollbackHash[paneId] = nil }
+    }
+
+    /// FR-45/57 "Forget Everything" step 1: stop the capture timers and drain
+    /// queued writes so the caller can release this engine and purge the state
+    /// dir with no writer racing the deletes.
+    func shutdown() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        scrollbackTimer?.invalidate()
+        scrollbackTimer = nil
+        topologyDebounce?.cancel()
+        frameDebounce?.cancel()
+        store.barrier()
+    }
+
     func scrollbackURL(for paneId: String) -> URL {
         ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId)
     }

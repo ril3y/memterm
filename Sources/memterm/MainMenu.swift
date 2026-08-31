@@ -29,6 +29,11 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Preferences…", to: appMenu, #selector(MemtermAppDelegate.openPreferences(_:)), ",",
         target: app)
     appMenu.addItem(.separator())
+    // FR-45/57: the global wipe, confirmation-gated in the action.
+    add("Forget Everything…", to: appMenu,
+        #selector(MemtermAppDelegate.forgetEverythingAction(_:)), "", modifiers: [],
+        target: app)
+    appMenu.addItem(.separator())
     add("Hide memterm", to: appMenu, #selector(NSApplication.hide(_:)), "h")
     add("Hide Others", to: appMenu, #selector(NSApplication.hideOtherApplications(_:)), "h",
         modifiers: [.command, .option])
@@ -56,6 +61,13 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     shellMenu.addItem(.separator())
     add("Type Resume Command", to: shellMenu,
         #selector(MemtermAppDelegate.typeResumeCommand(_:)), "r", target: app)
+    shellMenu.addItem(.separator())
+    // FR-57 kill memories: per-pane and per-tab forget (workspace forget lives
+    // in the Workspace submenu's Delete…; the global wipe in the app menu).
+    add("Forget Pane Memory", to: shellMenu,
+        #selector(MemtermAppDelegate.forgetPaneMemory(_:)), "", modifiers: [], target: app)
+    add("Forget Tab Memory", to: shellMenu,
+        #selector(MemtermAppDelegate.forgetTabMemory(_:)), "", modifiers: [], target: app)
     shellMenu.addItem(.separator())
     add("Close Pane/Tab", to: shellMenu, #selector(MemtermAppDelegate.closePane(_:)), "w",
         target: app)

@@ -473,6 +473,86 @@ public final class StateStore {
         invalidateWorkspaceCache()
     }
 
+    // MARK: Forget (FR-56/57: close = throw it away; kill memories at every granularity)
+
+    /// FR-56/57: purges the journal rows AND scrollback files for exactly
+    /// these panes. Used both by "Forget Pane Memory" (pane stays open — the
+    /// next capture starts a fresh trail) and by user-initiated pane closes
+    /// (the pane must never restore). Files are removed only after the row
+    /// purge COMMITs, mirroring forgetWorkspace.
+    public func forgetPanes(_ paneIds: [String], scrollbackDir: URL?) {
+        guard !paneIds.isEmpty else { return }
+        writer.async { [self] in
+            let marks = Array(repeating: "?", count: paneIds.count).joined(separator: ",")
+            let binds = paneIds.map { Bind.text($0) }
+            let committed = inTransaction {
+                var ok = true
+                ok = run("DELETE FROM pane_snapshot WHERE pane_id IN (\(marks))", binds) == SQLITE_OK && ok
+                ok = run("DELETE FROM panes WHERE id IN (\(marks))", binds) == SQLITE_OK && ok
+                return ok
+            }
+            if committed, let scrollbackDir {
+                for paneId in paneIds {
+                    try? FileManager.default.removeItem(
+                        at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
+                }
+            }
+        }
+    }
+
+    /// FR-56: a user-initiated tab close (⌘W, close button, native tab close)
+    /// removes the tab's rows, its panes' rows + snapshots + scrollback files,
+    /// and any window row left with no tabs — those tabs must never restore.
+    /// Quit/switch/park teardown must NOT reach this (callers gate on their
+    /// isTerminating / isSwitchingWorkspaces flags).
+    public func forgetTabs(_ tabIds: [String], scrollbackDir: URL?) {
+        guard !tabIds.isEmpty else { return }
+        writer.async { [self] in
+            let marks = Array(repeating: "?", count: tabIds.count).joined(separator: ",")
+            let binds = tabIds.map { Bind.text($0) }
+            var paneIds: [String] = []
+            query("SELECT id FROM panes WHERE tab_id IN (\(marks))", binds) { stmt in
+                if let paneId = column(stmt, 0) { paneIds.append(paneId) }
+            }
+            let committed = inTransaction {
+                var ok = true
+                ok = run("""
+                    DELETE FROM pane_snapshot WHERE pane_id IN
+                      (SELECT id FROM panes WHERE tab_id IN (\(marks)))
+                    """, binds) == SQLITE_OK && ok
+                ok = run("DELETE FROM panes WHERE tab_id IN (\(marks))", binds) == SQLITE_OK && ok
+                ok = run("DELETE FROM tabs WHERE id IN (\(marks))", binds) == SQLITE_OK && ok
+                // A window row whose tabs are all gone describes nothing.
+                ok = run("DELETE FROM windows WHERE id NOT IN (SELECT DISTINCT window_id FROM tabs)") == SQLITE_OK && ok
+                return ok
+            }
+            if committed, let scrollbackDir {
+                for paneId in paneIds {
+                    try? FileManager.default.removeItem(
+                        at: ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId))
+                }
+            }
+        }
+    }
+
+    /// FR-45/57 "Forget Everything": removes the store's entire on-disk
+    /// footprint — the db, its WAL/SHM sidecars, the FR-17 generation backups,
+    /// any .corrupt remnant, and every scrollback file. Call ONLY after the
+    /// StateStore instance has been released (its deinit closes the SQLite
+    /// connection); the caller then constructs a fresh StateStore and
+    /// re-captures the live layout so capture continues cleanly.
+    public static func purgeAll(dbURL: URL, scrollbackDir: URL) {
+        let fm = FileManager.default
+        var doomed = [dbURL.path, dbURL.path + "-wal", dbURL.path + "-shm",
+                      dbURL.path + ".corrupt"]
+        for n in 1...generationCount { doomed.append(generationURL(dbURL, n).path) }
+        for path in doomed { try? fm.removeItem(atPath: path) }
+        if let files = try? fm.contentsOfDirectory(at: scrollbackDir,
+                                                   includingPropertiesForKeys: nil) {
+            for file in files { try? fm.removeItem(at: file) }
+        }
+    }
+
     /// FR-57 hygiene: deletes scrollback files whose pane no longer has a row
     /// in the panes table (closed panes' files used to accumulate forever).
     /// No-ops on a degraded store — an empty pane set there is ignorance, not

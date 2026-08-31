@@ -178,9 +178,34 @@ enum RunMode {
     case interactive, latency, flood
 }
 
+/// Dock icon: resolves Assets/memterm.icns for every launch layout — bundled
+/// .app (make-app.sh puts it in Contents/Resources), bare swift-build binary
+/// (.build/<config>/memterm → ../../Assets/), or run-from-repo-root. Harmless
+/// no-op when nothing is found.
+func installAppIcon() {
+    let fm = FileManager.default
+    var candidates: [URL] = []
+    if let bundled = Bundle.main.url(forResource: "memterm", withExtension: "icns") {
+        candidates.append(bundled)
+    }
+    let executable = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let executableDir = executable.deletingLastPathComponent()
+    candidates.append(executableDir.appendingPathComponent("../../Assets/memterm.icns")
+        .standardizedFileURL)
+    candidates.append(URL(fileURLWithPath: fm.currentDirectoryPath)
+        .appendingPathComponent("Assets/memterm.icns"))
+    for url in candidates where fm.fileExists(atPath: url.path) {
+        if let image = NSImage(contentsOf: url) {
+            NSApp.applicationIconImage = image
+            return
+        }
+    }
+}
+
 func runApp(mode: RunMode, smoke: Bool = false) {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
+    installAppIcon()
     let delegate: NSApplicationDelegate = mode == .interactive
         ? MemtermAppDelegate(smokeMode: smoke)
         : ProbeAppDelegate(mode: mode)

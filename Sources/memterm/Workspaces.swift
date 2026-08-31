@@ -119,6 +119,41 @@ extension MemtermAppDelegate {
         controllers.first { $0.workspaceId == id }?.window?.makeKeyAndOrderFront(nil)
     }
 
+    /// FR-58: reassigns a live tab to another workspace. The tab stays on
+    /// screen — it joins the target's tab group when one is open, else stands
+    /// alone — and the next scoped topology save rewrites both workspaces'
+    /// rows (old without this tab, new with it; both are in captureScope via
+    /// materializedWorkspaceIds / the controllers list). Moving a tab into a
+    /// parked workspace reopens it: parked means "no windows on screen", and
+    /// this tab is on screen.
+    func moveTab(_ controller: TerminalWindowController, toWorkspace id: String) {
+        guard controller.workspaceId != id, let engine = memory,
+              let target = engine.store.listWorkspaces().first(where: { $0.id == id })
+        else { return }
+        if target.isParked { engine.store.setWorkspaceParked(id, parked: false) }
+        let oldId = controller.workspaceId
+        if let window = controller.window, let group = window.tabGroup,
+           group.windows.count > 1 {
+            group.removeWindow(window)
+        }
+        controller.setWorkspace(id)
+        if let host = controllers.first(where: { $0 !== controller && $0.workspaceId == id })?.window,
+           let moved = controller.window {
+            host.addTabbedWindow(moved, ordered: .above)
+        }
+        controller.window?.makeKeyAndOrderFront(nil)
+        materializedWorkspaceIds.insert(id)
+        // Moving the active workspace's last tab away leaves it with nothing
+        // on screen; follow the tab so the "active" workspace is a visible one.
+        if oldId == activeWorkspaceId,
+           !controllers.contains(where: { $0.workspaceId == oldId }) {
+            activeWorkspaceId = id
+            engine.store.setMeta("active_workspace_id", id)
+        }
+        rebuildWorkspaceMenu()
+        engine.scheduleTopologySave()
+    }
+
     // MARK: - Menu actions
 
     @objc func switchWorkspaceItem(_ sender: NSMenuItem) {
@@ -220,6 +255,63 @@ extension MemtermAppDelegate {
         return menu
     }
 
+    /// FR-58: the Workspace submenu of the pane context menu — the full
+    /// switcher (switch-to items, New/Rename/Color, Park, Delete…) plus the
+    /// tab-scoped items: "New Workspace from Tab…" and "Move Tab to
+    /// Workspace ▸". Creating a workspace is reachable by right-click alone.
+    func makeWorkspaceContextMenu(for controller: TerminalWindowController) -> NSMenu {
+        let menu = NSMenu(title: "Workspace")
+        populateWorkspaceMenu(menu)
+        menu.addItem(.separator())
+
+        let newFromTab = NSMenuItem(title: "New Workspace from Tab…",
+                                    action: #selector(newWorkspaceFromTabItem(_:)),
+                                    keyEquivalent: "")
+        newFromTab.target = self
+        newFromTab.representedObject = MoveTabRequest(controller: controller, workspaceId: nil)
+        menu.addItem(newFromTab)
+
+        let moveItem = NSMenuItem(title: "Move Tab to Workspace", action: nil, keyEquivalent: "")
+        let moveMenu = NSMenu(title: "Move Tab to Workspace")
+        if let store = memory?.store {
+            for workspace in store.listWorkspaces() {
+                let isCurrent = workspace.id == controller.workspaceId
+                let item = NSMenuItem(
+                    title: workspace.isParked ? "\(workspace.name) — parked" : workspace.name,
+                    // The tab's own workspace is shown checked and inert.
+                    action: isCurrent ? nil : #selector(moveTabToWorkspaceItem(_:)),
+                    keyEquivalent: "")
+                item.target = isCurrent ? nil : self
+                item.image = Self.chipImage(hex: workspace.color)
+                item.state = isCurrent ? .on : .off
+                item.representedObject = MoveTabRequest(controller: controller,
+                                                        workspaceId: workspace.id)
+                moveMenu.addItem(item)
+            }
+        }
+        moveItem.submenu = moveMenu
+        menu.addItem(moveItem)
+        return menu
+    }
+
+    @objc func newWorkspaceFromTabItem(_ sender: NSMenuItem) {
+        guard let request = sender.representedObject as? MoveTabRequest,
+              let controller = request.controller else { return }
+        let count = memory?.store.listWorkspaces().count ?? 0
+        guard let name = promptForText(title: "New Workspace from Tab",
+                                       message: "Name the new workspace:",
+                                       initial: "Workspace \(count + 1)"),
+              let id = createWorkspace(named: name) else { return }
+        moveTab(controller, toWorkspace: id)
+    }
+
+    @objc func moveTabToWorkspaceItem(_ sender: NSMenuItem) {
+        guard let request = sender.representedObject as? MoveTabRequest,
+              let controller = request.controller,
+              let workspaceId = request.workspaceId else { return }
+        moveTab(controller, toWorkspace: workspaceId)
+    }
+
     private func populateWorkspaceMenu(_ menu: NSMenu) {
         menu.removeAllItems()
         guard let store = memory?.store else { return }
@@ -317,7 +409,7 @@ extension MemtermAppDelegate {
 
     // MARK: - Name prompt (FR-50: NSAlert with accessory text field)
 
-    private func promptForText(title: String, message: String, initial: String) -> String? {
+    func promptForText(title: String, message: String, initial: String) -> String? {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
@@ -330,6 +422,19 @@ extension MemtermAppDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let name = field.stringValue.trimmingCharacters(in: .whitespaces)
         return name.isEmpty ? nil : name
+    }
+}
+
+/// representedObject payload for the tab-scoped workspace menu items: which
+/// tab, and (for move items) which destination workspace. The controller is
+/// weak — a menu can outlive a closing tab.
+final class MoveTabRequest: NSObject {
+    weak var controller: TerminalWindowController?
+    let workspaceId: String?
+
+    init(controller: TerminalWindowController, workspaceId: String?) {
+        self.controller = controller
+        self.workspaceId = workspaceId
     }
 }
 

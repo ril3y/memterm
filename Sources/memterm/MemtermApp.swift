@@ -181,7 +181,26 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 let activeTabs = engine.store.loadState(workspaceId: self.activeWorkspaceId)
                     .reduce(0) { $0 + $1.tabs.count }
                 print("SMOKE-WS workspaces=\(list.count) parked=\(parked) active_tabs=\(activeTabs)")
-                exit(0)
+            }
+            // FR-56 leg: deliberately close one tab (the single-pane one) —
+            // a user gesture, so it must be forgotten. Run 2 asserts it is
+            // NOT restored while everything else is.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.9) {
+                guard let doomed = self.controllers.first(where: {
+                    $0.workspaceId == self.activeWorkspaceId && $0.allPanes().count == 1
+                }) else {
+                    print("SMOKE-FAIL no single-pane tab to close")
+                    exit(1)
+                }
+                print("SMOKE-CLOSED tab=\(doomed.tabId)")
+                doomed.close()  // neither isTerminating nor isSwitchingWorkspaces: forgets
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 7.7) {
+                guard let engine = self.memory else { exit(1) }
+                engine.flushSync()
+                let counts = engine.store.counts()
+                print("SMOKE-AFTER-CLOSE windows=\(counts.windows) tabs=\(counts.tabs) panes=\(counts.panes)")
+                exit(0)  // exit() skips teardown — the closest thing to a crash
             }
         } else {
             // Run 2: report what the restore pipeline actually rebuilt.
@@ -199,6 +218,12 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 }
                 if self.controllers.contains(where: { $0.workspaceId == b.id }) {
                     print("SMOKE-FAIL parked workspace B was restored")
+                    exit(1)
+                }
+                // FR-56: the deliberately-closed tab from run 1 must NOT be
+                // restored, while the split tab (2 panes) is.
+                if self.controllers.count != 1 || panes.count != 2 {
+                    print("SMOKE-FAIL close-forget: expected 1 tab / 2 panes restored, got \(self.controllers.count) tab(s) / \(panes.count) pane(s)")
                     exit(1)
                 }
                 let parked = list.filter(\.isParked).count
@@ -301,6 +326,69 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func findPreviousInPane(_ sender: Any?) {
         keyController()?.currentPane()?.findPreviousMatch()
+    }
+
+    // MARK: - Kill memories (FR-57)
+
+    /// Rows + scrollback file for the focused pane; the pane stays open and
+    /// capture continues with a fresh trail.
+    @objc func forgetPaneMemory(_ sender: Any?) {
+        guard let pane = keyController()?.currentPane() else { return }
+        memory?.forgetPane(pane.paneId)
+    }
+
+    @objc func forgetTabMemory(_ sender: Any?) {
+        guard let controller = keyController() else { return }
+        memory?.forgetTab(tabId: controller.tabId,
+                          paneIds: controller.allPanes().map { $0.paneId })
+    }
+
+    /// FR-45/57 global wipe, confirmation-gated.
+    @objc func forgetEverythingAction(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Forget everything?"
+        alert.informativeText = """
+            Deletes all of memterm's memory — layouts, scrollback history, \
+            session records. Open terminals stay open.
+            """
+        alert.addButton(withTitle: "Forget Everything")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        forgetEverything()
+    }
+
+    /// Purges the state dir contents (db + generations + scrollback files),
+    /// starts a fresh StateStore, and re-captures the currently-open layout so
+    /// capture continues cleanly. Workspace rows for windows that stay open
+    /// are re-created first (a window's workspace id lives for the window's
+    /// life); everything else — parked workspaces included — is gone.
+    func forgetEverything() {
+        guard memory != nil else { return }
+        let openIds = Set(controllers.map { $0.workspaceId })
+        // No local strong reference to the engine: the store's deinit (which
+        // closes the SQLite connection) must run when `memory` is nilled,
+        // BEFORE purgeAll deletes the files under it.
+        let openWorkspaces = memory!.store.listWorkspaces().filter { openIds.contains($0.id) }
+        let dbURL = MemoryEngine.baseDir.appendingPathComponent("state.db")
+        let scrollbackDir = memory!.scrollbackDir
+        memory?.shutdown()  // timers off, writer queue drained
+        memory = nil        // releases the engine → StateStore deinit closes the db
+        StateStore.purgeAll(dbURL: dbURL, scrollbackDir: scrollbackDir)
+
+        let fresh = MemoryEngine(app: self, config: config)
+        memory = fresh
+        for workspace in openWorkspaces where workspace.id != StateStore.defaultWorkspaceId {
+            fresh.store.createWorkspace(id: workspace.id, name: workspace.name,
+                                        color: workspace.color)
+        }
+        if !openIds.contains(activeWorkspaceId) {
+            activeWorkspaceId = openIds.first ?? StateStore.defaultWorkspaceId
+        }
+        materializedWorkspaceIds = openIds.union([activeWorkspaceId])
+        fresh.store.setMeta("active_workspace_id", activeWorkspaceId)
+        fresh.start()
+        fresh.flushSync()   // the open layout is memory again, from this moment
+        rebuildWorkspaceMenu()
     }
 
     /// ⌘R: types the captured resume command into the pty WITHOUT a newline —
