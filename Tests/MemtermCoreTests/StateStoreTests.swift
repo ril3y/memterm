@@ -30,7 +30,7 @@ final class StateStoreTests: XCTestCase {
         ])
         let tab2 = TabSnap(id: "t2", title: "logs", tree: .pane("p4"), panes: [
             PaneSnap(id: "p4", shell: "/bin/zsh", cwd: "/var/log", cwdSource: "kernel"),
-        ])
+        ], color: "#0a84ff")
         return [WindowSnap(id: "w1", frame: "10,20,980,640", focusedTab: "t2",
                            tabs: [tab1, tab2])]
     }
@@ -55,6 +55,10 @@ final class StateStoreTests: XCTestCase {
         XCTAssertEqual(win.tabs[0].title, "work")
         XCTAssertEqual(win.tabs[1].title, "logs")
 
+        // Per-tab color round-trips; unset stays nil (schema v4).
+        XCTAssertNil(win.tabs[0].color)
+        XCTAssertEqual(win.tabs[1].color, "#0a84ff")
+
         // The split tree round-trips exactly, including nesting and ratios.
         XCTAssertEqual(win.tabs[0].tree, sampleTopology()[0].tabs[0].tree)
         XCTAssertEqual(win.tabs[1].tree, .pane("p4"))
@@ -78,7 +82,7 @@ final class StateStoreTests: XCTestCase {
         let store = StateStore(url: dbURL)
         store.setMeta("boot_session_uuid", "ABC-123")
         XCTAssertEqual(store.getMeta("boot_session_uuid"), "ABC-123")
-        XCTAssertEqual(store.getMeta("schema_version"), "3")
+        XCTAssertEqual(store.getMeta("schema_version"), "4")
         XCTAssertNil(store.getMeta("nope"))
     }
 

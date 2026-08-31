@@ -82,12 +82,16 @@ public struct TabSnap {
     public var title: String
     public var tree: SplitNode
     public var panes: [PaneSnap]
+    /// Founder 2026-08-31: user-set tab color (hex like "#0a84ff"), nil = none.
+    public var color: String?
 
-    public init(id: String, title: String, tree: SplitNode, panes: [PaneSnap]) {
+    public init(id: String, title: String, tree: SplitNode, panes: [PaneSnap],
+                color: String? = nil) {
         self.id = id
         self.title = title
         self.tree = tree
         self.panes = panes
+        self.color = color
     }
 }
 
@@ -140,11 +144,14 @@ public struct TabRestore {
     public var title: String
     public var tree: SplitNode
     public var panes: [String: PaneRestore]
+    public var color: String?
 
-    public init(title: String, tree: SplitNode, panes: [String: PaneRestore]) {
+    public init(title: String, tree: SplitNode, panes: [String: PaneRestore],
+                color: String? = nil) {
         self.title = title
         self.tree = tree
         self.panes = panes
+        self.color = color
     }
 }
 
@@ -311,6 +318,10 @@ public final class StateStore {
         if !columnExists("pane_snapshot", "proc_start") {
             exec("ALTER TABLE pane_snapshot ADD COLUMN proc_start INTEGER")
         }
+        // v3 → v4: tabs gain a user-set color (founder: right-click tab colors).
+        if !columnExists("tabs", "color") {
+            exec("ALTER TABLE tabs ADD COLUMN color TEXT")
+        }
         run("""
             INSERT INTO workspaces (id, name, color, ord, is_parked)
             SELECT ?, 'Default', ?, 0, 0
@@ -331,7 +342,7 @@ public final class StateStore {
                     """, [.text(adopter)])
             }
         }
-        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')")
+        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '4')")
     }
 
     private func columnExists(_ table: String, _ name: String) -> Bool {
@@ -611,9 +622,9 @@ public final class StateStore {
                               .text(win.workspaceId), .int(now)]) == SQLITE_OK && ok
                     for (ti, tab) in win.tabs.enumerated() {
                         let tree = jsonString(tab.tree.toJSONObject()) ?? "{}"
-                        ok = run("INSERT INTO tabs (id, window_id, ord, title, split_tree, workspace_id, updated_at) VALUES (?,?,?,?,?,?,?)",
+                        ok = run("INSERT INTO tabs (id, window_id, ord, title, split_tree, workspace_id, color, updated_at) VALUES (?,?,?,?,?,?,?,?)",
                                  [.text(tab.id), .text(win.id), .int(ti), .text(tab.title), .text(tree),
-                                  .text(win.workspaceId), .int(now)]) == SQLITE_OK && ok
+                                  .text(win.workspaceId), .textOrNull(tab.color), .int(now)]) == SQLITE_OK && ok
                         for pane in tab.panes {
                             ok = run("INSERT INTO panes (id, tab_id, shell, cwd, cwd_source, updated_at) VALUES (?,?,?,?,?,?)",
                                      [.text(pane.id), .text(tab.id), .textOrNull(pane.shell),
@@ -684,13 +695,13 @@ public final class StateStore {
             }
 
             var tabsByWindow: [String: [TabRestore]] = [:]
-            query("SELECT id, window_id, title, split_tree FROM tabs ORDER BY ord", []) { stmt in
+            query("SELECT id, window_id, title, split_tree, color FROM tabs ORDER BY ord", []) { stmt in
                 guard let id = column(stmt, 0), let windowId = column(stmt, 1),
                       let treeJSON = jsonObject(column(stmt, 3)),
                       let tree = SplitNode.from(jsonObject: treeJSON) else { return }
                 tabsByWindow[windowId, default: []].append(
                     TabRestore(title: column(stmt, 2) ?? "", tree: tree,
-                               panes: panesByTab[id] ?? [:]))
+                               panes: panesByTab[id] ?? [:], color: column(stmt, 4)))
             }
 
             var windows: [WindowRestore] = []

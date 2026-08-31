@@ -46,6 +46,17 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// hidden workspace must be surfaced (FR-59 corollary).
     var workspaceMRU: [String] = []
 
+    // -- Switch crossfade (founder: the hard cut on switch felt un-macOS) --
+    /// Fade only for real interactive switches: never in smoke/headless runs
+    /// (assertions read state synchronously) and never under Reduce Motion.
+    var switchFadeEnabled: Bool {
+        !smokeMode && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+    /// Set for the duration of a fading switch so every window-presenting path
+    /// (show-hidden, resurrect, fresh window) starts its windows at alpha 0;
+    /// the switch then animates them to 1 over the outgoing windows.
+    var fadeInPending = false
+
     // -- Workspace activity (founder UX: hidden workspaces show output) --
     /// Per-workspace output marks behind the chip pulse/ring
     /// (MemtermCore.WorkspaceActivityCenter — pure decay/coalescing state).
@@ -503,6 +514,29 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         moveItem.submenu = makeMoveTabSubmenu(for: controller)
         menu.addItem(moveItem)
         add("New Workspace from Tab…", #selector(newWorkspaceFromTabItem(_:)))
+        // Founder 2026-08-31: per-tab colors from the tab's own menu.
+        let colorItem = NSMenuItem(title: "Color", action: nil, keyEquivalent: "")
+        let colorMenu = NSMenu(title: "Color")
+        for preset in Self.workspaceColorPresets {
+            let item = NSMenuItem(title: preset.name,
+                                  action: #selector(TerminalWindowController.ctxSetTabColor(_:)),
+                                  keyEquivalent: "")
+            item.target = controller
+            item.representedObject = preset.hex
+            item.image = Self.chipImage(hex: preset.hex)
+            item.state = controller.tabColor == preset.hex ? .on : .off
+            colorMenu.addItem(item)
+        }
+        colorMenu.addItem(.separator())
+        let none = NSMenuItem(title: "None",
+                              action: #selector(TerminalWindowController.ctxSetTabColor(_:)),
+                              keyEquivalent: "")
+        none.target = controller
+        none.representedObject = ""
+        none.state = controller.tabColor == nil ? .on : .off
+        colorMenu.addItem(none)
+        colorItem.submenu = colorMenu
+        menu.addItem(colorItem)
         menu.addItem(.separator())
         add("Forget Tab Memory", #selector(ctxTabForget(_:)))
         menu.addItem(.separator())
@@ -704,6 +738,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 let controller = TerminalWindowController(app: self, workspaceId: workspaceId,
                                                           restoredTab: tab,
                                                           restoredFrame: frame)
+                if fadeInPending { controller.window?.alphaValue = 0 }
                 controllers.append(controller)
                 if i == 0 {
                     host = controller

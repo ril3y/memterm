@@ -32,6 +32,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     var customTitle: String? {
         didSet { refreshTitle() }
     }
+    /// Founder 2026-08-31: per-tab color (hex), set via the tab's right-click
+    /// menu, shown as a dot beside the activity indicator, journaled/restored.
+    var tabColor: String? {
+        didSet {
+            updateTabColorDot()
+            app.memory?.scheduleTopologySave()
+        }
+    }
+    private let tabColorDot = NSView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
     private weak var focusedPane: PaneView?
     // SwiftTerm's becomeFirstResponder is not open, so focus changes are
     // tracked by observing the window's firstResponder instead.
@@ -90,7 +99,17 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         super.init(window: window)
         window.delegate = self
         installWorkspaceChip(on: window)
-        window.tab.accessoryView = activityIndicator
+        do {
+            tabColorDot.wantsLayer = true
+            tabColorDot.layer?.cornerRadius = 4
+            tabColorDot.isHidden = true
+            tabColorDot.widthAnchor.constraint(equalToConstant: 8).isActive = true
+            tabColorDot.heightAnchor.constraint(equalToConstant: 8).isActive = true
+            let accessory = NSStackView(views: [tabColorDot, activityIndicator])
+            accessory.orientation = .horizontal
+            accessory.spacing = 3
+            window.tab.accessoryView = accessory
+        }
         // PINNED DEPENDENCY: NSWindow.firstResponder is not documented as
         // KVO-compliant (it works on every macOS to date). If a macOS update
         // stops emitting changes here, focusedPane stops updating and
@@ -146,6 +165,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if let restoredTab, !restoredTab.title.isEmpty {
             // Only custom names are journaled (auto titles regenerate live).
             customTitle = restoredTab.title
+        }
+        if let restoredTab, let color = restoredTab.color, !color.isEmpty {
+            tabColor = color
         }
         if let first = allPanes().first {
             window.makeFirstResponder(first)
@@ -534,7 +556,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         }
         // Custom names only: a stored auto title would freeze as custom on
         // restore. Auto titles regenerate from pane title/cwd anyway.
-        return TabSnap(id: tabId, title: customTitle ?? "", tree: tree, panes: panes)
+        return TabSnap(id: tabId, title: customTitle ?? "", tree: tree, panes: panes,
+                       color: tabColor)
     }
 
     private func snapshotNode(_ view: NSView) -> SplitNode? {
@@ -767,24 +790,44 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
     /// Double-click on the tab (FR: founder request 2026-08-31). Empty input
     /// clears the custom name and automatic titles resume.
+    private func updateTabColorDot() {
+        if let tabColor {
+            tabColorDot.layer?.backgroundColor =
+                MemtermAppDelegate.nsColor(hex: tabColor).cgColor
+            tabColorDot.isHidden = false
+        } else {
+            tabColorDot.isHidden = true
+        }
+    }
+
+    @objc func ctxSetTabColor(_ sender: NSMenuItem) {
+        let hex = sender.representedObject as? String
+        tabColor = (hex?.isEmpty ?? true) ? nil : hex
+    }
+
     func promptRenameTab() {
+        guard let window else { return }
         let alert = NSAlert()
         alert.messageText = "Rename Tab"
         alert.informativeText = "Leave empty to go back to automatic titles."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         field.stringValue = customTitle ?? ""
-        field.placeholderString = window?.title
+        field.placeholderString = window.title
         alert.accessoryView = field
         alert.addButton(withTitle: "Rename")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
-        // Ready to type: focused with the current name selected, so typing
-        // replaces it and Enter keeps it.
-        field.selectText(nil)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
-        customTitle = name.isEmpty ? nil : name
-        app.memory?.scheduleTopologySave()
+        // A sheet (not runModal): native look, and — unlike runModal, which
+        // ignores initialFirstResponder for accessory views — focus + select-
+        // all actually land, so typing immediately replaces the old name.
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+            self.customTitle = name.isEmpty ? nil : name
+            self.app.memory?.scheduleTopologySave()
+        }
+        alert.window.makeFirstResponder(field)
+        field.currentEditor()?.selectAll(nil)
     }
 
     // MARK: - NSWindowDelegate

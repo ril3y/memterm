@@ -60,7 +60,9 @@ extension MemtermAppDelegate {
         // looking at, Safari-tab-groups style. No window movement, ever.
         let adoptFrame = (NSApp.keyWindow
             ?? controllers.first { $0.workspaceId == outgoingId }?.window)?.frame
+        let fade = switchFadeEnabled
         isSwitchingWorkspaces = true
+        fadeInPending = fade
         // Bring the target up FIRST, hide the outgoing after — the app never
         // passes through a windowless moment.
         if !showHiddenWindows(of: id, adoptingFrame: adoptFrame) {
@@ -69,11 +71,38 @@ extension MemtermAppDelegate {
             if restored.isEmpty {
                 let fresh = openNewWindow(in: id)
                 if let adoptFrame { fresh.window?.setFrame(adoptFrame, display: true) }
+                if fade { fresh.window?.alphaValue = 0 }
             } else {
                 restoreWindows(restored, workspaceId: id, adoptingFrame: adoptFrame)
             }
         }
-        hideWindows(of: outgoingId)
+        fadeInPending = false
+        if fade {
+            // Crossfade (founder: the hard cut read un-macOS): incoming windows
+            // rise from alpha 0 over the still-visible outgoing ones; the
+            // outgoing are ordered out only after the fade, alphas restored
+            // while hidden. orderOut fires no delegate events, so nothing
+            // here needs the isSwitchingWorkspaces guard once the fade ends.
+            let incoming = controllers.filter { $0.workspaceId == id }.compactMap(\.window)
+            let outgoing = controllers.filter { $0.workspaceId == outgoingId }.compactMap(\.window)
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                incoming.forEach { $0.animator().alphaValue = 1 }
+                outgoing.forEach { $0.animator().alphaValue = 0 }
+            }, completionHandler: { [weak self] in
+                guard let self else { return }
+                // Re-switch during the fade: leave whatever is now active alone.
+                if self.activeWorkspaceId != outgoingId {
+                    self.hideWindows(of: outgoingId)
+                }
+                for controller in self.controllers where controller.workspaceId == outgoingId {
+                    controller.window?.alphaValue = 1
+                }
+            })
+        } else {
+            hideWindows(of: outgoingId)
+        }
         isSwitchingWorkspaces = false
         // The outgoing workspace stays materialized: its windows are live
         // (hidden), so its topology keeps being captured in scope.
@@ -123,6 +152,9 @@ extension MemtermAppDelegate {
     func showHiddenWindows(of workspaceId: String, adoptingFrame: NSRect? = nil) -> Bool {
         let members = controllers.filter { $0.workspaceId == workspaceId }
         guard !members.isEmpty else { return false }
+        if fadeInPending {
+            for member in members { member.window?.alphaValue = 0 }
+        }
         let layout = hiddenLayouts.removeValue(forKey: workspaceId)
         var byTab: [String: TerminalWindowController] = [:]
         for member in members { byTab[member.tabId] = member }
