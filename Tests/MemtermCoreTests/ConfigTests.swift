@@ -29,10 +29,18 @@ final class ConfigTests: XCTestCase {
         c.newTabSameCwd = false
         c.optionAsMeta = false
         c.bellStyle = "visual"
+        c.bellSound = "Glass"
         c.cursorStyle = "steady-bar"
+        c.confirmQuit = false
+        c.allowMouseReporting = false
+        c.lineSpacing = 1.25
+        c.windowOpacity = 0.85
+        c.windowBlur = true
         c.themeBackground = ConfigRGB(red: 0x1d, green: 0x1f, blue: 0x21)
         c.themeForeground = ConfigRGB(red: 0xc5, green: 0xc8, blue: 0xc6)
         c.themeCursor = ConfigRGB(red: 0xff, green: 0x00, blue: 0x7f)
+        c.themeSelection = ConfigRGB(red: 0x37, green: 0x3b, blue: 0x41)
+        c.themePreset = "dracula"
         c.ansiColors = (0..<16).map { ConfigRGB(red: $0 * 15, green: $0, blue: 255 - $0 * 15) }
 
         let parsed = Config.parse(c.serialize())
@@ -46,10 +54,18 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(parsed.newTabSameCwd, c.newTabSameCwd)
         XCTAssertEqual(parsed.optionAsMeta, c.optionAsMeta)
         XCTAssertEqual(parsed.bellStyle, c.bellStyle)
+        XCTAssertEqual(parsed.bellSound, c.bellSound)
         XCTAssertEqual(parsed.cursorStyle, c.cursorStyle)
+        XCTAssertEqual(parsed.confirmQuit, c.confirmQuit)
+        XCTAssertEqual(parsed.allowMouseReporting, c.allowMouseReporting)
+        XCTAssertEqual(parsed.lineSpacing, c.lineSpacing)
+        XCTAssertEqual(parsed.windowOpacity, c.windowOpacity)
+        XCTAssertEqual(parsed.windowBlur, c.windowBlur)
         XCTAssertEqual(parsed.themeBackground, c.themeBackground)
         XCTAssertEqual(parsed.themeForeground, c.themeForeground)
         XCTAssertEqual(parsed.themeCursor, c.themeCursor)
+        XCTAssertEqual(parsed.themeSelection, c.themeSelection)
+        XCTAssertEqual(parsed.themePreset, c.themePreset)
         XCTAssertEqual(parsed.ansiColors, c.ansiColors)
     }
 
@@ -65,9 +81,38 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(parsed.newTabSameCwd, "new tabs inherit the cwd by default")
         XCTAssertTrue(parsed.optionAsMeta, "Option is meta by default (SwiftTerm's default)")
         XCTAssertEqual(parsed.bellStyle, "sound")
+        XCTAssertNil(parsed.bellSound, "system beep by default")
         XCTAssertEqual(parsed.cursorStyle, "blink-block")
+        XCTAssertTrue(parsed.confirmQuit, "⌘Q asks about running jobs by default")
+        XCTAssertTrue(parsed.allowMouseReporting)
+        XCTAssertEqual(parsed.lineSpacing, 1.0)
+        XCTAssertEqual(parsed.windowOpacity, 1.0, "opaque by default")
+        XCTAssertFalse(parsed.windowBlur)
         XCTAssertNil(parsed.themeBackground)
+        XCTAssertNil(parsed.themeSelection)
+        XCTAssertNil(parsed.themePreset)
         XCTAssertNil(parsed.ansiColors)
+    }
+
+    func testNumericKnobsClampIntoRange() {
+        let low = Config.parse("line_spacing = 0.2\nwindow_opacity = 0.05")
+        XCTAssertEqual(low.lineSpacing, 1.0, "line_spacing clamps up to 1.0")
+        XCTAssertEqual(low.windowOpacity, 0.3, "window_opacity clamps up to 0.3")
+
+        let high = Config.parse("line_spacing = 3.0\nwindow_opacity = 2.0")
+        XCTAssertEqual(high.lineSpacing, 1.6, "line_spacing clamps down to 1.6")
+        XCTAssertEqual(high.windowOpacity, 1.0)
+
+        let mid = Config.parse("line_spacing = 1.05\nwindow_opacity = 0.85")
+        XCTAssertEqual(mid.lineSpacing, 1.05)
+        XCTAssertEqual(mid.windowOpacity, 0.85)
+    }
+
+    func testUnknownBellSoundKeepsSystemBeep() {
+        XCTAssertNil(Config.parse("bell_sound = \"Airhorn\"").bellSound)
+        for sound in Config.bellSounds {
+            XCTAssertEqual(Config.parse("bell_sound = \"\(sound)\"").bellSound, sound)
+        }
     }
 
     func testInvalidStyleValuesKeepDefaults() {

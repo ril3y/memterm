@@ -36,6 +36,9 @@ final class PaneView: LocalProcessTerminalView {
     /// configured bellStyle (sound/visual/none — SwiftTerm handles those); the
     /// controller adds the app-level responses (tab dot, dock attention).
     var onBell: (() -> Void)?
+    /// `bell_sound`: a named macOS sound replacing the default system beep.
+    /// nil keeps SwiftTerm's delegate default (NSSound.beep()).
+    var bellSoundName: String?
 
     // -- Search state (FR-4, plumbing in FindBar.swift) --
     /// This pane's ⌘F find bar, created lazily on first use.
@@ -100,7 +103,23 @@ final class PaneView: LocalProcessTerminalView {
     /// keeps the dispatch real: LocalProcessTerminalView satisfies the
     /// delegate's bell via a protocol extension, which a subclass can't hook.
     override func bell(source: Terminal) {
-        super.bell(source: source)
+        // Custom bell sound (`bell_sound`): the .sound half of bellStyle
+        // normally dispatches to the TerminalViewDelegate default, which is
+        // NSSound.beep() via a protocol extension — not overridable from
+        // here (LocalProcessTerminalView is its own terminalDelegate). So
+        // the sound half is suppressed for one dispatch (super still runs
+        // the visual half) and the named sound plays instead.
+        if let name = bellSoundName, let sound = NSSound(named: name),
+           bellStyle == .sound || bellStyle == .soundAndVisual {
+            let saved = bellStyle
+            bellStyle = saved == .soundAndVisual ? .visual : .none
+            super.bell(source: source)
+            bellStyle = saved
+            sound.stop()  // restart on rapid-fire BELs instead of dropping them
+            sound.play()
+        } else {
+            super.bell(source: source)
+        }
         onBell?()
     }
 

@@ -28,7 +28,31 @@ extension Config {
     var themeBackgroundColor: NSColor? { themeBackground?.nsColor }
     var themeForegroundColor: NSColor? { themeForeground?.nsColor }
     var themeCursorColor: NSColor? { themeCursor?.nsColor }
+    var themeSelectionColor: NSColor? { themeSelection?.nsColor }
     var terminalAnsiColors: [SwiftTerm.Color]? { ansiColors?.map(\.terminalColor) }
+
+    /// SwiftTerm's own selection default (MacTerminalView), pushed back when
+    /// the theme's selection color is cleared.
+    static let defaultSelectionColor = NSColor(srgbRed: 0, green: 166.0 / 255.0,
+                                               blue: 178.0 / 255.0, alpha: 1.0)
+
+    /// The 16 wells' seed when no theme palette is set — SwiftTerm's installed
+    /// default palette (Color.defaultInstalledColors), so what the grid shows
+    /// matches what panes render.
+    static var defaultAnsiPalette: [ConfigRGB] {
+        SwiftTerm.Color.defaultInstalledColors.map {
+            ConfigRGB(red: Int($0.red >> 8), green: Int($0.green >> 8),
+                      blue: Int($0.blue >> 8))
+        }
+    }
+
+    /// `window_opacity`, clamped and quantized the way parse() stores it.
+    var effectiveOpacity: CGFloat {
+        CGFloat(min(max(windowOpacity, Config.windowOpacityRange.lowerBound),
+                    Config.windowOpacityRange.upperBound))
+    }
+
+    var isWindowOpaque: Bool { effectiveOpacity >= 0.999 }
 
     /// `bell_style` — the config strings ARE BellStyle tagNames (verified in
     /// SwiftTerm's Apple/BellStyle.swift; parse() already validated them).

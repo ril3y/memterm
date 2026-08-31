@@ -44,6 +44,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     /// `terminalContainer` beneath it.
     private(set) var workspaceBar: WorkspaceBarView?
     private let terminalContainer = NSView()
+    /// `window_blur`: behind-window blur, shown only while the window is
+    /// translucent (Settings 2.0). Public NSVisualEffectView — no private
+    /// CGS blur API.
+    private let blurView = NSVisualEffectView()
     /// Per-tab activity indicator (spinner while output flows on a
     /// non-selected tab, decaying to an unseen-output dot; TabActivity.swift).
     private let activityIndicator = TabActivityIndicatorView()
@@ -92,9 +96,17 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
         let content = NSView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
         window.contentView = content
+        blurView.material = .hudWindow
+        blurView.blendingMode = .behindWindow
+        blurView.state = .active
+        blurView.frame = content.bounds
+        blurView.autoresizingMask = [.width, .height]
+        blurView.isHidden = true
+        content.addSubview(blurView)
         terminalContainer.frame = content.bounds
         terminalContainer.autoresizingMask = [.width, .height]
         content.addSubview(terminalContainer)
+        applyWindowChrome(app.config)
         let bar = WorkspaceBarView(app: app)
         workspaceBar = bar
         content.addSubview(bar)
@@ -187,8 +199,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
                                          height: content.bounds.height - barHeight)
     }
 
-    func updateWorkspaceBar(workspaces: [WorkspaceRow], activeId: String) {
-        workspaceBar?.update(workspaces: workspaces, activeId: activeId)
+    func updateWorkspaceBar(workspaces: [WorkspaceRow], activeId: String,
+                            activity: [String: TabActivityState] = [:]) {
+        workspaceBar?.update(workspaces: workspaces, activeId: activeId, activity: activity)
         let visible = app.config.workspaceBar
         if workspaceBar?.isHidden == visible {  // visibility flipped in config
             layoutWorkspaceBar(visible: visible)
@@ -293,10 +306,25 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         pane.copyOnSelect = config.copyOnSelect
         pane.optionAsMetaKey = config.optionAsMeta
         pane.bellStyle = config.terminalBellStyle
+        pane.bellSoundName = config.bellSound
+        pane.allowMouseReporting = config.allowMouseReporting
+        if config.lineSpacing != 1.0 { pane.lineSpacing = CGFloat(config.lineSpacing) }
         pane.processDelegate = self
-        if let bg = config.themeBackgroundColor { pane.nativeBackgroundColor = bg }
+        // Transparency is background-color ALPHA (SwiftTerm's CoreText path
+        // deliberately preserves a translucent background), never window
+        // alpha — text stays fully opaque.
+        let opacity = config.effectiveOpacity
+        if let bg = config.themeBackgroundColor {
+            pane.nativeBackgroundColor = config.isWindowOpaque
+                ? bg : bg.withAlphaComponent(opacity)
+        } else if !config.isWindowOpaque {
+            pane.nativeBackgroundColor = NSColor.black.withAlphaComponent(opacity)
+        }
         if let fg = config.themeForegroundColor { pane.nativeForegroundColor = fg }
         if let cursor = config.themeCursorColor { pane.caretColor = cursor }
+        if let selection = config.themeSelectionColor {
+            pane.selectedTextBackgroundColor = selection
+        }
         if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
         pane.onOutputActivity = { [weak self] in self?.paneProducedOutput() }
         pane.onBell = { [weak self] in self?.paneRangBell() }
@@ -336,6 +364,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         } else {
             scheduleActivityRefresh(after: activity.coalesceInterval)
         }
+        // Founder UX: output in a HIDDEN workspace marks its chip in the
+        // workspace bar (pulse → unseen ring). The app-level center owns the
+        // per-workspace state; it ignores the active workspace.
+        app.workspaceProducedOutput(workspaceId)
     }
 
     private func refreshActivityIndicator() {
@@ -617,23 +649,47 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         for pane in allPanes() { pane.font = font }
     }
 
+    /// `window_opacity` / `window_blur`: the window's share of the theme.
+    /// Opacity is background-color alpha with isOpaque=false (never window
+    /// alphaValue — glyphs stay crisp); the blur is our NSVisualEffectView
+    /// behind the terminal, only while translucent.
+    private func applyWindowChrome(_ config: Config) {
+        guard let window else { return }
+        let bg = config.themeBackgroundColor ?? .black
+        let opaque = config.isWindowOpaque
+        window.isOpaque = opaque
+        window.backgroundColor = opaque
+            ? bg : bg.withAlphaComponent(config.effectiveOpacity)
+        blurView.isHidden = opaque || !config.windowBlur
+    }
+
     /// Live theme application from the Settings window. Explicit defaults are
     /// pushed when the theme is cleared so panes don't keep stale colors.
     func applyTheme(_ config: Config) {
+        let opaque = config.isWindowOpaque
+        let opacity = config.effectiveOpacity
         let bg = config.themeBackgroundColor ?? .black
         let fg = config.themeForegroundColor
             ?? NSColor(srgbRed: 0.77, green: 0.78, blue: 0.78, alpha: 1)
-        window?.backgroundColor = bg
+        applyWindowChrome(config)
         for pane in allPanes() {
             pane.copyOnSelect = config.copyOnSelect
             pane.optionAsMetaKey = config.optionAsMeta
             pane.bellStyle = config.terminalBellStyle
+            pane.bellSoundName = config.bellSound
+            pane.allowMouseReporting = config.allowMouseReporting
             // Live cursor restyle (Terminal.setCursorStyle is public —
             // verified in SwiftTerm's Terminal.swift:4123).
             pane.getTerminal().setCursorStyle(config.terminalCursorStyle)
-            pane.nativeBackgroundColor = bg
+            pane.nativeBackgroundColor = opaque ? bg : bg.withAlphaComponent(opacity)
             pane.nativeForegroundColor = fg
             pane.caretColor = config.themeCursorColor ?? fg
+            pane.selectedTextBackgroundColor = config.themeSelectionColor
+                ?? Config.defaultSelectionColor
+            // lineSpacing's setter does a full font reset — only touch it on
+            // an actual change (applyTheme runs on every Settings tweak).
+            let spacing = CGFloat(config.lineSpacing)
+            if pane.lineSpacing != spacing { pane.lineSpacing = spacing }
             if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
             pane.needsDisplay = true
         }

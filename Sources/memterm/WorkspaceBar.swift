@@ -98,8 +98,11 @@ final class WorkspaceBarView: NSVisualEffectView {
     required init?(coder: NSCoder) { fatalError() }
 
     /// Rebuilds the chip row. Chip views are reused by workspace id so an
-    /// in-progress inline rename survives unrelated refreshes.
-    func update(workspaces: [WorkspaceRow], activeId: String) {
+    /// in-progress inline rename survives unrelated refreshes. `activity`:
+    /// per-workspace output marks (founder UX: a hidden workspace's chip
+    /// pulses while output flows, keeps an unseen ring after).
+    func update(workspaces: [WorkspaceRow], activeId: String,
+                activity: [String: TabActivityState] = [:]) {
         for view in stack.arrangedSubviews {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -112,7 +115,8 @@ final class WorkspaceBarView: NSVisualEffectView {
             chip.configure(name: workspace.name,
                            color: MemtermAppDelegate.nsColor(hex: workspace.color),
                            isActive: workspace.id == activeId,
-                           isParked: workspace.isParked)
+                           isParked: workspace.isParked,
+                           activity: activity[workspace.id] ?? .idle)
             kept[workspace.id] = chip
             stack.addArrangedSubview(chip)
         }
@@ -128,19 +132,33 @@ final class WorkspaceBarView: NSVisualEffectView {
     func chipTitlesForProbe() -> [String] {
         stack.arrangedSubviews.compactMap { ($0 as? WorkspaceChipView)?.probeTitle }
     }
+
+    /// MEMTERM_UI_PROBE support: the activity mark a chip is rendering.
+    func chipActivityForProbe(workspaceId: String) -> TabActivityState? {
+        chipsById[workspaceId]?.activityState
+    }
 }
 
 /// One workspace chip: color dot + name, rounded background when active,
 /// dimmed with a "(parked)" suffix when parked. Owns the inline-rename editor.
+/// The dot is a real layer-backed view (not a glyph) so it can carry the
+/// activity marks: a pulse while a hidden workspace's output flows, a ring
+/// while output sits unseen (WorkspaceActivityCenter drives the states).
 final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     let workspaceId: String
     private unowned let app: MemtermAppDelegate
     private let label = NSTextField(labelWithString: "")
+    private let dot = NSView()
+    private let ring = NSView()
     private var editor: NSTextField?
     private var renameCancelled = false
     private(set) var isActive = false
     private var isParked = false
     private var name = ""
+    private var dotColor = NSColor.systemGray
+    private(set) var activityState: TabActivityState = .idle
+
+    private static let pulseKey = "memterm.chip.pulse"
 
     init(app: MemtermAppDelegate, workspaceId: String) {
         self.app = app
@@ -148,11 +166,29 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 5
+        ring.translatesAutoresizingMaskIntoConstraints = false
+        ring.wantsLayer = true
+        ring.layer?.cornerRadius = 6
+        ring.layer?.borderWidth = 1.5
+        ring.isHidden = true
+        addSubview(ring)
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3.5
+        addSubview(dot)
         label.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingTail
         addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            dot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 7),
+            dot.heightAnchor.constraint(equalToConstant: 7),
+            ring.centerXAnchor.constraint(equalTo: dot.centerXAnchor),
+            ring.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
+            ring.widthAnchor.constraint(equalToConstant: 12),
+            ring.heightAnchor.constraint(equalToConstant: 12),
+            label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
             label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
             label.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
@@ -168,22 +204,20 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         "\(name)\(isActive ? "*" : "")\(isParked ? "(parked)" : "")"
     }
 
-    func configure(name: String, color: NSColor, isActive: Bool, isParked: Bool) {
+    func configure(name: String, color: NSColor, isActive: Bool, isParked: Bool,
+                   activity: TabActivityState = .idle) {
         self.name = name
         self.isActive = isActive
         self.isParked = isParked
         let dimmed = isParked && !isActive
+        dotColor = dimmed ? color.withAlphaComponent(0.45) : color
         let title = NSMutableAttributedString(
-            string: "● ",
-            attributes: [.foregroundColor: dimmed ? color.withAlphaComponent(0.45) : color,
-                         .font: NSFont.systemFont(ofSize: 9)])
-        title.append(NSAttributedString(
             string: name,
             attributes: [.foregroundColor: isActive ? NSColor.labelColor
                             : dimmed ? NSColor.tertiaryLabelColor
                             : NSColor.secondaryLabelColor,
                          .font: NSFont.systemFont(ofSize: 11,
-                                                  weight: isActive ? .semibold : .medium)]))
+                                                  weight: isActive ? .semibold : .medium)])
         if isParked {
             title.append(NSAttributedString(
                 string: "  (parked)",
@@ -194,8 +228,33 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         layer?.backgroundColor = isActive
             ? NSColor.labelColor.withAlphaComponent(0.12).cgColor
             : NSColor.clear.cgColor
+        // The active workspace's chip never indicates (the user is looking at
+        // it) — belt and braces on top of the center's own guard.
+        applyActivity(isActive ? .idle : activity)
         toolTip = isParked ? "\(name) — parked. Click to reopen."
             : isActive ? "Click to rename" : "Switch to \(name)"
+    }
+
+    /// Dot pulse while output flows in this (hidden) workspace; a persistent
+    /// ring once it stops, cleared by switching to the workspace.
+    private func applyActivity(_ state: TabActivityState) {
+        activityState = state
+        dot.layer?.backgroundColor = dotColor.cgColor
+        ring.layer?.borderColor = dotColor.cgColor
+        ring.isHidden = state != .unseen
+        if state == .active {
+            if dot.layer?.animation(forKey: Self.pulseKey) == nil {
+                let pulse = CABasicAnimation(keyPath: "opacity")
+                pulse.fromValue = 1.0
+                pulse.toValue = 0.25
+                pulse.duration = 0.45
+                pulse.autoreverses = true
+                pulse.repeatCount = .infinity
+                dot.layer?.add(pulse, forKey: Self.pulseKey)
+            }
+        } else {
+            dot.layer?.removeAnimation(forKey: Self.pulseKey)
+        }
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -203,6 +262,8 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         layer?.backgroundColor = isActive
             ? NSColor.labelColor.withAlphaComponent(0.12).cgColor
             : NSColor.clear.cgColor
+        dot.layer?.backgroundColor = dotColor.cgColor
+        ring.layer?.borderColor = dotColor.cgColor
     }
 
     // MARK: - Mouse

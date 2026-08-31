@@ -46,6 +46,12 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// hidden workspace must be surfaced (FR-59 corollary).
     var workspaceMRU: [String] = []
 
+    // -- Workspace activity (founder UX: hidden workspaces show output) --
+    /// Per-workspace output marks behind the chip pulse/ring
+    /// (MemtermCore.WorkspaceActivityCenter — pure decay/coalescing state).
+    private var workspaceActivity = WorkspaceActivityCenter()
+    private var workspaceActivityWork: DispatchWorkItem?
+
     /// The workspaces a topology capture may rewrite: everything that is (or
     /// was, this session) on screen. Parked and never-opened workspaces stay out.
     /// Hidden workspaces stay IN: their windows are live and still captured.
@@ -198,9 +204,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 print("UIPROBE-FAIL single-tab tab bar not reachable"); exit(1)
             }
         }
+        var probeWorkspaceId: String?
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             self.newWindowForTab(nil)  // second tab so the tab bar is visible
-            _ = self.createWorkspace(named: "Probe")
+            probeWorkspaceId = self.createWorkspace(named: "Probe")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
             guard let controller = self.keyController(), let window = controller.window else {
@@ -229,6 +236,61 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.8) {
             print("UIPROBE-ACT after_select=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
+        }
+        // Workspace-activity leg (founder: hidden workspaces show output):
+        // switch to the Probe workspace (Default's windows hide, shells stay
+        // live per FR-59), write to a hidden Default pane → Default's chip
+        // must mark active, decay to unseen, and clear on switch-back.
+        let defaultId = StateStore.defaultWorkspaceId
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+            guard let probe = probeWorkspaceId else {
+                print("UIPROBE-FAIL no Probe workspace"); exit(1)
+            }
+            self.switchToWorkspace(probe)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.4) {
+            guard self.activeWorkspaceId != defaultId,
+                  let hidden = self.controllers.first(where: { $0.workspaceId == defaultId })
+            else { print("UIPROBE-FAIL default workspace not hidden"); exit(1) }
+            hidden.allPanes().first?.send(txt: "echo ws-activity\r")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+            let state = self.workspaceActivityState(of: defaultId)
+            print("UIPROBE-WSACT after_output=\(state)")
+            if state == .idle {
+                print("UIPROBE-FAIL hidden workspace output did not mark its chip"); exit(1)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7.8) {
+            let state = self.workspaceActivityState(of: defaultId)
+            print("UIPROBE-WSACT after_decay=\(state)")
+            if state != .unseen {
+                print("UIPROBE-FAIL expected unseen after decay, got \(state)"); exit(1)
+            }
+            // The rendered chip must agree with the state machine.
+            let chip = self.controllers
+                .first { $0.workspaceId == self.activeWorkspaceId }?
+                .workspaceBar?.chipActivityForProbe(workspaceId: defaultId)
+            print("UIPROBE-WSACT chip_state=\(chip.map(String.init(describing:)) ?? "nil")")
+            if chip != .unseen {
+                print("UIPROBE-FAIL chip does not show the unseen ring"); exit(1)
+            }
+            self.switchToWorkspace(defaultId)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.2) {
+            let state = self.workspaceActivityState(of: defaultId)
+            print("UIPROBE-WSACT after_switch=\(state)")
+            if state != .idle {
+                print("UIPROBE-FAIL switching back must clear the mark"); exit(1)
+            }
+            // Settings 2.0 leg: the sectioned window must construct and load
+            // (buildForm + loadValues run in init) — a broken control graph
+            // would otherwise only surface on the founder's first ⌘,.
+            let settings = SettingsWindowController(app: self)
+            print("UIPROBE-SETTINGS built=\(settings.window != nil)")
+            if settings.window == nil {
+                print("UIPROBE-FAIL settings window did not build"); exit(1)
+            }
             exit(0)
         }
     }
@@ -332,10 +394,121 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Workspace activity (founder: "the ping command always creates
+    // activity — the non-front workspace should blink the color circle")
+
+    /// Called (coalesced upstream per tab, and again per workspace by the
+    /// center) from every pane's pty output. The ACTIVE workspace never
+    /// marks — the user is looking at it.
+    func workspaceProducedOutput(_ workspaceId: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if workspaceActivity.recordOutput(workspace: workspaceId, at: now,
+                                          isActiveWorkspace: workspaceId == activeWorkspaceId) {
+            refreshWorkspaceActivity()
+        } else {
+            scheduleWorkspaceActivityRefresh(after: workspaceActivity.coalesceInterval)
+        }
+    }
+
+    /// The user switched to `workspaceId`: its output is seen, the mark clears.
+    func workspaceActivitySeen(_ workspaceId: String) {
+        workspaceActivity.recordSwitched(to: workspaceId)
+        workspaceActivityWork?.cancel()
+        workspaceActivityWork = nil
+    }
+
+    func workspaceActivityForgotten(_ workspaceId: String) {
+        workspaceActivity.removeWorkspace(workspaceId)
+    }
+
+    /// Chip states for the bar refresh (and the UI probe).
+    func workspaceActivityStates() -> [String: TabActivityState] {
+        guard let store = memory?.store else { return [:] }
+        let now = ProcessInfo.processInfo.systemUptime
+        var states: [String: TabActivityState] = [:]
+        for workspace in store.listWorkspaces() {
+            let state = workspaceActivity.state(of: workspace.id, at: now)
+            if state != .idle { states[workspace.id] = state }
+        }
+        return states
+    }
+
+    func workspaceActivityState(of workspaceId: String) -> TabActivityState {
+        workspaceActivity.state(of: workspaceId, at: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func refreshWorkspaceActivity() {
+        workspaceActivityWork?.cancel()
+        workspaceActivityWork = nil
+        refreshWorkspaceChips()
+        // One more repaint just past the earliest decay boundary flips a
+        // pulsing dot to the persistent unseen ring (same pattern as the
+        // per-tab indicator in TerminalWindowController).
+        let now = ProcessInfo.processInfo.systemUptime
+        if let decayAt = workspaceActivity.nextDecay(after: now) {
+            scheduleWorkspaceActivityRefresh(after: decayAt - now + 0.05)
+        }
+    }
+
+    private func scheduleWorkspaceActivityRefresh(after delay: TimeInterval) {
+        guard workspaceActivityWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.workspaceActivityWork = nil
+            self?.refreshWorkspaceActivity()
+        }
+        workspaceActivityWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0.05), execute: work)
+    }
+
+    // MARK: - Quit
+
+    /// Founder confirm-quit stage: ⌘Q with running foreground jobs asks once;
+    /// plain shells quit instantly (FR-20 stays lossless either way — the
+    /// alert's Quit runs the exact same flushSync path). Guarded off for
+    /// --smoke and the UI probe (both terminate via exit(), but never risk a
+    /// modal in an automated run), and for willPowerOff (that path only
+    /// flushes, it never calls terminate:).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if config.confirmQuit, !smokeMode,
+           ProcessInfo.processInfo.environment["MEMTERM_UI_PROBE"] != "1" {
+            let jobs = runningForegroundJobCount()
+            if jobs > 0 {
+                let alert = NSAlert()
+                alert.messageText = "Quit memterm?"
+                alert.informativeText = jobs == 1
+                    ? "1 job is still running — it will be terminated. "
+                      + "Your layout and sessions will be remembered."
+                    : "\(jobs) jobs are still running — they will be terminated. "
+                      + "Your layout and sessions will be remembered."
+                alert.addButton(withTitle: "Quit")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    return .terminateCancel
+                }
+            }
+        }
         memory?.flushSync()   // windows still open: the snapshot is the live layout
         isTerminating = true
         return .terminateNow
+    }
+
+    /// Panes whose foreground process differs from their shell — the same
+    /// kernel-truth reads the 2 s capture poll uses (tcgetpgrp on the pty
+    /// master, child pids as fallback), taken fresh at quit time. Hidden
+    /// workspaces count: their jobs die with the app too.
+    private func runningForegroundJobCount() -> Int {
+        var jobs = 0
+        for controller in controllers {
+            for pane in controller.allPanes() {
+                guard let process = pane.process, process.running else { continue }
+                let shellPid = process.shellPid
+                var fg = ProcessInspector.foregroundPgid(masterFd: process.childfd)
+                if fg == shellPid { fg = nil }
+                if fg == nil { fg = ProcessInspector.childPids(of: shellPid).first }
+                if let pid = fg, pid != shellPid { jobs += 1 }
+            }
+        }
+        return jobs
     }
 
     @objc private func workspaceWillPowerOff(_ note: Notification) {

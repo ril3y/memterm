@@ -81,6 +81,9 @@ extension MemtermAppDelegate {
         activeWorkspaceId = id
         workspaceMRU.removeAll { $0 == outgoingId }
         workspaceMRU.insert(outgoingId, at: 0)
+        // Founder UX: switching to a workspace sees its output — the chip's
+        // activity mark (pulse/unseen ring) clears now.
+        workspaceActivitySeen(id)
         engine.store.setMeta("active_workspace_id", id)
         rebuildWorkspaceMenu()
         engine.scheduleTopologySave()
@@ -216,6 +219,7 @@ extension MemtermAppDelegate {
         engine.store.forgetWorkspace(id, scrollbackDir: engine.scrollbackDir)
         engine.store.barrier()
         materializedWorkspaceIds.remove(id)
+        workspaceActivityForgotten(id)
         rebuildWorkspaceMenu()
     }
 
@@ -601,6 +605,7 @@ extension MemtermAppDelegate {
     func refreshWorkspaceChips() {
         guard let store = memory?.store else { return }
         let list = store.listWorkspaces()
+        let activity = workspaceActivityStates()
         var byId: [String: WorkspaceRow] = [:]
         for workspace in list { byId[workspace.id] = workspace }
         for controller in controllers {
@@ -608,7 +613,8 @@ extension MemtermAppDelegate {
             controller.updateWorkspaceChip(
                 name: workspace?.name ?? "Workspace",
                 color: Self.nsColor(hex: workspace?.color ?? StateStore.defaultWorkspaceColor))
-            controller.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId)
+            controller.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId,
+                                          activity: activity)
         }
     }
 
