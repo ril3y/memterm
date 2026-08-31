@@ -55,16 +55,22 @@ extension MemtermAppDelegate {
             engine.store.setWorkspaceParked(id, parked: false)  // reopen
         }
         let outgoingId = activeWorkspaceId
+        // Founder (2026-08-31): switching presents IN PLACE — the incoming
+        // workspace's primary tab group takes over the frame the user is
+        // looking at, Safari-tab-groups style. No window movement, ever.
+        let adoptFrame = (NSApp.keyWindow
+            ?? controllers.first { $0.workspaceId == outgoingId }?.window)?.frame
         isSwitchingWorkspaces = true
         // Bring the target up FIRST, hide the outgoing after — the app never
         // passes through a windowless moment.
-        if !showHiddenWindows(of: id) {
+        if !showHiddenWindows(of: id, adoptingFrame: adoptFrame) {
             // Resurrect path: no live windows for this workspace exist.
             let restored = engine.store.loadState(workspaceId: id)
             if restored.isEmpty {
-                openNewWindow(in: id)
+                let fresh = openNewWindow(in: id)
+                if let adoptFrame { fresh.window?.setFrame(adoptFrame, display: true) }
             } else {
-                restoreWindows(restored, workspaceId: id)
+                restoreWindows(restored, workspaceId: id, adoptingFrame: adoptFrame)
             }
         }
         hideWindows(of: outgoingId)
@@ -111,17 +117,27 @@ extension MemtermAppDelegate {
     /// the workspace has no live windows (caller falls back to resurrect).
     /// Windows keep their frames — nothing here centers, cascades, or moves.
     @discardableResult
-    func showHiddenWindows(of workspaceId: String) -> Bool {
+    func showHiddenWindows(of workspaceId: String, adoptingFrame: NSRect? = nil) -> Bool {
         let members = controllers.filter { $0.workspaceId == workspaceId }
         guard !members.isEmpty else { return false }
         let layout = hiddenLayouts.removeValue(forKey: workspaceId)
         var byTab: [String: TerminalWindowController] = [:]
         for member in members { byTab[member.tabId] = member }
+        // In-place switch: the primary group (the one holding the workspace's
+        // last key tab, else the first) adopts the outgoing window's frame;
+        // secondary windows keep their own frames.
+        let groups = layout?.groups ?? []
+        let primaryIndex = groups.firstIndex {
+            $0.tabIds.contains(layout?.keyTabId ?? "")
+        } ?? (groups.isEmpty ? nil : 0)
         var shown = Set<ObjectIdentifier>()
         var focusTarget: TerminalWindowController?
-        for group in layout?.groups ?? [] {
+        for (index, group) in groups.enumerated() {
             let live = group.tabIds.compactMap { byTab[$0] }
             guard let host = live.first, let hostWindow = host.window else { continue }
+            if index == primaryIndex, let adoptingFrame {
+                hostWindow.setFrame(adoptingFrame, display: false)
+            }
             hostWindow.orderFront(nil)
             shown.insert(ObjectIdentifier(host))
             var anchor = hostWindow

@@ -344,12 +344,20 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Restore
 
-    func restoreWindows(_ windows: [WindowRestore], workspaceId: String) {
+    /// `adoptingFrame` (switch-in-place, FR-59): the FIRST restored window
+    /// group takes this frame instead of its journaled one, so switching into
+    /// a parked workspace presents where the user is already looking;
+    /// additional window groups keep their journaled frames. nil (launch
+    /// path) restores journaled frames throughout.
+    func restoreWindows(_ windows: [WindowRestore], workspaceId: String,
+                        adoptingFrame: NSRect? = nil) {
         var focusTarget: TerminalWindowController?
-        for win in windows {
+        for (w, win) in windows.enumerated() {
             var host: TerminalWindowController?
             for (i, tab) in win.tabs.enumerated() {
-                let frame = i == 0 ? parseFrame(win.frame) : nil
+                let frame = i == 0
+                    ? (w == 0 ? adoptingFrame ?? parseFrame(win.frame) : parseFrame(win.frame))
+                    : nil
                 let controller = TerminalWindowController(app: self, workspaceId: workspaceId,
                                                           restoredTab: tab,
                                                           restoredFrame: frame)
@@ -458,7 +466,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 let framesStable = defaults.first?.window?.frame == defaultFrame
                 guard sameObjects, samePanes, visible, survivors == defaultPids.count,
                       !defaultPids.isEmpty, dividers == 0, framesStable else {
-                    print("SMOKE-FAIL live-switch show: sameObjects=\(sameObjects) samePanes=\(samePanes) visible=\(visible) pids=\(survivors)/\(defaultPids.count) dividers=\(dividers) framesStable=\(framesStable)")
+                    print("SMOKE-FAIL live-switch show: sameObjects=\(sameObjects) samePanes=\(samePanes) visible=\(visible) pids=\(survivors)/\(defaultPids.count) dividers=\(dividers) framesStable=\(framesStable) before=\(defaultFrame) after=\(String(describing: defaults.first?.window?.frame))")
                     exit(1)
                 }
                 print("SMOKE-LIVE-SWITCH pids_survived=\(survivors) same_panes=\(samePanes) frames_stable=\(framesStable)")

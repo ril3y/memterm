@@ -31,6 +31,13 @@ final class WorkspaceBarView: NSVisualEffectView {
     private let stack = NSStackView()
     private let addButton = NSButton()
     private let separator = NSView()
+    /// Founder request: the bar names itself so the chips are self-explanatory.
+    private let titleLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "Workspaces:")
+        label.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .tertiaryLabelColor
+        return label
+    }()
     private var chipsById: [String: WorkspaceChipView] = [:]
 
     init(app: MemtermAppDelegate) {
@@ -97,6 +104,7 @@ final class WorkspaceBarView: NSVisualEffectView {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+        stack.addArrangedSubview(titleLabel)
         var kept: [String: WorkspaceChipView] = [:]
         for workspace in workspaces {
             let chip = chipsById[workspace.id] ?? WorkspaceChipView(app: app,

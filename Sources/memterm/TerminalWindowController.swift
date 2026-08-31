@@ -143,7 +143,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         if app.config.alwaysShowTabBar { applyTabBarPolicy(alwaysShow: true) }
     }
 
-    // MARK: - Workspace chip (FR-50: titlebar control)
+    // MARK: - Titlebar gear (founder 2026-08-31: the workspace chip duplicated
+    // the workspace bar — replaced by a gear: click opens Settings, right-click
+    // still pops the workspace switcher)
 
     private func installWorkspaceChip(on window: NSWindow) {
         workspaceChipButton.menuProvider = { [weak self] in
@@ -151,12 +153,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         }
         workspaceChipButton.isBordered = false
         workspaceChipButton.setButtonType(.momentaryChange)
-        workspaceChipButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        workspaceChipButton.target = self
-        workspaceChipButton.action = #selector(showWorkspaceMenu(_:))
-        workspaceChipButton.frame = NSRect(x: 0, y: 0, width: 90, height: 20)
+        workspaceChipButton.image = NSImage(systemSymbolName: "gearshape",
+                                            accessibilityDescription: "Settings")
+        workspaceChipButton.contentTintColor = .secondaryLabelColor
+        workspaceChipButton.toolTip = "Settings (right-click: workspaces)"
+        workspaceChipButton.target = app
+        workspaceChipButton.action = #selector(MemtermAppDelegate.openPreferences(_:))
+        workspaceChipButton.frame = NSRect(x: 0, y: 0, width: 24, height: 20)
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 98, height: 22))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 32, height: 22))
         workspaceChipButton.setFrameOrigin(NSPoint(x: 4, y: 1))
         container.addSubview(workspaceChipButton)
 
@@ -201,25 +206,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         window?.contentLayoutRect.maxY ?? 0
     }
 
+    /// The gear replaced the name/color chip; the workspace identity lives in
+    /// the workspace bar now, so this only keeps the tooltip current.
     func updateWorkspaceChip(name: String, color: NSColor) {
-        let title = NSMutableAttributedString(
-            string: "● ",
-            attributes: [.foregroundColor: color,
-                         .font: NSFont.systemFont(ofSize: 10)])
-        title.append(NSAttributedString(
-            string: name,
-            attributes: [.foregroundColor: NSColor.secondaryLabelColor,
-                         .font: NSFont.systemFont(ofSize: 11, weight: .medium)]))
-        workspaceChipButton.attributedTitle = title
-        workspaceChipButton.sizeToFit()
-        workspaceChipButton.superview?.frame.size.width =
-            workspaceChipButton.frame.width + 8
-    }
-
-    @objc private func showWorkspaceMenu(_ sender: NSButton) {
-        let menu = app.makeWorkspacePopUpMenu()
-        menu.popUp(positioning: nil,
-                   at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+        workspaceChipButton.toolTip = "Settings — workspace: \(name) (right-click to switch)"
     }
 
     // MARK: - Pane context menu (FR-58: right-click is a first-class affordance)
@@ -685,6 +675,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
         alert.addButton(withTitle: "Rename")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
+        // Ready to type: focused with the current name selected, so typing
+        // replaces it and Enter keeps it.
+        field.selectText(nil)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = field.stringValue.trimmingCharacters(in: .whitespaces)
         customTitle = name.isEmpty ? nil : name
