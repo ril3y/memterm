@@ -157,8 +157,13 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         }
         app.memory?.scheduleTopologySave()
         // FR-59 corollary: never leave the app windowless while other
-        // workspaces hold hidden live windows — surface the MRU one.
+        // workspaces hold hidden live tabs — surface the MRU one.
         app.activeWorkspaceWindowClosed(workspaceId, userInitiated: userInitiated)
+        // Founder (stage 2): a USER close that empties a non-Default
+        // workspace removes the workspace itself — Default persists.
+        if userInitiated {
+            app.workspaceEmptiedByUserClose(workspaceId)
+        }
     }
 
     // MARK: - Pane context menu (FR-58: right-click is a first-class affordance)

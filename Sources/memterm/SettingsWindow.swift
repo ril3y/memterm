@@ -18,7 +18,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let copyOnSelectCheck = NSButton(checkboxWithTitle: "Selecting text copies it", target: nil, action: nil)
     private let confirmQuitCheck = NSButton(checkboxWithTitle: "Confirm quitting while jobs are running", target: nil, action: nil)
     private let workspaceBarCheck = NSButton(checkboxWithTitle: "Show the workspace bar", target: nil, action: nil)
-    private let alwaysTabBarCheck = NSButton(checkboxWithTitle: "Always show the tab bar", target: nil, action: nil)
     private let shellField = NSTextField()
 
     // Appearance
@@ -121,7 +120,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildForm() {
         for check in [sameCwdCheck, copyOnSelectCheck, confirmQuitCheck, workspaceBarCheck,
-                      alwaysTabBarCheck, optionMetaCheck, mouseReportingCheck, blurCheck,
+                      optionMetaCheck, mouseReportingCheck, blurCheck,
                       shellIntegrationCheck] {
             wire(check)
         }
@@ -195,7 +194,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSGridCell.emptyContentView, confirmQuitCheck],
             [NSGridCell.emptyContentView, caption("⌘Q asks only while foreground jobs are running. Quitting always remembers your layout and sessions.")],
             [NSGridCell.emptyContentView, workspaceBarCheck],
-            [NSGridCell.emptyContentView, alwaysTabBarCheck],
             [label("Shell:"), shellField],
             [NSGridCell.emptyContentView, caption("Applies to new panes. Blank uses $SHELL.")],
             [NSGridCell.emptyContentView, editFile],
@@ -331,7 +329,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         copyOnSelectCheck.state = config.copyOnSelect ? .on : .off
         confirmQuitCheck.state = config.confirmQuit ? .on : .off
         workspaceBarCheck.state = config.workspaceBar ? .on : .off
-        alwaysTabBarCheck.state = config.alwaysShowTabBar ? .on : .off
         shellField.stringValue = config.shell ?? ""
 
         // Appearance
@@ -433,7 +430,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         config.copyOnSelect = copyOnSelectCheck.state == .on
         config.confirmQuit = confirmQuitCheck.state == .on
         config.workspaceBar = workspaceBarCheck.state == .on
-        config.alwaysShowTabBar = alwaysTabBarCheck.state == .on
         let shell = shellField.stringValue.trimmingCharacters(in: .whitespaces)
         config.shell = shell.isEmpty ? nil : shell
 

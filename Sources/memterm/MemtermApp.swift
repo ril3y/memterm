@@ -48,11 +48,6 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     let workspaceMenu = NSMenu(title: "Workspace")
 
     // -- FR-59: non-destructive switching state --
-    /// NATIVE-TAB-ERA REMNANT (deleted for real in stage 2): under custom
-    /// chrome, orderOut() hides PLAIN windows and nothing dissolves — hosts
-    /// keep their tab order while hidden, so no layout bookkeeping is needed.
-    /// Kept only so stage-2's deletion list stays accurate.
-    var hiddenLayouts: [String: HiddenWorkspaceLayout] = [:]
     /// Workspaces most-recently switched AWAY from, newest first — the pick
     /// order when the active workspace's last visible window closes and a
     /// hidden workspace must be surfaced (FR-59 corollary).
@@ -175,15 +170,12 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func runUIProbe() {
-        // Single-tab leg (always_show_tab_bar): before the second tab exists,
-        // OUR tab strip row must already be visible (its height non-empty),
-        // or double-click rename / right-click menu are unreachable on a
-        // fresh window. Skipped when the founder's config disables the policy.
+        // Single-tab leg: before the second tab exists, OUR tab strip row
+        // must already be visible (its height non-empty), or double-click
+        // rename / right-click menu are unreachable on a fresh window. Stage
+        // 2: the strip is ALWAYS visible (always_show_tab_bar is a parsed
+        // no-op now), so this leg is unconditional.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            guard self.config.alwaysShowTabBar else {
-                print("UIPROBE-SINGLE skipped (always_show_tab_bar=false)")
-                return
-            }
             guard let host = self.keyHost(), host.window != nil else {
                 print("UIPROBE-FAIL no window (single-tab leg)"); exit(1)
             }
@@ -633,6 +625,44 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 print("UIPROBE-FAIL ⌘R with absent device must report honestly and not open")
                 exit(1)
             }
+        }
+        // Last-tab-close leg (founder pending item, stage 2): closing the
+        // LAST tab of a non-Default workspace auto-removes the now-empty
+        // workspace (Default persists), and the MRU corollary surfaces the
+        // hidden Default instead of stranding the app windowless. Switching
+        // to Probe here also exercises the multi-host slot-matched swap
+        // (Default holds two hosts by now; the extra one orders out whole).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 19.1) {
+            guard let probe = probeWorkspaceId else {
+                print("UIPROBE-FAIL no Probe workspace (last-tab-close leg)"); exit(1)
+            }
+            self.switchToWorkspace(probe)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 19.5) {
+            guard let probe = probeWorkspaceId,
+                  self.activeWorkspaceId == probe,
+                  let listed = self.memory?.store.listWorkspaces()
+                      .contains(where: { $0.id == probe }), listed,
+                  let doomed = self.controllers.first(where: { $0.workspaceId == probe })
+            else {
+                print("UIPROBE-FAIL Probe workspace not presented for last-tab close")
+                exit(1)
+            }
+            doomed.close()  // user close of the workspace's only tab
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20.1) {
+            guard let probe = probeWorkspaceId, let store = self.memory?.store else { exit(1) }
+            let names = store.listWorkspaces().map { $0.name }
+            let probeGone = !store.listWorkspaces().contains { $0.id == probe }
+            let defaultKept = store.listWorkspaces()
+                .contains { $0.id == StateStore.defaultWorkspaceId }
+            let surfacedDefault = self.activeWorkspaceId == StateStore.defaultWorkspaceId
+            let visibleWindow = self.hosts.contains { $0.window?.isVisible == true }
+            print("UIPROBE-WSCLOSE probe_removed=\(probeGone) default_kept=\(defaultKept) surfaced_default=\(surfacedDefault) visible_window=\(visibleWindow) names=\(names)")
+            if !probeGone || !defaultKept || !surfacedDefault || !visibleWindow {
+                print("UIPROBE-FAIL last-tab close must remove the empty workspace and surface Default")
+                exit(1)
+            }
             exit(0)
         }
     }
@@ -959,8 +989,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
                 // FR-59 leg: record Default's controllers, shell pids, and
-                // frame, then switch to a fresh workspace B. The switch must
-                // HIDE Default — same objects, processes untouched.
+                // frame, then switch to a fresh workspace B (resurrect/fresh
+                // path: B has no live tabs, so Default's hosts hide whole).
+                // Default's tabs must stay LIVE — same objects, processes
+                // untouched, no host displaying them.
                 let defaults = defaultControllers()
                 defaultControllerIds = Set(defaults.map(ObjectIdentifier.init))
                 let panes = defaults.flatMap { $0.allPanes() }
@@ -989,7 +1021,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                     print("SMOKE-FAIL live-switch hide: hidden=\(hidden) alive=\(alive) sameObjects=\(sameObjects)")
                     exit(1)
                 }
-                // Switch back: hide/show, NOT the restore pipeline.
+                // Switch back: the FR-59 tab-set swap (Default has live tabs
+                // in a hidden holder), NOT the restore pipeline — Default's
+                // tabs swap INTO the window the user is looking at.
                 self.switchToWorkspace(StateStore.defaultWorkspaceId)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 6.1) {
@@ -1004,6 +1038,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 // kill(pid, 0) on the ORIGINAL pre-switch pids, post round-trip.
                 let survivors = defaultPids.filter { kill($0, 0) == 0 }.count
                 let dividers = panes.reduce(0) { $0 + $1.restoredDividerCount }
+                // Frame stability under the swap model: the window now
+                // DISPLAYING Default is the one the user was looking at
+                // throughout, whose frame was adopted from Default's original
+                // window at the first switch — byte-identical frames.
                 let framesStable = defaults.first?.window?.frame == defaultFrame
                 guard sameObjects, samePanes, visible, survivors == defaultPids.count,
                       !defaultPids.isEmpty, dividers == 0, framesStable else {
@@ -1438,23 +1476,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - FR-59 supporting types
 
-/// The native-tab-group layout of a workspace at the moment it was hidden:
-/// per group, the member tabIds in strip order and the selected tab, plus
-/// which tab held key status. Recorded by hideWindows, consumed by
-/// showHiddenWindows (regrouping) and captureGroups (topology fidelity),
-/// because orderOut() dissolves live tab groups.
-struct HiddenWorkspaceLayout {
-    struct Group {
-        var tabIds: [String]
-        var selectedTabId: String?
-    }
-
-    var groups: [Group]
-    var keyTabId: String?
-}
-
-/// One journal "window": the tab controllers that form (or formed, while
-/// hidden) a native tab group, plus its focused tab.
+/// One journal "window": a host's ordered tab controllers plus its focused
+/// (selected) tab — first-class model state under custom chrome, read the
+/// same way whether the host is visible or a hidden holder.
 struct CaptureGroup {
     let members: [TerminalWindowController]
     let focusedTabId: String?

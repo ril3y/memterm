@@ -130,35 +130,11 @@ final class MemoryEngine {
         store.saveTopology(snapshotTopology(), forWorkspaces: app.captureScope())
     }
 
-    /// NATIVE-TAB-ERA REMNANT (no callers; stage-2 deletion): grouping used
-    /// to be reverse-engineered from NSWindow tab groups. Under custom chrome
-    /// the window rows come from first-class model state —
-    /// MemtermAppDelegate.captureGroups() over hosts.
-    static func groupedControllers(_ controllers: [TerminalWindowController])
-        -> [[TerminalWindowController]] {
-        var groups: [[TerminalWindowController]] = []
-        var seen = Set<ObjectIdentifier>()
-        for controller in controllers {
-            guard let window = controller.window else { continue }
-            if let tabGroup = window.tabGroup, tabGroup.windows.count > 1 {
-                let gid = ObjectIdentifier(tabGroup)
-                guard !seen.contains(gid) else { continue }
-                seen.insert(gid)
-                let members = tabGroup.windows.compactMap { tabWindow in
-                    controllers.first { $0.window === tabWindow }
-                }
-                if !members.isEmpty { groups.append(members) }
-            } else {
-                groups.append([controller])
-            }
-        }
-        return groups
-    }
-
-    /// FR-59: grouping and focus come from app.captureGroups(), which uses the
-    /// live tab groups for visible windows and the recorded hide-time layout
-    /// for hidden ones (orderOut dissolves native tab groups, so reading them
-    /// directly would journal each hidden tab as its own window).
+    /// FR-59: grouping and focus come from app.captureGroups() — first-class
+    /// model state (each host's ordered tabs + selection), read identically
+    /// for visible hosts and hidden holders. The journal's tab/pane ids are
+    /// the controllers' own, unchanged across the custom-chrome migration, so
+    /// a pre-migration state.db restores as-is (PreMigrationRestoreTests).
     private func snapshotTopology() -> [WindowSnap] {
         app.captureGroups().compactMap { group in
             let tabs = group.members.compactMap { $0.snapshotTab() }

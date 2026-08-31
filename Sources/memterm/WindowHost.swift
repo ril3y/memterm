@@ -43,12 +43,11 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     private(set) var workspaceBar: WorkspaceBarView?
     private let gearButton = ChipButton()
     private(set) var tabStrip: TabStripView!
-    /// Minimal drag/title row shown only when BOTH chrome rows are hidden
-    /// (workspace_bar=false and a lone tab with always_show_tab_bar=false) —
-    /// the window still needs a titlebar-like strip for dragging.
-    private let fallbackRow = FallbackTitleRow()
     private let contentContainer = NSView()
     private let blurView = NSVisualEffectView()
+    /// FR-59 in-window crossfade: the outgoing content's snapshot, fading out
+    /// over the swapped-in workspace (Workspaces.swapTabSets).
+    private var crossfadeOverlay: NSImageView?
 
     // PINNED DEPENDENCY (moved here from the per-tab controller): the window's
     // firstResponder KVO drives focusedPane tracking. NSWindow.firstResponder
@@ -125,9 +124,6 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
         tabStrip.heightAnchor.constraint(equalToConstant: TabStripView.height).isActive = true
 
-        fallbackRow.translatesAutoresizingMaskIntoConstraints = false
-        fallbackRow.heightAnchor.constraint(equalToConstant: 28).isActive = true
-
         chromeStack.orientation = .vertical
         chromeStack.alignment = .leading
         chromeStack.spacing = 0
@@ -135,7 +131,6 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         chromeStack.translatesAutoresizingMaskIntoConstraints = false
         chromeStack.addArrangedSubview(barRow)
         chromeStack.addArrangedSubview(tabStrip)
-        chromeStack.addArrangedSubview(fallbackRow)
         content.addSubview(chromeStack)
 
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -147,7 +142,6 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
             chromeStack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             barRow.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
             tabStrip.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
-            fallbackRow.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
             contentContainer.topAnchor.constraint(equalTo: chromeStack.bottomAnchor),
             contentContainer.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             contentContainer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -261,6 +255,67 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         select(tabs[index])
     }
 
+    /// FR-59 swap primitive (custom-chrome stage 2): replaces this host's
+    /// DISPLAYED tab set in place — same NSWindow, same frame, processes
+    /// untouched. The outgoing tabs keep their views/panes/ptys; the caller
+    /// re-homes them into another host (Workspaces.swapTabSets pairs a
+    /// visible host with the incoming group's former hidden holder). A tab's
+    /// pane root may currently be parented in ANOTHER host's container
+    /// mid-swap, so detachment is guarded by superview identity.
+    func setTabs(_ newTabs: [TerminalWindowController],
+                 selecting: TerminalWindowController?) {
+        if let sel = selectedTab, sel.paneRoot.superview === contentContainer {
+            sel.paneRoot.removeFromSuperview()
+        }
+        selectedTab = nil
+        for tab in tabs where tab.host === self { tab.host = nil }
+        tabs = newTabs
+        for tab in tabs { tab.host = self }
+        updateChromeVisibility()
+        tabStrip.reload()
+        if let selecting, tabs.contains(where: { $0 === selecting }) {
+            select(selecting)
+        } else if let first = tabs.first {
+            select(first)
+        } else {
+            refreshTitle()
+        }
+    }
+
+    /// FR-59 crossfade, swap edition (founder: the hard cut read un-macOS):
+    /// snapshot the window's current content, let the caller swap the tab set
+    /// under it, and fade the snapshot out — an IN-WINDOW crossfade replacing
+    /// the old window-alpha fade (the window itself no longer changes). Call
+    /// BEFORE mutating the displayed tabs. Self-contained per host: a
+    /// re-switch mid-fade just replaces the overlay, so there is no
+    /// completion race with workspace state.
+    func beginContentCrossfade() {
+        guard let window, window.isVisible, let content = window.contentView,
+              content.bounds.width > 0, content.bounds.height > 0 else { return }
+        crossfadeOverlay?.removeFromSuperview()
+        crossfadeOverlay = nil
+        guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)
+        else { return }
+        content.cacheDisplay(in: content.bounds, to: rep)
+        let image = NSImage(size: content.bounds.size)
+        image.addRepresentation(rep)
+        let overlay = NSImageView(frame: content.bounds)
+        overlay.image = image
+        overlay.imageScaling = .scaleAxesIndependently
+        overlay.autoresizingMask = [.width, .height]
+        overlay.wantsLayer = true
+        content.addSubview(overlay, positioned: .above, relativeTo: nil)
+        crossfadeOverlay = overlay
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            overlay.animator().alphaValue = 0
+        }, completionHandler: { [weak self, weak overlay] in
+            overlay?.removeFromSuperview()
+            if let self, self.crossfadeOverlay === overlay { self.crossfadeOverlay = nil }
+        })
+    }
+
     func selectNextTab() { cycleTab(by: 1) }
     func selectPreviousTab() { cycleTab(by: -1) }
 
@@ -284,15 +339,15 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Chrome state
 
-    /// `always_show_tab_bar` maps to: the strip row collapses only when the
-    /// host has one tab AND the key is false; forced visible otherwise.
+    /// The tab strip is ALWAYS visible under memterm's own chrome (stage 2:
+    /// it is the window's titlebar surface — titles, rename, drag, activity
+    /// all live there, so collapsing it would orphan them). The old
+    /// `always_show_tab_bar` key is parsed as a documented no-op now. Only
+    /// the workspace row remains toggleable (workspace_bar).
     func updateChromeVisibility() {
-        let config = app.config
-        let barVisible = config.workspaceBar
-        let stripVisible = config.alwaysShowTabBar || tabs.count > 1
+        let barVisible = app.config.workspaceBar
         barRow.isHidden = !barVisible
-        tabStrip.isHidden = !stripVisible
-        fallbackRow.isHidden = barVisible || stripVisible
+        tabStrip.isHidden = false
         // The TOP visible chrome row keeps its content clear of the traffic
         // lights; a strip below the workspace bar needs no extra inset.
         tabStrip.leadingInset = barVisible ? 8 : Self.trafficLightInset
@@ -328,7 +383,6 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     /// accessibility) even though titleVisibility is .hidden.
     func refreshTitle() {
         window?.title = selectedTab?.displayTitle ?? "memterm"
-        fallbackRow.title = window?.title ?? "memterm"
     }
 
     func updateWorkspaceBar(workspaces: [WorkspaceRow], activeId: String,
@@ -388,47 +442,5 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
 
     func windowDidMove(_ notification: Notification) {
         app.memory?.scheduleFrameSave()
-    }
-}
-
-/// The drag/title row shown when both chrome rows are hidden: a plain
-/// titlebar stand-in (window title text + drag-to-move + double-click zoom).
-final class FallbackTitleRow: NSVisualEffectView {
-    private let label = NSTextField(labelWithString: "")
-
-    var title: String = "" {
-        didSet { label.stringValue = title }
-    }
-
-    init() {
-        super.init(frame: .zero)
-        material = .headerView
-        blendingMode = .withinWindow
-        state = .followsWindowActiveState
-        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        label.textColor = .secondaryLabelColor
-        label.lineBreakMode = .byTruncatingTail
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor,
-                                           constant: WindowHostController.trafficLightInset),
-        ])
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError() }
-
-    override var mouseDownCanMoveWindow: Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            window?.performZoom(nil)
-            return
-        }
-        super.mouseDown(with: event)
     }
 }

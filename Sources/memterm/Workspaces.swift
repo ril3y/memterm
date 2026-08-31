@@ -4,20 +4,24 @@ import MemtermCore
 // Group G (FR-49..52, FR-59): workspace runtime — switching, park/reopen,
 // forget — plus the switcher menu and the titlebar chip plumbing.
 //
-// FR-59 (founder decision 2026-08-31): SWITCHING IS NON-DESTRUCTIVE. A switch
-// hides the outgoing workspace's windows (orderOut) and keeps every pane's pty
-// and process alive; switching back shows the same NSWindow objects at their
-// existing frames — no restore pipeline, no "restored" divider, no respawn.
-// The journal → resurrect pipeline runs ONLY when the processes are actually
-// gone: app launch, and reopening a PARKED workspace. Park stays the explicit
-// destructive-but-remembered gesture (capture + close windows + keep rows).
+// FR-59 (founder decision 2026-08-31): SWITCHING IS NON-DESTRUCTIVE. Every
+// pane's pty and process stays alive across a switch; switching back presents
+// the same tab/pane objects with no restore pipeline, no "restored" divider,
+// no respawn. The journal → resurrect pipeline runs ONLY when the processes
+// are actually gone: app launch, and reopening a PARKED workspace. Park stays
+// the explicit destructive-but-remembered gesture (capture + close windows +
+// keep rows).
 //
-// CUSTOM-TAB-CHROME NOTE: under our own chrome a "window" is a
-// WindowHostController displaying its tab set — orderOut() hides a PLAIN
-// window and dissolves nothing, so hiding/showing needs no tab-group
-// bookkeeping (the native-tab era's hiddenLayouts machinery is a dead remnant
-// slated for stage-2 deletion). Hidden hosts keep their tabs, order, and
-// selection; capture reads them from the model (captureGroups over hosts).
+// CUSTOM-TAB-CHROME (stage 2): switching is a TAB-SET SWAP. In the common
+// case the window the user is looking at never moves or hides — the visible
+// host swaps the incoming workspace's tab group into its strip + content IN
+// PLACE (same NSWindow, same frame — the founder's in-place presentation is
+// the primitive now, not an adopted-frame special case), and the incoming
+// group's former hidden host becomes the hidden holder of the outgoing group.
+// Slots beyond the overlap show or hide whole (plain) hosts. Hidden hosts
+// keep their tabs, order, and selection as first-class model state — capture
+// reads them via captureGroups over hosts; the native-tab era's hiddenLayouts
+// bookkeeping is gone (orderOut of a plain window dissolves nothing).
 
 extension MemtermAppDelegate {
 
@@ -33,13 +37,14 @@ extension MemtermAppDelegate {
 
     // MARK: - Core operations
 
-    /// FR-59: switch = hide/show. The outgoing workspace is captured (scoped
-    /// save) and its windows ordered out — controllers stay in `controllers`,
-    /// ptys and child processes untouched, capture keeps polling them. If the
-    /// target has hidden live windows they are shown again (same NSWindow
-    /// objects, same frames, regrouped from the recorded layout). ONLY a
-    /// target with no live windows (parked, or never materialized this
-    /// session) goes through the journal → resurrect pipeline. Switching to a
+    /// FR-59: switch = tab-set swap. The outgoing workspace is captured
+    /// (scoped save); controllers stay in `controllers`, ptys and child
+    /// processes untouched, capture keeps polling them. A target with LIVE
+    /// tabs (hidden holders) is swapped into the visible hosts in place —
+    /// same NSWindow the user is looking at, same frame, no window movement,
+    /// ever. ONLY a target with no live tabs (parked, or never materialized
+    /// this session) goes through the journal → resurrect pipeline (which
+    /// builds fresh hosts; its primary adopts the key frame). Switching to a
     /// parked workspace reopens (unparks) it.
     func switchToWorkspace(_ id: String) {
         guard let engine = memory else { return }
@@ -49,24 +54,33 @@ extension MemtermAppDelegate {
             focusWindows(ofWorkspace: id)
             return
         }
-        // Capture the outgoing workspace while its windows are still visible.
+        // Capture the outgoing workspace while its tabs are still presented.
         engine.flushSync()
         if target.isParked {
             engine.store.setWorkspaceParked(id, parked: false)  // reopen
         }
         let outgoingId = activeWorkspaceId
-        // Founder (2026-08-31): switching presents IN PLACE — the incoming
-        // workspace's primary tab group takes over the frame the user is
-        // looking at, Safari-tab-groups style. No window movement, ever.
-        let adoptFrame = (NSApp.keyWindow
-            ?? hosts.first { $0.workspaceId == outgoingId }?.window)?.frame
         let fade = switchFadeEnabled
         isSwitchingWorkspaces = true
-        fadeInPending = fade
-        // Bring the target up FIRST, hide the outgoing after — the app never
-        // passes through a windowless moment.
-        if !showHiddenWindows(of: id, adoptingFrame: adoptFrame) {
-            // Resurrect path: no live windows for this workspace exist.
+        // Slot order: the KEY host first — the in-place presentation swaps
+        // the incoming primary group into the window the user is looking at.
+        var outgoing = hosts.filter { $0.workspaceId == outgoingId }
+        if let keyWindow = NSApp.keyWindow ?? NSApp.mainWindow,
+           let keyIndex = outgoing.firstIndex(where: { $0.window === keyWindow }),
+           keyIndex != 0 {
+            outgoing.swapAt(0, keyIndex)
+        }
+        let incoming = hosts.filter { $0.workspaceId == id }
+        if !incoming.isEmpty {
+            swapTabSets(incoming: incoming, outgoing: outgoing, fade: fade)
+        } else {
+            // Resurrect path: no live tabs for this workspace exist — journal
+            // rows become fresh tab models in fresh hosts; the primary host
+            // adopts the outgoing key frame so the switch still presents in
+            // place. The outgoing hosts hide whole (plain windows — nothing
+            // dissolves; their tabs, order, and selection stay first-class).
+            let adoptFrame = outgoing.first?.window?.frame
+            fadeInPending = fade
             let restored = engine.store.loadState(workspaceId: id)
             if restored.isEmpty {
                 let fresh = openNewWindow(in: id)
@@ -75,36 +89,12 @@ extension MemtermAppDelegate {
             } else {
                 restoreWindows(restored, workspaceId: id, adoptingFrame: adoptFrame)
             }
-        }
-        fadeInPending = false
-        if fade {
-            // Crossfade (founder: the hard cut read un-macOS): incoming windows
-            // rise from alpha 0 over the still-visible outgoing ones; the
-            // outgoing are ordered out only after the fade, alphas restored
-            // while hidden. orderOut fires no delegate events, so nothing
-            // here needs the isSwitchingWorkspaces guard once the fade ends.
-            let incoming = hosts.filter { $0.workspaceId == id }.compactMap(\.window)
-            let outgoing = hosts.filter { $0.workspaceId == outgoingId }.compactMap(\.window)
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.16
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                incoming.forEach { $0.animator().alphaValue = 1 }
-                outgoing.forEach { $0.animator().alphaValue = 0 }
-            }, completionHandler: { [weak self] in
-                guard let self else { return }
-                // Re-switch during the fade: leave whatever is now active alone.
-                if self.activeWorkspaceId != outgoingId {
-                    self.hideWindows(of: outgoingId)
-                }
-                for host in self.hosts where host.workspaceId == outgoingId {
-                    host.window?.alphaValue = 1
-                }
-            })
-        } else {
-            hideWindows(of: outgoingId)
+            fadeInPending = false
+            crossfadeInResurrected(incomingId: id, outgoingId: outgoingId,
+                                   outgoing: outgoing, fade: fade)
         }
         isSwitchingWorkspaces = false
-        // The outgoing workspace stays materialized: its windows are live
+        // The outgoing workspace stays materialized: its tabs are live
         // (hidden), so its topology keeps being captured in scope.
         materializedWorkspaceIds.insert(id)
         activeWorkspaceId = id
@@ -118,34 +108,118 @@ extension MemtermAppDelegate {
         engine.scheduleTopologySave()
     }
 
-    /// Orders out every window of `workspaceId`. Plain windows under custom
-    /// chrome: nothing dissolves — each hidden host keeps its tab order and
-    /// selection. Nothing is closed; nothing is forgotten.
-    func hideWindows(of workspaceId: String) {
-        for host in hosts where host.workspaceId == workspaceId {
-            host.window?.orderOut(nil)
+    /// The FR-59 swap: slot-matched over the two workspaces' ordered host
+    /// lists. A slot occupied on both sides swaps IN PLACE — the visible host
+    /// keeps its window and frame and swaps the incoming group into its
+    /// strip + content (in-window crossfade under the snapshot overlay); the
+    /// incoming group's former hidden host becomes the hidden holder of the
+    /// outgoing group. An incoming group beyond the overlap shows its own
+    /// host at its existing frame; an outgoing host beyond the overlap orders
+    /// out whole. Frames are trivially stable: no window ever moves.
+    private func swapTabSets(incoming: [WindowHostController],
+                             outgoing: [WindowHostController], fade: Bool) {
+        let pairs = min(incoming.count, outgoing.count)
+        for slot in 0..<pairs {
+            let visible = outgoing[slot]
+            let holder = incoming[slot]
+            let incomingTabs = holder.tabs
+            let incomingSelected = holder.selectedTab
+            let outgoingTabs = visible.tabs
+            let outgoingSelected = visible.selectedTab
+            if fade { visible.beginContentCrossfade() }
+            visible.setTabs(incomingTabs, selecting: incomingSelected)
+            holder.setTabs(outgoingTabs, selecting: outgoingSelected)
+            holder.window?.orderOut(nil)  // the holder stays (or goes) hidden
         }
+        // Incoming groups beyond the overlap: show their hosts as-is.
+        if incoming.count > outgoing.count {
+            for host in incoming[outgoing.count...] {
+                guard let window = host.window else { continue }
+                if fade { window.alphaValue = 0 }
+                window.orderFront(nil)
+            }
+        }
+        // Outgoing hosts beyond the overlap: hide whole, after the fade.
+        let extraOutgoing = outgoing.count > incoming.count
+            ? Array(outgoing[incoming.count...]) : []
+        if fade {
+            let shownExtras = incoming.count > outgoing.count
+                ? Array(incoming[outgoing.count...]) : []
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                for host in shownExtras { host.window?.animator().alphaValue = 1 }
+                for host in extraOutgoing { host.window?.animator().alphaValue = 0 }
+            }, completionHandler: { [weak self] in
+                guard let self else { return }
+                for host in extraOutgoing {
+                    // Re-switch during the fade: hide only what is still not
+                    // the active workspace's (the swap may have re-homed it).
+                    if host.workspaceId != self.activeWorkspaceId {
+                        host.window?.orderOut(nil)
+                    }
+                    host.window?.alphaValue = 1
+                }
+            })
+        } else {
+            for host in extraOutgoing { host.window?.orderOut(nil) }
+        }
+        (outgoing.first ?? incoming.first)?.window?.makeKeyAndOrderFront(nil)
     }
 
-    /// Shows the hidden live windows (hosts) of `workspaceId`. Returns false
-    /// when the workspace has no live windows (caller falls back to
-    /// resurrect). Windows keep their frames — nothing here centers,
-    /// cascades, or moves; the PRIMARY host (in-place switch, founder
-    /// decision) adopts the outgoing key window's frame.
-    @discardableResult
-    func showHiddenWindows(of workspaceId: String, adoptingFrame: NSRect? = nil) -> Bool {
-        let members = hosts.filter { $0.workspaceId == workspaceId }
-        guard !members.isEmpty else { return false }
-        if fadeInPending {
-            for member in members { member.window?.alphaValue = 0 }
+    /// Resurrect-path presentation: the freshly built hosts rise from alpha 0
+    /// (fadeInPending) over the still-visible outgoing windows, which hide
+    /// after the fade — alphas restored while hidden. orderOut fires no
+    /// delegate events, so nothing here needs the isSwitchingWorkspaces guard
+    /// once the fade ends.
+    private func crossfadeInResurrected(incomingId: String, outgoingId: String,
+                                        outgoing: [WindowHostController], fade: Bool) {
+        guard fade else {
+            for host in outgoing { host.window?.orderOut(nil) }
+            return
         }
-        let primary = members[0]
-        if let adoptingFrame {
-            primary.window?.setFrame(adoptingFrame, display: false)
-        }
-        for member in members { member.window?.orderFront(nil) }
-        primary.window?.makeKeyAndOrderFront(nil)
-        return true
+        let incomingWindows = hosts.filter { $0.workspaceId == incomingId }
+            .compactMap(\.window)
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            incomingWindows.forEach { $0.animator().alphaValue = 1 }
+            outgoing.forEach { $0.window?.animator().alphaValue = 0 }
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            for host in outgoing {
+                // Re-switch during the fade: leave the now-active alone.
+                if host.workspaceId != self.activeWorkspaceId {
+                    host.window?.orderOut(nil)
+                }
+                host.window?.alphaValue = 1
+            }
+        })
+    }
+
+    /// Founder (stage 2): closing the LAST tab of a non-Default workspace
+    /// removes the now-empty workspace outright — its rows, scrollback, and
+    /// chip all go; Default persists forever. Called from the tab teardown
+    /// path for USER closes only — quit, park, forget, and a shell dying on
+    /// its own never auto-remove (FR-56: memory follows intent, and only a
+    /// gesture is intent). The last remaining workspace also persists (the
+    /// app always has one).
+    func workspaceEmptiedByUserClose(_ workspaceId: String) {
+        guard workspaceId != StateStore.defaultWorkspaceId,
+              let engine = memory,
+              !controllers.contains(where: { $0.workspaceId == workspaceId }),
+              engine.store.listWorkspaces().contains(where: { $0.id == workspaceId }),
+              engine.store.listWorkspaces().count > 1 else { return }
+        engine.store.forgetWorkspace(workspaceId, scrollbackDir: engine.scrollbackDir,
+                                     historyDir: engine.historyDir)
+        materializedWorkspaceIds.remove(workspaceId)
+        workspaceMRU.removeAll { $0 == workspaceId }
+        workspaceActivityForgotten(workspaceId)
+        // activeWorkspaceId may still name the removed workspace for a
+        // moment: the deferred MRU surfacing (activeWorkspaceWindowClosed)
+        // switches away, and the launch path's active-workspace fallback
+        // covers a quit in between.
+        rebuildWorkspaceMenu()
     }
 
     /// Park = capture, close the windows, keep every journal row (FR-51).
@@ -171,7 +245,6 @@ extension MemtermAppDelegate {
             isSwitchingWorkspaces = false
             materializedWorkspaceIds.remove(id)
         }
-        hiddenLayouts.removeValue(forKey: id)
         engine.store.setWorkspaceParked(id, parked: true)
         rebuildWorkspaceMenu()
     }
@@ -193,7 +266,6 @@ extension MemtermAppDelegate {
             for controller in controllers.filter({ $0.workspaceId == id }) { controller.close() }
             isSwitchingWorkspaces = false
         }
-        hiddenLayouts.removeValue(forKey: id)
         engine.store.forgetWorkspace(id, scrollbackDir: engine.scrollbackDir,
                                      historyDir: engine.historyDir)
         engine.store.barrier()

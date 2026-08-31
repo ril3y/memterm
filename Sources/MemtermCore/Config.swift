@@ -37,9 +37,10 @@ public struct Config {
     /// by default (the founder wants to SEE workspaces); `workspace_bar =
     /// false` hides it.
     public var workspaceBar = true
-    /// Founder UX (FR-59 stage): single-tab windows show the tab bar too, so
-    /// the tab (and double-click rename) is always reachable. `false` restores
-    /// the macOS default of hiding the bar until a second tab exists.
+    /// DEPRECATED NO-OP (custom-tab-chrome stage 2): memterm's own tab strip
+    /// is the window's titlebar surface and is always visible — collapsing it
+    /// would orphan titles, rename, drag, and activity. The key stays parsed
+    /// (and written back) so existing config files round-trip without noise.
     public var alwaysShowTabBar = true
     public var scrollbackLines = 10_000
     public var shell: String?
@@ -252,7 +253,7 @@ public struct Config {
         lines.append("font_size = \(fontSize == fontSize.rounded() ? String(Int(fontSize)) : String(fontSize))")
         lines.append("copy_on_select = \(copyOnSelect)")
         lines.append("workspace_bar = \(workspaceBar)")
-        lines.append("always_show_tab_bar = \(alwaysShowTabBar)  # show the tab bar even with one tab")
+        lines.append("always_show_tab_bar = \(alwaysShowTabBar)  # no-op: memterm's tab strip is always visible")
         lines.append("scrollback_lines = \(scrollbackLines)")
         if let shell {
             lines.append("shell = \"\(shell)\"")
@@ -316,8 +317,8 @@ public struct Config {
         # The workspace bar (chips under the tab bar). false hides it.
         # workspace_bar = true
 
-        # Show the tab bar even when a window has a single tab, so the tab
-        # (and double-click rename) is always reachable.
+        # No-op (kept for old config files): memterm draws its own tab strip
+        # and it is always visible.
         # always_show_tab_bar = true
 
         # scrollback_lines = 10000
