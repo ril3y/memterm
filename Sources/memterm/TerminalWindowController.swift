@@ -690,7 +690,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             // an actual change (applyTheme runs on every Settings tweak).
             let spacing = CGFloat(config.lineSpacing)
             if pane.lineSpacing != spacing { pane.lineSpacing = spacing }
-            if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
+            // A cleared palette (Use Default Colors) must push SwiftTerm's
+            // defaults back, or panes keep the previous preset's 16 ANSI
+            // colors until relaunch — the exact stale-color half-apply the
+            // "explicit defaults" contract above forbids.
+            pane.installColors(config.terminalAnsiColors ?? SwiftTerm.Color.defaultInstalledColors)
             pane.needsDisplay = true
         }
     }

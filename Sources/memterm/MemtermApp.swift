@@ -411,10 +411,14 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// The user switched to `workspaceId`: its output is seen, the mark clears.
+    /// Repaint-and-reschedule (NOT a bare cancel): the one pending work item
+    /// may be ANOTHER workspace's active→unseen decay flip — dropping it
+    /// would leave that chip pulsing forever while its tracker sits on
+    /// .unseen. refreshWorkspaceActivity cancels, repaints every chip, and
+    /// re-arms the earliest remaining decay.
     func workspaceActivitySeen(_ workspaceId: String) {
         workspaceActivity.recordSwitched(to: workspaceId)
-        workspaceActivityWork?.cancel()
-        workspaceActivityWork = nil
+        refreshWorkspaceActivity()
     }
 
     func workspaceActivityForgotten(_ workspaceId: String) {
