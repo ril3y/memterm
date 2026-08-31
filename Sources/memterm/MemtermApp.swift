@@ -447,6 +447,41 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             if stillFullScreen || !barOK {
                 print("UIPROBE-FAIL fullscreen round-trip wedged the accessory"); exit(1)
             }
+        }
+        // Close-pane leg (founder bug 2026-08-31: split down, close the bottom
+        // pane → the whole tab blanked): reproduce exactly and assert the tab
+        // survives with one visible pane and a live shell.
+        var closeProbePane: PaneView?
+        var closeProbeController: TerminalWindowController?
+        DispatchQueue.main.asyncAfter(deadline: .now() + 13.9) {
+            guard let controller = self.keyController() else {
+                print("UIPROBE-FAIL no controller (close-pane leg)"); exit(1)
+            }
+            closeProbeController = controller
+            let before = controller.allPanes()
+            controller.splitCurrentPane(vertical: false)
+            let after = controller.allPanes()
+            closeProbePane = after.first { pane in !before.contains { $0 === pane } }
+            if after.count != before.count + 1 || closeProbePane == nil {
+                print("UIPROBE-FAIL split for close-pane leg (before=\(before.count) after=\(after.count))")
+                exit(1)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 14.5) {
+            guard let controller = closeProbeController, let pane = closeProbePane else {
+                print("UIPROBE-FAIL close-pane setup lost"); exit(1)
+            }
+            let windowBefore = controller.window
+            controller.close(pane: pane)
+            let panes = controller.allPanes()
+            let frame = panes.first?.frame ?? .zero
+            let windowAlive = controller.window != nil && controller.window === windowBefore
+                && self.controllers.contains { $0 === controller }
+            let shellAlive = panes.first?.process.running ?? false
+            print("UIPROBE-CLOSEPANE window_alive=\(windowAlive) panes=\(panes.count) frame=\(Int(frame.width))x\(Int(frame.height)) shell_alive=\(shellAlive)")
+            if !windowAlive || panes.count != 1 || frame.width < 50 || frame.height < 50 || !shellAlive {
+                print("UIPROBE-FAIL close-pane blanked the tab"); exit(1)
+            }
             exit(0)
         }
     }

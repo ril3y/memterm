@@ -681,9 +681,17 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
             remaining.removeFromSuperview()
             remaining.frame = split.frame
             replace(split, with: remaining)
+            // Founder bug 2026-08-31 ("closed both", tab looked blank): after
+            // the view swap, force layout + repaint of the survivor — a
+            // structurally-correct pane that never redraws looks exactly like
+            // a closed one.
+            remaining.needsLayout = true
+            remaining.needsDisplay = true
         }
+        window?.contentView?.needsLayout = true
         if let next = allPanes().first {
             window?.makeFirstResponder(next)
+            next.needsDisplay = true
         }
         app.memory?.scheduleTopologySave()
     }
@@ -793,6 +801,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
     }
 
     private func refreshTitle() {
+        defer { updateTabColorDot() }  // the color pill wraps the live title
         if let customTitle {
             window?.title = customTitle
             return
@@ -812,14 +821,30 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, Loca
 
     /// Double-click on the tab (FR: founder request 2026-08-31). Empty input
     /// clears the custom name and automatic titles resume.
+    /// Founder (screenshot, 2026-08-31): the tab color reads as a PILL behind
+    /// the tab's title, not a dot. The native tab bar is private AppKit, so
+    /// the whole-tab tint iTerm2 draws (custom chrome) isn't reachable; the
+    /// public-API equivalent is NSWindowTab.attributedTitle with a colored
+    /// background behind padded title text — visually the pill in the
+    /// founder's screenshot. Text flips black/white by luminance.
     private func updateTabColorDot() {
-        if let tabColor {
-            tabColorDot.layer?.backgroundColor =
-                MemtermAppDelegate.nsColor(hex: tabColor).cgColor
-            tabColorDot.isHidden = false
-        } else {
-            tabColorDot.isHidden = true
+        tabColorDot.isHidden = true  // superseded by the pill
+        guard let window else { return }
+        guard let tabColor else {
+            window.tab.attributedTitle = nil
+            return
         }
+        let color = MemtermAppDelegate.nsColor(hex: tabColor)
+        let srgb = color.usingColorSpace(.sRGB) ?? color
+        let luminance = 0.299 * srgb.redComponent + 0.587 * srgb.greenComponent
+            + 0.114 * srgb.blueComponent
+        window.tab.attributedTitle = NSAttributedString(
+            string: "  \(window.title)  ",
+            attributes: [
+                .backgroundColor: color,
+                .foregroundColor: luminance > 0.55 ? NSColor.black : NSColor.white,
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            ])
     }
 
     @objc func ctxSetTabColor(_ sender: NSMenuItem) {
