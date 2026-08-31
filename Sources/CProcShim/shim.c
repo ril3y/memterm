@@ -1,8 +1,11 @@
 #include "cprocshim.h"
 
+#include <IOKit/serial/ioss.h>
 #include <libproc.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/proc_info.h>
+#include <termios.h>
 
 int memterm_pid_cwd(pid_t pid, char *buf, size_t bufsize) {
     struct proc_vnodepathinfo vpi;
@@ -25,4 +28,9 @@ int64_t memterm_pid_start_time(pid_t pid) {
         return -1;
     }
     return (int64_t)info.pbi_start_tvsec * 1000000 + (int64_t)info.pbi_start_tvusec;
+}
+
+int memterm_set_arbitrary_baud(int fd, unsigned long speed) {
+    speed_t s = (speed_t)speed;
+    return ioctl(fd, IOSSIOSPEED, &s);
 }

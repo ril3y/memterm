@@ -19,6 +19,7 @@ let package = Package(
         // AppKit-free so it is testable headlessly.
         .target(
             name: "MemtermCore",
+            dependencies: ["CProcShim"],
             path: "Sources/MemtermCore"
         ),
         .executableTarget(
