@@ -443,7 +443,26 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         }
     }
 
+    /// MEMTERM_UI_PROBE diagnostics: the rename-commit focus handoff is the
+    /// probe's flakiest contract — log every step of end-editing so a failed
+    /// run says WHERE the handoff died (never fired / guard bailed / AppKit
+    /// refused the responder change).
+    private static let probeLogging =
+        ProcessInfo.processInfo.environment["MEMTERM_UI_PROBE"] == "1"
+
+    private func probeLog(_ message: @autoclosure () -> String) {
+        if Self.probeLogging { print("UIPROBE-RENAME-TRACE \(message())") }
+    }
+
+    /// Single-line responder name for the trace (NSTextView's description is
+    /// multi-line and would shred the probe log).
+    private static func describeResponder(_ responder: NSResponder?) -> String {
+        guard let responder else { return "nil" }
+        return "\(type(of: responder))(\(Unmanaged.passUnretained(responder).toOpaque()))"
+    }
+
     func controlTextDidEndEditing(_ obj: Notification) {
+        probeLog("endEditing fired editor=\(editor != nil) fr=\(Self.describeResponder(window?.firstResponder))")
         guard let field = editor else { return }
         let newName = field.stringValue.trimmingCharacters(in: .whitespaces)
         field.removeFromSuperview()
@@ -463,13 +482,21 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         // that click wins; its field editor has a different delegate).
         let dyingField = field
         DispatchQueue.main.async { [weak self] in
-            guard let self, let window = self.window,
+            guard let self else { return }
+            guard let window = self.window,
                   let host = window.delegate as? WindowHostController,
-                  let pane = host.selectedTab?.currentPane() else { return }
+                  let pane = host.selectedTab?.currentPane() else {
+                self.probeLog("handoff bailed window=\(self.window != nil) host=\((self.window?.delegate as? WindowHostController) != nil)")
+                return
+            }
             let fr = window.firstResponder
             let orphanEditor = (fr as? NSTextView)?.delegate as? NSTextField === dyingField
-            guard fr === window || fr == nil || orphanEditor else { return }
-            window.makeFirstResponder(pane)
+            guard fr === window || fr == nil || orphanEditor else {
+                self.probeLog("handoff skipped: fr already claimed by \(Self.describeResponder(fr))")
+                return
+            }
+            let accepted = window.makeFirstResponder(pane)
+            self.probeLog("handoff makeFirstResponder(pane)=\(accepted) fr_now=\(Self.describeResponder(window.firstResponder))")
         }
     }
 }

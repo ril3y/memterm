@@ -662,6 +662,31 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         return result
     }
 
+    /// MEMTERM_UI_PROBE diagnostics: one-line-per-node dump of the pane tree
+    /// (type, frame, hidden, window attachment) — the close-pane leg prints
+    /// it so a "blanked tab" failure shows the surviving hierarchy.
+    func probeTreeDump() -> String {
+        var lines: [String] = []
+        func walk(_ view: NSView, depth: Int) {
+            let indent = String(repeating: "  ", count: depth)
+            let kind: String
+            if let pane = view as? PaneView {
+                kind = "pane(\(pane.paneId.prefix(8)))"
+            } else if let split = view as? NSSplitView {
+                kind = "split(\(split.isVertical ? "v" : "h") arranged=\(split.arrangedSubviews.count))"
+            } else {
+                kind = String(describing: type(of: view))
+            }
+            let f = view.frame
+            lines.append("\(indent)\(kind) frame=\(Int(f.origin.x)),\(Int(f.origin.y)),\(Int(f.width))x\(Int(f.height)) hidden=\(view.isHidden) inWindow=\(view.window != nil)")
+            for sub in view.subviews where sub is PaneView || sub is NSSplitView {
+                walk(sub, depth: depth + 1)
+            }
+        }
+        walk(paneRoot, depth: 0)
+        return lines.joined(separator: "\n")
+    }
+
     func currentPane() -> PaneView? {
         if let pane = window?.firstResponder as? PaneView,
            allPanes().contains(where: { $0 === pane }) { return pane }

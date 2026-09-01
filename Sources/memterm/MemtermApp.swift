@@ -192,6 +192,13 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             let visible = host.isTabStripVisible
             let regionHeight = host.tabStripFrameInWindow()?.height ?? 0
             print("UIPROBE-SINGLE tab_bar_visible=\(visible) strip_region_h=\(Int(regionHeight))")
+            // Restore-path diagnostics: the selected tab's pane tree as first
+            // presented — a restored split whose second pane is already
+            // zero-sized here collapsed during restore, not during any later
+            // leg's gesture.
+            if let tab = host.selectedTab {
+                print("UIPROBE-TREE at_launch:\n\(tab.probeTreeDump())")
+            }
             if !visible || regionHeight <= 0 {
                 print("UIPROBE-FAIL single-tab tab strip not reachable"); exit(1)
             }
@@ -213,6 +220,12 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             print("UIPROBE tabs_in_strip=\(host.tabStrip.probeTabIds().count) strip_visible=\(host.isTabStripVisible)")
             print("UIPROBE chips=\(bar?.chipTitlesForProbe() ?? [])")
             if host.tabStrip.probeTabIds().count != 2 || !host.isTabStripVisible {
+                // Which side is wrong: the strip's item list, the host's tab
+                // list, or the second tab landing on a different host?
+                print("UIPROBE-TABS-DEBUG strip_ids=\(host.tabStrip.probeTabIds()) host_tabs=\(host.tabs.map(\.tabId))")
+                for (i, h) in self.hosts.enumerated() {
+                    print("UIPROBE-TABS-DEBUG host[\(i)] ws=\(h.workspaceId ?? "nil") tabs=\(h.tabs.map(\.tabId)) visible=\(h.window?.isVisible == true) isKeyHostPick=\(h === host)")
+                }
                 print("UIPROBE-FAIL both tabs must render in the strip"); exit(1)
             }
             // Founder: "workspaces should be on top then tabs below it" — the
@@ -431,8 +444,17 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             print("UIPROBE-RENAME focus_back_to_pane=\(focusBack)")
             if !focusBack {
                 print("UIPROBE-RENAME-DEBUG fr=\(String(describing: renameHost?.window?.firstResponder)) window=\(String(describing: renameHost?.window)) isWindow=\(renameHost?.window?.firstResponder === renameHost?.window) selected=\(String(describing: renameHost?.selectedTab?.displayTitle)) pane=\(String(describing: renameHost?.selectedTab?.currentPane()))")
-                print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
-                exit(1)
+                // Timing-vs-stuck discriminator: re-check once after a settle
+                // delay before failing. A pass here means the handoff is real
+                // but slow (the leg raced it); a second miss means the focus
+                // is genuinely stranded.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    let settled = renameHost?.window?.firstResponder is PaneView
+                    print("UIPROBE-RENAME recheck_after_settle=\(settled) fr=\(String(describing: renameHost?.window?.firstResponder))")
+                    print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
+                    exit(1)
+                }
+                return
             }
         }
         // Esc-cancel leg (the rename contract's other half — the known
@@ -510,6 +532,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             }
             closeProbeController = controller
             let before = controller.allPanes()
+            print("UIPROBE-CLOSEPANE-TREE before-split:\n\(controller.probeTreeDump())")
             controller.splitCurrentPane(vertical: false)
             let after = controller.allPanes()
             closeProbePane = after.first { pane in !before.contains { $0 === pane } }
@@ -530,6 +553,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 && self.controllers.contains { $0 === controller }
             let shellAlive = panes.first?.process.running ?? false
             print("UIPROBE-CLOSEPANE window_alive=\(windowAlive) panes=\(panes.count) frame=\(Int(frame.width))x\(Int(frame.height)) shell_alive=\(shellAlive)")
+            print("UIPROBE-CLOSEPANE-TREE after-close:\n\(controller.probeTreeDump())")
             if !windowAlive || panes.count != 1 || frame.width < 50 || frame.height < 50 || !shellAlive {
                 print("UIPROBE-FAIL close-pane blanked the tab"); exit(1)
             }
