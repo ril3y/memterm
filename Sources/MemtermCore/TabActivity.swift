@@ -3,8 +3,8 @@ import Foundation
 // Founder UX stage (2026-08-31): "if stuff is happening on a tab (like text
 // scrolling) lets have the title shake a bit or show a spinner or something".
 // This is the pure state machine behind the per-tab activity indicator; the
-// AppKit face (spinner / unseen dot in the native tab via
-// NSWindowTab.accessoryView) lives in the executable target.
+// AppKit face (TabActivityIndicatorView, spinner / unseen dot inside the
+// custom tab strip's TabItemView) lives in the executable target.
 //
 // States:
 //   .active — pty output flowed within `decayInterval` on a NON-selected tab

@@ -2,7 +2,7 @@ import AppKit
 import MemtermCore
 
 // Group G (FR-49..52, FR-59): workspace runtime — switching, park/reopen,
-// forget — plus the switcher menu and the titlebar chip plumbing.
+// forget — plus the switcher menu and the Settings-gear popup plumbing.
 //
 // FR-59 (founder decision 2026-08-31): SWITCHING IS NON-DESTRUCTIVE. Every
 // pane's pty and process stays alive across a switch; switching back presents
@@ -433,8 +433,8 @@ extension MemtermAppDelegate {
         refreshWorkspaceChips()
     }
 
-    /// A fresh copy for the titlebar chip's popup (an NSMenu can't be shown
-    /// in two places at once).
+    /// A fresh copy for the Settings gear's right-click popup (an NSMenu
+    /// can't be shown in two places at once).
     func makeWorkspacePopUpMenu() -> NSMenu {
         let menu = NSMenu(title: "Workspace")
         populateWorkspaceMenu(menu)

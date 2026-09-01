@@ -132,7 +132,8 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Focus Pane Down", to: viewMenu, #selector(MemtermAppDelegate.focusPaneDown(_:)),
         down, modifiers: arrows, target: app)
 
-    // Window — standard items plus the native tab set.
+    // Window — standard items plus our tab set (all actions target the app
+    // delegate's custom-chrome tab plumbing, not NSWindow tab selectors).
     let windowMenu = submenu("Window")
     add("Minimize", to: windowMenu, #selector(NSWindow.performMiniaturize(_:)), "m")
     add("Zoom", to: windowMenu, #selector(NSWindow.performZoom(_:)), "", modifiers: [])

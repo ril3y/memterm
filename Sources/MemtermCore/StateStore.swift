@@ -100,7 +100,7 @@ public struct WindowSnap {
     public var frame: String  // "x,y,w,h"
     public var focusedTab: String?
     public var tabs: [TabSnap]
-    /// FR-49: every tab belongs to exactly one workspace; a window (native tab
+    /// FR-49: every tab belongs to exactly one workspace; a window (tab
     /// group) is homogeneous, so the workspace hangs off the window snap.
     public var workspaceId: String
 
@@ -556,7 +556,7 @@ public final class StateStore {
         }
     }
 
-    /// FR-56: a user-initiated tab close (⌘W, close button, native tab close)
+    /// FR-56: a user-initiated tab close (⌘W, the tab's close button)
     /// removes the tab's rows, its panes' rows + snapshots + scrollback and
     /// shell-history files, and any window row left with no tabs — those tabs
     /// must never restore. Quit/switch/park teardown must NOT reach this
@@ -656,6 +656,7 @@ public final class StateStore {
     // MARK: Topology
 
     /// Full rewrite: every workspace's rows are replaced by `windows`.
+    /// (Test seam: app code always uses the scoped overload below.)
     public func saveTopology(_ windows: [WindowSnap]) {
         saveTopology(windows, forWorkspaces: nil)
     }

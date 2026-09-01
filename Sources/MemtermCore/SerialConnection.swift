@@ -71,6 +71,8 @@ public final class SerialConnection {
 
     deinit { close() }
 
+    /// Test seam: tests assert open/close lifecycle; app code tracks its
+    /// own connection state.
     public var isOpen: Bool {
         lock.lock(); defer { lock.unlock() }
         return fd >= 0 && !closed

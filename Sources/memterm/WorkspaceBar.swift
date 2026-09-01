@@ -7,16 +7,13 @@ import MemtermCore
 //
 // The workspace bar: a 26 pt strip, row 1 of the custom chrome
 // (WindowHostController hosts it as a PLAIN subview above our TabStripView —
-// the custom-tab-chrome stage). History: under native tabs it lived in a
-// .top NSTitlebarAccessoryViewController (a .bottom accessory measured
-// broken — with native tabs EVERY tabbed window's bottom accessory stacked
-// into the shared titlebar at once, and AppKit forced the height to 36; and
-// the .top placement auto-hid the titlebar's window-title text). Custom
-// chrome deleted both caveats: the host passes the traffic-light clearance
-// as leadingInset (AppKit used to inset accessories ~78 pt for free) and
-// window.title stays synced on the host. All workspaces render as chips
-// (color dot + name): the active one visually distinct, parked ones dimmed
-// with "(parked)", plus a "+" to create one.
+// the custom-tab-chrome stage; the titlebar-accessory homes of earlier
+// stages, and their height/stacking caveats, are gone). Because the bar is
+// plain chrome now, the host passes the traffic-light clearance as
+// leadingInset (AppKit no longer insets it for free) and window.title stays
+// synced on the host. All workspaces render as chips (color dot + name):
+// the active one visually distinct, parked ones dimmed with "(parked)",
+// plus a "+" to create one.
 //
 //   click a chip           = switch to it (reopens if parked)
 //   click the ACTIVE chip  = inline rename (label swaps for a text field —
@@ -24,8 +21,8 @@ import MemtermCore
 //   right-click a chip     = that workspace's menu (Rename, Color, Park/
 //                            Reopen, Delete…)
 //
-// The bar is additive: the old titlebar chip, ⌃⌘n keys, and the Shell menu
-// all keep working. Always visible; `workspace_bar = false` hides it.
+// The bar is additive: the gear's workspace popup, ⌃⌘n keys, and the Shell
+// menu all keep working. Always visible; `workspace_bar = false` hides it.
 
 final class WorkspaceBarView: NSVisualEffectView {
     static let height: CGFloat = 26
@@ -96,7 +93,7 @@ final class WorkspaceBarView: NSVisualEffectView {
         separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
     }
 
-    /// Titlebar-accessory placement: empty bar space IS titlebar — dragging
+    /// Chrome-row placement: empty bar space acts as titlebar — dragging
     /// the window by it must keep working (chips opt out; they handle clicks).
     override var mouseDownCanMoveWindow: Bool { true }
 
@@ -370,9 +367,9 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
 
     // MARK: - Mouse
 
-    /// In the titlebar accessory, a chip click must be a click (switch /
-    /// rename), never the start of a window drag — the bar's background keeps
-    /// the drag affordance instead.
+    /// In the chrome row, a chip click must be a click (switch / rename),
+    /// never the start of a window drag — the bar's background keeps the
+    /// drag affordance instead.
     override var mouseDownCanMoveWindow: Bool { false }
 
     /// The whole chip is one click target: the label must never swallow
