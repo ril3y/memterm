@@ -68,7 +68,7 @@ Semantics:
 - **Sentinel protocol — a partial run can NEVER read green:**
   - `ProbeRunner.run()` prints the manifest first: `UIPROBE-BEGIN steps=<N> build=<stamp> mode=<mode> statedir=<dir>`.
   - Success prints exactly `UIPROBE-PASS steps=N/N` then `exit(0)`.
-  - An `atexit` handler installed at probe start prints `UIPROBE-ABORT completed=i/N` if the process exits by any other path (crash-safe teardown, last-window-close, terminate).
+  - An `atexit` handler installed at probe start prints `UIPROBE-ABORT completed=i/N in_flight=<step>` if the process exits by any other path (crash-safe teardown, last-window-close, terminate) — naming the leg the run died in.
   - In probe/smoke modes `applicationShouldTerminateAfterLastWindowClosed` returns `false` — a mid-run empty app is a FAIL, not a clean quit.
   - **The runner (verify.sh) greps for the PASS sentinel with matching step counts; exit code 0 alone is never a pass.** Same protocol for smoke: `SMOKE-PASS run=save|verify steps=N/N`.
 - `MEMTERM_UI_PROBE=1` combined with `--smoke` is rejected at startup with a printed error and exit 2.
@@ -97,7 +97,7 @@ func assertChipVisible(chipFrame: CGRect, in bmp: NSBitmapImageRep, what: String
 
 Mandatory uses:
 - **At-launch geometry step (first step of every restored/observe run):** for every restored pane, `assertPaneGeometry` + `assertRendered` on a `probeBitmap` of the content view after layout settles. The old `UIPROBE-TREE at_launch` print is an assertion now. *(Catches bug 1: the 979/0 collapse fails in the first step of every restored run.)*
-- **Chip visibility** is asserted over the rendered chrome bitmap (`chip-contrast-rendered`), not layer-color equality.
+- **Chip visibility** is asserted over the rendered chrome bitmap (`chip-contrast-rendered`), not layer-color equality — and over each chip's **label text region separately** (`probeChipLabelFrames`): the meta-gate proved the whole-chip sample can be carried by the color dot / active background while the name itself is invisible.
 - **Config matrix:** verify.sh runs the probe over `{default, founder-like: opacity 0.37 + blur, workspace_bar=false, light theme, dark theme}` via `MEMTERM_CONFIG_PATH`, with chip contrast asserted per config. *(Catches bug 2.)*
 - All failure-path bitmaps (and the per-config chip-bar success shots) are archived as PNGs under `$MEMTERM_PROBE_OUT` and listed in the verify report so a human can eyeball what the gate saw.
 - Caveat, documented here so nobody "fixes" it: `cacheDisplay` sees the view's own rendering, not window-server compositing. Opacity/blur/occlusion truths need the on-screen `probeWindowImage` pass, which is why one **visible** pixel pass survives in verify.sh (§2.5).
@@ -187,6 +187,19 @@ The gate IS this script. Humans and agents run nothing else to claim green.
 | 3 — close-pane blanked a restored tab | probe step `close-pane` in `MEMTERM_PROBE_MODE=restored` (targets the restored 2-pane tab) |
 | 4 — probe false-greens | ProbeRunner sentinel protocol (`*-BEGIN`/`*-PASS steps=N/N`/`*-ABORT`), condition-driven steps, `addStateful` shared manifests, probe-never-auto-quits |
 | 5 — evidence hygiene | `BuildStamp` + `--version`-in-every-BEGIN-line · make-app.sh dirty refusal + `-dirty` stamp · verify.sh identity check + report |
+
+### 4.1 Meta-gate mutation log (calibration-set reintroductions, 2026-09-01)
+
+Each founder bug class was deliberately reintroduced on a scratch commit and the
+harness required to fail loudly, naming the leg. Any mutation that survives
+green means the overhaul failed there — the harness gets fixed and re-mutated.
+
+| Mutation (bug class) | Result |
+|---|---|
+| A — adopt the pre-layout 0x0 container unconditionally in `select()` (bug 1) | CAUGHT: `UIPROBE-FAIL step=at-launch-geometry`, tree dump shows the 979/0 collapse |
+| B — chip text alpha 0.05, dot left intact (bug 2) | **SURVIVED at first** — the dot/active-background carried the whole-chip contrast sample. Hardened: `chip-contrast-rendered` now samples each label's own region; re-mutation fails at contrast 1.41 < 1.6 naming the leg |
+| C — restored-tree close-pane never re-installs the survivor (bug 3) | CAUGHT restored-only, exactly the calibration story: fresh run 30/30 green (the old blind spot), restored run `UIPROBE-FAIL step=close-pane reason=close-pane blanked the tab` |
+| D — early clean `exit(0)` mid-leg (bug 4) | CAUGHT: exit code 0 but no PASS sentinel; `UIPROBE-ABORT` printed. Hardened: ABORT now names the in-flight leg (`in_flight=tab-tint-contrast`) |
 
 ---
 
