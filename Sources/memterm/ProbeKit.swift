@@ -130,7 +130,7 @@ final class ProbeRunner {
     private var steps: [ProbeStep] = []
     private(set) var completed = 0
     private(set) var finished = false
-    private var currentStepName = "(setup)"
+    private(set) var currentStepName = "(setup)"
     private var currentStepStarted: TimeInterval = 0
     /// App-supplied diagnostics dump (tree dumps, window list, tabs debug,
     /// screenshot) run on every failure before exit.
@@ -247,7 +247,9 @@ func installProbeAbortGuard() {
     probeAbortGuardInstalled = true
     atexit {
         if let runner = ProbeRunner.current, !runner.finished {
-            print("\(runner.prefix)-ABORT completed=\(runner.completed)/\(runner.totalSteps)")
+            // Meta-gate hardening: name the in-flight leg — an early exit's
+            // ABORT must point at WHERE the run died, not just how far it got.
+            print("\(runner.prefix)-ABORT completed=\(runner.completed)/\(runner.totalSteps) in_flight=\(runner.currentStepName)")
             fflush(stdout)
         }
     }
