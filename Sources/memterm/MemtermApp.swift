@@ -179,36 +179,131 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["MEMTERM_UI_PROBE"] == "1" { runUIProbe() }
     }
 
+    /// MEMTERM_UI_PROBE sequencer. The probe used to be a cascade of fixed
+    /// asyncAfter deadlines racing real work — under machine load a leg could
+    /// sample its assertion BEFORE the (correct) behavior it awaited had run
+    /// (probe-reproduced: the rename-commit focus handoff landed in the pane
+    /// in 18/18 "failures", just after the leg's fixed clock tick). Steps now
+    /// run in ORDER — each a fixed gap after the previous step finished — and
+    /// `settle` steps poll for the condition they assert (50 ms cadence,
+    /// bounded timeout) instead of sampling a clock tick. A timeout still
+    /// fails the run loudly, so a genuinely stuck behavior is never papered
+    /// over — only correct-but-slow work stops flaking.
+    private final class ProbeRunner {
+        private enum Step {
+            case run(gap: TimeInterval, body: () -> Void)
+            case wait(label: String, timeout: TimeInterval, gap: TimeInterval,
+                      condition: () -> Bool, onTimeout: () -> Void)
+        }
+        private var steps: [Step] = []
+        private var index = 0
+
+        func step(after gap: TimeInterval = 0.3, _ body: @escaping () -> Void) {
+            steps.append(.run(gap: gap, body: body))
+        }
+
+        /// Waits (bounded) for `condition`, then proceeds. On timeout,
+        /// `onTimeout` runs first for leg-specific diagnostics/messages (it
+        /// normally exits); if it returns, a generic UIPROBE-FAIL fires.
+        func settle(_ label: String, timeout: TimeInterval = 5.0,
+                    after gap: TimeInterval = 0.1,
+                    onTimeout: @escaping () -> Void = {},
+                    until condition: @escaping () -> Bool) {
+            steps.append(.wait(label: label, timeout: timeout, gap: gap,
+                               condition: condition, onTimeout: onTimeout))
+        }
+
+        func start() { advance() }
+
+        private func advance() {
+            guard index < steps.count else { return }
+            let step = steps[index]
+            index += 1
+            switch step {
+            case .run(let gap, let body):
+                DispatchQueue.main.asyncAfter(deadline: .now() + gap) {
+                    body()
+                    self.advance()
+                }
+            case .wait(let label, let timeout, let gap, let condition, let onTimeout):
+                let deadline = ProcessInfo.processInfo.systemUptime + gap + timeout
+                func poll() {
+                    if condition() { self.advance(); return }
+                    if ProcessInfo.processInfo.systemUptime >= deadline {
+                        onTimeout()
+                        print("UIPROBE-FAIL timeout waiting for \(label)")
+                        exit(1)
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05,
+                                                  execute: poll)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + gap, execute: poll)
+            }
+        }
+    }
+
     private func runUIProbe() {
+        let probe = ProbeRunner()
+
         // Single-tab leg: before the second tab exists, OUR tab strip row
         // must already be visible (its height non-empty), or double-click
         // rename / right-click menu are unreachable on a fresh window. Stage
         // 2: the strip is ALWAYS visible (always_show_tab_bar is a parsed
         // no-op now), so this leg is unconditional.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        probe.step(after: 0.5) {
             guard let host = self.keyHost(), host.window != nil else {
                 print("UIPROBE-FAIL no window (single-tab leg)"); exit(1)
             }
             let visible = host.isTabStripVisible
             let regionHeight = host.tabStripFrameInWindow()?.height ?? 0
             print("UIPROBE-SINGLE tab_bar_visible=\(visible) strip_region_h=\(Int(regionHeight))")
-            // Restore-path diagnostics: the selected tab's pane tree as first
-            // presented — a restored split whose second pane is already
-            // zero-sized here collapsed during restore, not during any later
-            // leg's gesture.
             if let tab = host.selectedTab {
                 print("UIPROBE-TREE at_launch:\n\(tab.probeTreeDump())")
             }
             if !visible || regionHeight <= 0 {
                 print("UIPROBE-FAIL single-tab tab strip not reachable"); exit(1)
             }
+            // REGRESSION LEG (restored-split collapse, fixed 2026-09-01): a
+            // restore-path select() used to squeeze the buildNode-built split
+            // tree through the not-yet-laid-out container's 0x0 bounds — every
+            // restored 2-pane tab presented with ALL width on the first pane
+            // (second pane 0-wide, permanently) before any gesture ran. Every
+            // multi-pane tab in every host must present real pane sizes at
+            // launch. Runs on the fresh path too (vacuously) — the RESTORED
+            // probe variant is what exercises it.
+            for h in self.hosts {
+                for tab in h.tabs {
+                    let panes = tab.allPanes()
+                    guard panes.count > 1 else { continue }
+                    for pane in panes
+                    where pane.frame.width < 10 || pane.frame.height < 10 {
+                        print("UIPROBE-TREE collapsed:\n\(tab.probeTreeDump())")
+                        print("UIPROBE-FAIL restored split pane collapsed to zero size at launch (pane=\(pane.paneId.prefix(8)) frame=\(Int(pane.frame.width))x\(Int(pane.frame.height)))")
+                        exit(1)
+                    }
+                }
+            }
         }
         var probeWorkspaceId: String?
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+        probe.step(after: 0.3) {
             self.newWindowForTab(nil)  // second tab in the same host
             probeWorkspaceId = self.createWorkspace(named: "Probe")
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+        probe.settle("both tabs render in the strip", onTimeout: {
+            // Which side is wrong: the strip's item list, the host's tab
+            // list, or the second tab landing on a different host?
+            if let host = self.keyHost() {
+                print("UIPROBE-TABS-DEBUG strip_ids=\(host.tabStrip.probeTabIds()) host_tabs=\(host.tabs.map(\.tabId))")
+                for (i, h) in self.hosts.enumerated() {
+                    print("UIPROBE-TABS-DEBUG host[\(i)] ws=\(h.workspaceId ?? "nil") tabs=\(h.tabs.map(\.tabId)) visible=\(h.window?.isVisible == true) isKeyHostPick=\(h === host)")
+                }
+            }
+            print("UIPROBE-FAIL both tabs must render in the strip"); exit(1)
+        }) {
+            guard let host = self.keyHost() else { return false }
+            return host.tabStrip.probeTabIds().count == 2 && host.isTabStripVisible
+        }
+        probe.step(after: 0.2) {
             guard let host = self.keyHost(), let window = host.window else {
                 print("UIPROBE-FAIL no window"); exit(1)
             }
@@ -219,15 +314,6 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             print("UIPROBE bar_frame=\(Int(barFrame.minX)),\(Int(barFrame.minY)),\(Int(barFrame.width)),\(Int(barFrame.height)) in_window=\(bar?.window === window)")
             print("UIPROBE tabs_in_strip=\(host.tabStrip.probeTabIds().count) strip_visible=\(host.isTabStripVisible)")
             print("UIPROBE chips=\(bar?.chipTitlesForProbe() ?? [])")
-            if host.tabStrip.probeTabIds().count != 2 || !host.isTabStripVisible {
-                // Which side is wrong: the strip's item list, the host's tab
-                // list, or the second tab landing on a different host?
-                print("UIPROBE-TABS-DEBUG strip_ids=\(host.tabStrip.probeTabIds()) host_tabs=\(host.tabs.map(\.tabId))")
-                for (i, h) in self.hosts.enumerated() {
-                    print("UIPROBE-TABS-DEBUG host[\(i)] ws=\(h.workspaceId ?? "nil") tabs=\(h.tabs.map(\.tabId)) visible=\(h.window?.isVisible == true) isKeyHostPick=\(h === host)")
-                }
-                print("UIPROBE-FAIL both tabs must render in the strip"); exit(1)
-            }
             // Founder: "workspaces should be on top then tabs below it" — the
             // workspace row must sit fully ABOVE the tab strip row, and the
             // two rows must not overlap.
@@ -308,32 +394,33 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // Activity-indicator leg: output lands on the FIRST tab while the
         // second (created above) is selected → active → decays to unseen →
         // clears when the tab is selected.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+        probe.step(after: 0.4) {
             self.controllers.first?.allPanes().first?.send(txt: "echo probe-activity\r")
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+        probe.step(after: 0.6) {
             print("UIPROBE-ACT after_output=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.4) {
+        probe.step(after: 1.8) {
             print("UIPROBE-ACT after_decay=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
             // Selecting the tab in its host (the strip click path) clears it.
             if let first = self.controllers.first { first.host?.select(first) }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.8) {
-            print("UIPROBE-ACT after_select=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
-            // Keyboard contract: after a tab switch (host.select), the first
-            // responder is a pane OF THE SELECTED TAB — keystrokes land in
-            // the visible pane.
-            guard let host = self.keyHost(), let tab = host.selectedTab else {
-                print("UIPROBE-FAIL no selected tab (focus-after-select)"); exit(1)
-            }
+        // Keyboard contract: after a tab switch (host.select), the first
+        // responder is a pane OF THE SELECTED TAB — keystrokes land in
+        // the visible pane.
+        probe.settle("focus lands in the selected tab's pane after tab switch",
+                     timeout: 3.0, after: 0.3, onTimeout: {
+            print("UIPROBE-FOCUS after_tab_select=false")
+            print("UIPROBE-FAIL keystrokes would not land in the selected tab's pane after tab switch")
+            exit(1)
+        }) {
+            guard let host = self.keyHost(), let tab = host.selectedTab else { return false }
             let fr = host.window?.firstResponder as? PaneView
-            let focusOK = fr != nil && tab.allPanes().contains { $0 === fr }
-            print("UIPROBE-FOCUS after_tab_select=\(focusOK)")
-            if !focusOK {
-                print("UIPROBE-FAIL keystrokes would not land in the selected tab's pane after tab switch")
-                exit(1)
-            }
+            return fr != nil && tab.allPanes().contains { $0 === fr }
+        }
+        probe.step(after: 0.1) {
+            print("UIPROBE-ACT after_select=\(self.controllers.first.map { $0.activityStateForProbe() } ?? .idle)")
+            print("UIPROBE-FOCUS after_tab_select=true")
         }
         // Workspace-activity leg (founder: hidden workspaces show output):
         // switch to the Probe workspace (Default's windows hide, shells stay
@@ -342,39 +429,44 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         let defaultId = StateStore.defaultWorkspaceId
         var preSwitchHostIds = Set<ObjectIdentifier>()
         var preSwitchVisibleWindow: NSWindow?
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
-            guard let probe = probeWorkspaceId else {
+        probe.step(after: 0.2) {
+            guard let probeWs = probeWorkspaceId else {
                 print("UIPROBE-FAIL no Probe workspace"); exit(1)
             }
-            self.switchToWorkspace(probe)
+            self.switchToWorkspace(probeWs)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.4) {
+        probe.step(after: 0.4) {
             guard self.activeWorkspaceId != defaultId,
                   let hidden = self.controllers.first(where: { $0.workspaceId == defaultId })
             else { print("UIPROBE-FAIL default workspace not hidden"); exit(1) }
             hidden.allPanes().first?.send(txt: "echo ws-activity\r")
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
-            let state = self.workspaceActivityState(of: defaultId)
-            print("UIPROBE-WSACT after_output=\(state)")
-            if state == .idle {
-                print("UIPROBE-FAIL hidden workspace output did not mark its chip"); exit(1)
-            }
+        probe.settle("hidden workspace output marks its chip", onTimeout: {
+            print("UIPROBE-WSACT after_output=\(self.workspaceActivityState(of: defaultId))")
+            print("UIPROBE-FAIL hidden workspace output did not mark its chip"); exit(1)
+        }) {
+            self.workspaceActivityState(of: defaultId) != .idle
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 7.8) {
-            let state = self.workspaceActivityState(of: defaultId)
-            print("UIPROBE-WSACT after_decay=\(state)")
-            if state != .unseen {
-                print("UIPROBE-FAIL expected unseen after decay, got \(state)"); exit(1)
-            }
-            // The rendered chip must agree with the state machine.
+        probe.step(after: 0.1) {
+            print("UIPROBE-WSACT after_output=\(self.workspaceActivityState(of: defaultId))")
+        }
+        // The mark must decay to the unseen ring, and the RENDERED chip must
+        // agree with the state machine.
+        probe.settle("workspace activity decays to unseen (chip agreeing)",
+                     timeout: 8.0, onTimeout: {
             let chip = self.hosts
                 .first { $0.workspaceId == self.activeWorkspaceId }?
                 .workspaceBar?.chipActivityForProbe(workspaceId: defaultId)
-            print("UIPROBE-WSACT chip_state=\(chip.map(String.init(describing:)) ?? "nil")")
-            if chip != .unseen {
-                print("UIPROBE-FAIL chip does not show the unseen ring"); exit(1)
-            }
+            print("UIPROBE-WSACT after_decay=\(self.workspaceActivityState(of: defaultId)) chip_state=\(chip.map(String.init(describing:)) ?? "nil")")
+            print("UIPROBE-FAIL expected unseen after decay (state + rendered chip)"); exit(1)
+        }) {
+            let chip = self.hosts
+                .first { $0.workspaceId == self.activeWorkspaceId }?
+                .workspaceBar?.chipActivityForProbe(workspaceId: defaultId)
+            return self.workspaceActivityState(of: defaultId) == .unseen && chip == .unseen
+        }
+        probe.step(after: 0.1) {
+            print("UIPROBE-WSACT after_decay=unseen chip_state=unseen")
             // FR-59 swap invariants: record host + visible-window identity so
             // the switch-back can prove no window was created or destroyed
             // and the user keeps looking at the SAME window object.
@@ -383,7 +475,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 .first { $0.window?.isVisible == true }?.window
             self.switchToWorkspace(defaultId)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.2) {
+        probe.step(after: 0.4) {
             let state = self.workspaceActivityState(of: defaultId)
             print("UIPROBE-WSACT after_switch=\(state)")
             if state != .idle {
@@ -419,9 +511,13 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // end editing) must hand the first responder back to the pane — the
         // exact contract the titlebar-accessory placement needed. The host is
         // captured per leg (not re-resolved via keyHost) so key-window churn
-        // under load can't misdirect the assertions.
+        // under load can't misdirect the assertions. The focus-back check
+        // SETTLES: the chip's end-editing handoff runs via a main-queue async
+        // hop, which under load lands after any fixed clock tick (diagnosed
+        // 2026-09-01: makeFirstResponder(pane)=true in every "failing" run —
+        // the old fixed 0.4 s deadline raced behavior that was correct).
         var renameHost: WindowHostController?
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.5) {
+        probe.step(after: 0.3) {
             guard self.config.workspaceBar else {
                 print("UIPROBE-RENAME skipped (workspace_bar=false)"); return
             }
@@ -438,29 +534,23 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             }
             host.window?.makeFirstResponder(nil)  // commit via end-editing
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.9) {
+        probe.settle("rename commit hands focus back to the pane", onTimeout: {
+            print("UIPROBE-RENAME focus_back_to_pane=false")
+            print("UIPROBE-RENAME-DEBUG fr=\(String(describing: renameHost?.window?.firstResponder)) window=\(String(describing: renameHost?.window)) isWindow=\(renameHost?.window?.firstResponder === renameHost?.window) selected=\(String(describing: renameHost?.selectedTab?.displayTitle)) pane=\(String(describing: renameHost?.selectedTab?.currentPane()))")
+            print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
+            exit(1)
+        }) {
+            !self.config.workspaceBar
+                || (renameHost?.window?.firstResponder is PaneView)
+        }
+        probe.step(after: 0.1) {
             guard self.config.workspaceBar else { return }
-            let focusBack = renameHost?.window?.firstResponder is PaneView
-            print("UIPROBE-RENAME focus_back_to_pane=\(focusBack)")
-            if !focusBack {
-                print("UIPROBE-RENAME-DEBUG fr=\(String(describing: renameHost?.window?.firstResponder)) window=\(String(describing: renameHost?.window)) isWindow=\(renameHost?.window?.firstResponder === renameHost?.window) selected=\(String(describing: renameHost?.selectedTab?.displayTitle)) pane=\(String(describing: renameHost?.selectedTab?.currentPane()))")
-                // Timing-vs-stuck discriminator: re-check once after a settle
-                // delay before failing. A pass here means the handoff is real
-                // but slow (the leg raced it); a second miss means the focus
-                // is genuinely stranded.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    let settled = renameHost?.window?.firstResponder is PaneView
-                    print("UIPROBE-RENAME recheck_after_settle=\(settled) fr=\(String(describing: renameHost?.window?.firstResponder))")
-                    print("UIPROBE-FAIL rename commit did not hand focus back to the pane")
-                    exit(1)
-                }
-                return
-            }
+            print("UIPROBE-RENAME focus_back_to_pane=true")
         }
         // Esc-cancel leg (the rename contract's other half — the known
         // regression class): type a replacement name, press Esc — the store
         // must keep the old name and the keyboard must return to the pane.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 9.2) {
+        probe.step(after: 0.3) {
             guard self.config.workspaceBar else {
                 print("UIPROBE-ESC skipped (workspace_bar=false)"); return
             }
@@ -479,59 +569,79 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             // the chip's control(_:textView:doCommandBy:) — the real key path.
             editor.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 9.6) {
+        probe.settle("Esc returns the keyboard to the pane", onTimeout: {
+            print("UIPROBE-ESC focus_back_to_pane=false fr=\(String(describing: renameHost?.window?.firstResponder))")
+            print("UIPROBE-FAIL Esc did not cancel the rename cleanly"); exit(1)
+        }) {
+            !self.config.workspaceBar
+                || (renameHost?.window?.firstResponder is PaneView)
+        }
+        probe.step(after: 0.1) {
             guard self.config.workspaceBar else { return }
             let names = self.memory?.store.listWorkspaces().map { $0.name } ?? []
             let cancelled = !names.contains("Garbage-Name")
-            let focusBack = renameHost?.window?.firstResponder is PaneView
-            print("UIPROBE-ESC cancelled=\(cancelled) focus_back_to_pane=\(focusBack) names=\(names) fr=\(String(describing: renameHost?.window?.firstResponder))")
-            if !cancelled || !focusBack {
+            print("UIPROBE-ESC cancelled=\(cancelled) focus_back_to_pane=true names=\(names)")
+            if !cancelled {
                 print("UIPROBE-FAIL Esc did not cancel the rename cleanly"); exit(1)
             }
         }
         // Fullscreen leg (custom chrome): enter/exit must not wedge the
         // chrome — after the round-trip the window is out of fullscreen and
-        // the workspace row is back above the tab strip row.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 9.9) {
+        // the workspace row is back above the tab strip row. Both transitions
+        // are OS animations, so both checks settle on the styleMask flip.
+        probe.step(after: 0.3) {
             self.keyHost()?.window?.toggleFullScreen(nil)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 11.7) {
+        probe.settle("window enters fullscreen", timeout: 8.0, onTimeout: {
+            print("UIPROBE-FS entered=false")
+            print("UIPROBE-FAIL window did not enter fullscreen"); exit(1)
+        }) {
+            self.keyHost()?.window?.styleMask.contains(.fullScreen) == true
+        }
+        probe.step(after: 0.6) {
             guard let window = self.keyHost()?.window else {
                 print("UIPROBE-FAIL no window (fullscreen leg)"); exit(1)
             }
-            let inFullScreen = window.styleMask.contains(.fullScreen)
-            print("UIPROBE-FS entered=\(inFullScreen) frame_h=\(Int(window.frame.height))")
-            if !inFullScreen {
-                print("UIPROBE-FAIL window did not enter fullscreen"); exit(1)
-            }
+            print("UIPROBE-FS entered=true frame_h=\(Int(window.frame.height))")
             window.toggleFullScreen(nil)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 13.5) {
+        probe.settle("window exits fullscreen", timeout: 8.0, onTimeout: {
+            print("UIPROBE-FS exited=false bar_restored=false")
+            print("UIPROBE-FAIL fullscreen round-trip wedged the chrome"); exit(1)
+        }) {
+            self.keyHost()?.window?.styleMask.contains(.fullScreen) == false
+        }
+        probe.step(after: 0.6) {
             guard let host = self.keyHost(), let window = host.window else {
                 print("UIPROBE-FAIL no window (fullscreen exit)"); exit(1)
             }
-            let stillFullScreen = window.styleMask.contains(.fullScreen)
             let barFrame = host.workspaceBarFrameInWindow() ?? .zero
             let stripFrame = host.tabStripFrameInWindow() ?? .zero
             let barOK = !self.config.workspaceBar
                 || (host.workspaceBar?.window === window
                     && barFrame.minY >= stripFrame.maxY - 1)
-            print("UIPROBE-FS exited=\(!stillFullScreen) bar_restored=\(barOK)")
-            if stillFullScreen || !barOK {
+            print("UIPROBE-FS exited=true bar_restored=\(barOK)")
+            if !barOK {
                 print("UIPROBE-FAIL fullscreen round-trip wedged the chrome"); exit(1)
             }
         }
         // Close-pane leg (founder bug 2026-08-31: split down, close the bottom
-        // pane → the whole tab blanked): reproduce exactly and assert the tab
-        // survives with one visible pane and a live shell.
+        // pane → the whole tab blanked — hit LIVE in a restored session):
+        // reproduce exactly and assert the tab survives. RESTORED-AWARE: the
+        // target tab may legitimately start with SEVERAL panes (a restored
+        // split), so the post-close contract is "back to the before-split
+        // pane count" — and every surviving pane keeps a real on-screen size
+        // (the frame check is what catches the zero-collapse class).
         var closeProbePane: PaneView?
         var closeProbeController: TerminalWindowController?
-        DispatchQueue.main.asyncAfter(deadline: .now() + 13.9) {
+        var closeProbePaneCountBefore = 0
+        probe.step(after: 0.4) {
             guard let controller = self.keyController() else {
                 print("UIPROBE-FAIL no controller (close-pane leg)"); exit(1)
             }
             closeProbeController = controller
             let before = controller.allPanes()
+            closeProbePaneCountBefore = before.count
             print("UIPROBE-CLOSEPANE-TREE before-split:\n\(controller.probeTreeDump())")
             controller.splitCurrentPane(vertical: false)
             let after = controller.allPanes()
@@ -541,20 +651,21 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 exit(1)
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 14.5) {
+        probe.step(after: 0.6) {
             guard let controller = closeProbeController, let pane = closeProbePane else {
                 print("UIPROBE-FAIL close-pane setup lost"); exit(1)
             }
             let windowBefore = controller.window
             controller.close(pane: pane)
             let panes = controller.allPanes()
-            let frame = panes.first?.frame ?? .zero
+            let minDim = panes.map { min($0.frame.width, $0.frame.height) }.min() ?? 0
             let windowAlive = controller.window != nil && controller.window === windowBefore
                 && self.controllers.contains { $0 === controller }
             let shellAlive = panes.first?.process.running ?? false
-            print("UIPROBE-CLOSEPANE window_alive=\(windowAlive) panes=\(panes.count) frame=\(Int(frame.width))x\(Int(frame.height)) shell_alive=\(shellAlive)")
+            print("UIPROBE-CLOSEPANE window_alive=\(windowAlive) panes=\(panes.count) expected_panes=\(closeProbePaneCountBefore) min_pane_dim=\(Int(minDim)) shell_alive=\(shellAlive)")
             print("UIPROBE-CLOSEPANE-TREE after-close:\n\(controller.probeTreeDump())")
-            if !windowAlive || panes.count != 1 || frame.width < 50 || frame.height < 50 || !shellAlive {
+            if !windowAlive || panes.count != closeProbePaneCountBefore
+                || minDim < 50 || !shellAlive {
                 print("UIPROBE-FAIL close-pane blanked the tab"); exit(1)
             }
         }
@@ -566,7 +677,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // EOF disconnect banner.
         var serialMasterFD: Int32 = -1
         var serialPane: SerialPaneView?
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) {
+        probe.step(after: 0.5) {
             let master = posix_openpt(O_RDWR | O_NOCTTY)
             guard master >= 0, grantpt(master) == 0, unlockpt(master) == 0,
                   let slaveC = ptsname(master),
@@ -596,23 +707,32 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             let rx = Array("hello-serial\r\n".utf8)
             _ = rx.withUnsafeBytes { write(master, $0.baseAddress, $0.count) }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15.6) {
-            guard let pane = serialPane else { print("UIPROBE-FAIL serial pane lost"); exit(1) }
-            let text = pane.scrollbackText(maxLines: 200)
-            let rxOK = text.contains("hello-serial")
-            print("UIPROBE-SERIAL rx_rendered=\(rxOK)")
-            if !rxOK { print("UIPROBE-FAIL serial RX not rendered: \(text.suffix(300))"); exit(1) }
-            pane.send(txt: "ping\r")  // keystroke path → send override → fd
+        probe.settle("serial RX renders in the pane", onTimeout: {
+            let text = serialPane?.scrollbackText(maxLines: 200) ?? ""
+            print("UIPROBE-SERIAL rx_rendered=false")
+            print("UIPROBE-FAIL serial RX not rendered: \(text.suffix(300))"); exit(1)
+        }) {
+            serialPane?.scrollbackText(maxLines: 200).contains("hello-serial") == true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 16.1) {
-            guard let pane = serialPane else { exit(1) }
+        probe.step(after: 0.1) {
+            print("UIPROBE-SERIAL rx_rendered=true")
+            serialPane?.send(txt: "ping\r")  // keystroke path → send override → fd
+        }
+        // CRLF TX transform: the pane's Enter (CR) must arrive as CRLF. The
+        // nonblocking master read accumulates across polls.
+        var serialTxReceived = ""
+        probe.settle("serial TX reaches the master as CRLF", onTimeout: {
+            print("UIPROBE-SERIAL tx_bytes=\(serialTxReceived.utf8.count) crlf_transform=false")
+            print("UIPROBE-FAIL serial TX/line-ending (got: \(serialTxReceived.debugDescription))"); exit(1)
+        }) {
             var buf = [UInt8](repeating: 0, count: 512)
             let n = read(serialMasterFD, &buf, buf.count)
-            let received = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
-            // CRLF TX transform: the pane's Enter (CR) must arrive as CRLF.
-            let txOK = received.contains("ping\r\n")
-            print("UIPROBE-SERIAL tx_bytes=\(n) crlf_transform=\(txOK)")
-            if !txOK { print("UIPROBE-FAIL serial TX/line-ending (got: \(received.debugDescription))"); exit(1) }
+            if n > 0 { serialTxReceived += String(decoding: buf[0..<n], as: UTF8.self) }
+            return serialTxReceived.contains("ping\r\n")
+        }
+        probe.step(after: 0.1) {
+            guard let pane = serialPane else { exit(1) }
+            print("UIPROBE-SERIAL tx_bytes=\(serialTxReceived.utf8.count) crlf_transform=true")
             // Local echo honored, both ways: echo OFF + raw master (no kernel
             // echo) means the typed "ping" must NOT have rendered; flipping
             // echo ON must render the next keystrokes locally even though the
@@ -627,15 +747,17 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                                   0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef]
             _ = bytes.withUnsafeBytes { write(serialMasterFD, $0.baseAddress, $0.count) }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 16.7) {
-            guard let pane = serialPane else { exit(1) }
-            let text = pane.scrollbackText(maxLines: 200)
-            let hexOK = text.contains("de ad be ef") && text.contains("hex view on")
-            print("UIPROBE-SERIAL hex_lens=\(hexOK)")
-            if !hexOK { print("UIPROBE-FAIL hex lens: \(text.suffix(300))"); exit(1) }
-            let echoOnOK = text.contains("echo-on-test")
-            print("UIPROBE-SERIAL echo_on_rendered=\(echoOnOK)")
-            if !echoOnOK { print("UIPROBE-FAIL local-echo-on keystrokes did not render"); exit(1) }
+        probe.settle("hex lens + local echo render", onTimeout: {
+            let text = serialPane?.scrollbackText(maxLines: 200) ?? ""
+            print("UIPROBE-SERIAL hex_lens=\(text.contains("de ad be ef") && text.contains("hex view on")) echo_on_rendered=\(text.contains("echo-on-test"))")
+            print("UIPROBE-FAIL hex lens / local-echo-on: \(text.suffix(300))"); exit(1)
+        }) {
+            guard let text = serialPane?.scrollbackText(maxLines: 200) else { return false }
+            return text.contains("de ad be ef") && text.contains("hex view on")
+                && text.contains("echo-on-test")
+        }
+        probe.step(after: 0.1) {
+            print("UIPROBE-SERIAL hex_lens=true echo_on_rendered=true")
             // Journal the pane (2 s poll may not have ticked yet): poll + flush.
             self.memory?.pollNow()
             self.memory?.flushSync()
@@ -656,22 +778,26 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             // "Unplug": closing the pty master REVOKES the slave. macOS can
             // swallow the kevent on revoke (probe-verified: no read event
             // ever fires), so the banner arrives via SerialConnection's
-            // 0.5 s liveness probe — the assert below waits > 2 ticks.
+            // 0.5 s liveness probe — settle until it ticks.
             _ = Darwin.close(serialMasterFD)
         }
+        probe.settle("serial disconnect banner after unplug", timeout: 6.0, onTimeout: {
+            let text = serialPane?.scrollbackText(maxLines: 200) ?? ""
+            print("UIPROBE-SERIAL disconnect_banner=false still_connected=\(serialPane?.isConnected == true)")
+            print("UIPROBE-FAIL serial disconnect handling (tail: \(text.suffix(200)))"); exit(1)
+        }) {
+            guard let pane = serialPane else { return false }
+            return pane.scrollbackText(maxLines: 200)
+                .contains("device disconnected — will reconnect when it returns")
+                && !pane.isConnected
+        }
+        // Restore-offer leg: drive the EXACT restore path with a journaled
+        // serial snapshot for an absent device. The pane must come back
+        // NOT connected (never auto-open on restore) with the standard
+        // consent-gated offer line.
         var restoredSerialController: TerminalWindowController?
-        DispatchQueue.main.asyncAfter(deadline: .now() + 18.0) {
-            guard let pane = serialPane else { exit(1) }
-            let text = pane.scrollbackText(maxLines: 200)
-            let bannerOK = text.contains("device disconnected — will reconnect when it returns")
-            print("UIPROBE-SERIAL disconnect_banner=\(bannerOK) still_connected=\(pane.isConnected)")
-            if !bannerOK || pane.isConnected {
-                print("UIPROBE-FAIL serial disconnect handling"); exit(1)
-            }
-            // Restore-offer leg: drive the EXACT restore path with a journaled
-            // serial snapshot for an absent device. The pane must come back
-            // NOT connected (never auto-open on restore) with the standard
-            // consent-gated offer line.
+        probe.step(after: 0.1) {
+            print("UIPROBE-SERIAL disconnect_banner=true still_connected=false")
             let state = SerialAdapter.journalState(
                 path: "/dev/cu.memterm-probe-absent", identity: "usb:0000:0000:probe",
                 label: "probe-restore", settings: SerialSettings(),
@@ -691,74 +817,97 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             host.focusWindow()
             restoredSerialController = controller
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 18.4) {
+        probe.settle("serial restore offer renders", onTimeout: {
             guard let controller = restoredSerialController,
                   let pane = controller.allPanes().first as? SerialPaneView else {
                 print("UIPROBE-FAIL serial restore did not build a serial pane"); exit(1)
             }
-            let text = pane.scrollbackText(maxLines: 100)
-            let offerOK = text.contains("was connected: memterm-probe-absent @ 115200-8N1 — press ⌘R to reconnect")
-            print("UIPROBE-SERIAL restore_offer=\(offerOK) auto_opened=\(pane.isConnected) pending=\(pane.pendingReconnectOffer)")
-            if !offerOK || pane.isConnected || !pane.pendingReconnectOffer {
+            print("UIPROBE-SERIAL restore_offer=false auto_opened=\(pane.isConnected) pending=\(pane.pendingReconnectOffer)")
+            print("UIPROBE-FAIL serial restore offer (consent gate)"); exit(1)
+        }) {
+            guard let controller = restoredSerialController,
+                  let pane = controller.allPanes().first as? SerialPaneView
+            else { return false }
+            return pane.scrollbackText(maxLines: 100)
+                .contains("was connected: memterm-probe-absent @ 115200-8N1 — press ⌘R to reconnect")
+        }
+        probe.step(after: 0.1) {
+            guard let controller = restoredSerialController,
+                  let pane = controller.allPanes().first as? SerialPaneView else { exit(1) }
+            print("UIPROBE-SERIAL restore_offer=true auto_opened=\(pane.isConnected) pending=\(pane.pendingReconnectOffer)")
+            if pane.isConnected || !pane.pendingReconnectOffer {
                 print("UIPROBE-FAIL serial restore offer (consent gate)"); exit(1)
             }
             // The ⌘R gesture with the device absent: an honest line, no open.
             self.typeResumeCommand(nil)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 18.8) {
-            guard let controller = restoredSerialController,
-                  let pane = controller.allPanes().first as? SerialPaneView else { exit(1) }
-            let text = pane.scrollbackText(maxLines: 100)
-            let honestOK = text.contains("device not connected — memterm-probe-absent @ 115200-8N1")
-            print("UIPROBE-SERIAL reconnect_absent=\(honestOK) still_closed=\(!pane.isConnected)")
-            if !honestOK || pane.isConnected {
-                print("UIPROBE-FAIL ⌘R with absent device must report honestly and not open")
-                exit(1)
-            }
+        probe.settle("⌘R with absent device reports honestly", onTimeout: {
+            let pane = restoredSerialController?.allPanes().first as? SerialPaneView
+            print("UIPROBE-SERIAL reconnect_absent=false still_closed=\(pane?.isConnected == false)")
+            print("UIPROBE-FAIL ⌘R with absent device must report honestly and not open")
+            exit(1)
+        }) {
+            guard let pane = restoredSerialController?.allPanes().first as? SerialPaneView
+            else { return false }
+            return pane.scrollbackText(maxLines: 100)
+                .contains("device not connected — memterm-probe-absent @ 115200-8N1")
+                && !pane.isConnected
+        }
+        probe.step(after: 0.1) {
+            print("UIPROBE-SERIAL reconnect_absent=true still_closed=true")
         }
         // Last-tab-close leg (founder pending item, stage 2): closing the
         // LAST tab of a non-Default workspace auto-removes the now-empty
         // workspace (Default persists), and the MRU corollary surfaces the
         // hidden Default instead of stranding the app windowless. Switching
         // to Probe here also exercises the multi-host slot-matched swap
-        // (Default holds two hosts by now; the extra one orders out whole).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 19.1) {
-            guard let probe = probeWorkspaceId else {
+        // (Default holds several hosts by now; the extras order out whole).
+        probe.step(after: 0.3) {
+            guard let probeWs = probeWorkspaceId else {
                 print("UIPROBE-FAIL no Probe workspace (last-tab-close leg)"); exit(1)
             }
-            self.switchToWorkspace(probe)
+            self.switchToWorkspace(probeWs)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 19.5) {
-            guard let probe = probeWorkspaceId,
-                  self.activeWorkspaceId == probe,
+        probe.step(after: 0.4) {
+            guard let probeWs = probeWorkspaceId,
+                  self.activeWorkspaceId == probeWs,
                   let listed = self.memory?.store.listWorkspaces()
-                      .contains(where: { $0.id == probe }), listed,
-                  let doomed = self.controllers.first(where: { $0.workspaceId == probe })
+                      .contains(where: { $0.id == probeWs }), listed,
+                  let doomed = self.controllers.first(where: { $0.workspaceId == probeWs })
             else {
                 print("UIPROBE-FAIL Probe workspace not presented for last-tab close")
                 exit(1)
             }
             doomed.close()  // user close of the workspace's only tab
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20.1) {
-            guard let probe = probeWorkspaceId, let store = self.memory?.store else { exit(1) }
+        probe.settle("empty-workspace auto-remove surfaces Default", onTimeout: {
+            guard let probeWs = probeWorkspaceId, let store = self.memory?.store else { exit(1) }
             let names = store.listWorkspaces().map { $0.name }
-            let probeGone = !store.listWorkspaces().contains { $0.id == probe }
+            let probeGone = !store.listWorkspaces().contains { $0.id == probeWs }
             let defaultKept = store.listWorkspaces()
                 .contains { $0.id == StateStore.defaultWorkspaceId }
             let surfacedDefault = self.activeWorkspaceId == StateStore.defaultWorkspaceId
             let visibleWindow = self.hosts.contains { $0.window?.isVisible == true }
             print("UIPROBE-WSCLOSE probe_removed=\(probeGone) default_kept=\(defaultKept) surfaced_default=\(surfacedDefault) visible_window=\(visibleWindow) names=\(names)")
-            if !probeGone || !defaultKept || !surfacedDefault || !visibleWindow {
-                print("UIPROBE-FAIL last-tab close must remove the empty workspace and surface Default")
-                exit(1)
-            }
+            print("UIPROBE-FAIL last-tab close must remove the empty workspace and surface Default")
+            exit(1)
+        }) {
+            guard let probeWs = probeWorkspaceId, let store = self.memory?.store
+            else { return false }
+            return !store.listWorkspaces().contains { $0.id == probeWs }
+                && store.listWorkspaces().contains { $0.id == StateStore.defaultWorkspaceId }
+                && self.activeWorkspaceId == StateStore.defaultWorkspaceId
+                && self.hosts.contains { $0.window?.isVisible == true }
+        }
+        probe.step(after: 0.1) {
+            let names = self.memory?.store.listWorkspaces().map { $0.name } ?? []
+            print("UIPROBE-WSCLOSE probe_removed=true default_kept=true surfaced_default=true visible_window=true names=\(names)")
         }
         // Hover-✕ leg (founder ask): the strip's ✕ closes the tab through the
         // real button action, which is a USER close — FR-56 forgets its rows
         // at the moment of the gesture (before any debounced topology save
         // could) — and focus lands in the surviving selected tab's pane.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20.6) {
+        probe.step(after: 0.5) {
             guard let host = self.keyHost() else {
                 print("UIPROBE-FAIL no host (close-x leg)"); exit(1)
             }
@@ -785,9 +934,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
         // Strip double-click-rename leg (founder ask): the double-click
         // gesture on a tab body opens the rename sheet; committing through
-        // the sheet's own Rename button pins the title and journals it.
+        // the sheet's own Rename button pins the title and journals it. The
+        // sheet's completion handler is async — settle on the pinned title.
         var renamedTab: TerminalWindowController?
-        DispatchQueue.main.asyncAfter(deadline: .now() + 21.0) {
+        probe.step(after: 0.4) {
             guard let host = self.keyHost(), let window = host.window,
                   let tab = host.selectedTab else {
                 print("UIPROBE-FAIL no host (rename-tab leg)"); exit(1)
@@ -818,15 +968,21 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             field.stringValue = "Probe-Renamed"
             rename.performClick(nil)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 21.4) {
+        probe.settle("rename sheet commit pins the title", onTimeout: {
+            print("UIPROBE-RENAMETAB title=false display=\(renamedTab?.displayTitle ?? "nil")")
+            print("UIPROBE-FAIL strip double-click rename did not pin/journal the title")
+            exit(1)
+        }) {
+            renamedTab?.displayTitle == "Probe-Renamed"
+        }
+        probe.step(after: 0.1) {
             guard let tab = renamedTab else { exit(1) }
-            let titleOK = tab.displayTitle == "Probe-Renamed"
             self.memory?.flushSync()
             let journaled = self.memory?.store
                 .loadState(workspaceId: self.activeWorkspaceId)
                 .flatMap(\.tabs).contains { $0.title == "Probe-Renamed" } ?? false
-            print("UIPROBE-RENAMETAB title=\(titleOK) journaled=\(journaled) display=\(tab.displayTitle)")
-            if !titleOK || !journaled {
+            print("UIPROBE-RENAMETAB title=true journaled=\(journaled) display=\(tab.displayTitle)")
+            if !journaled {
                 print("UIPROBE-FAIL strip double-click rename did not pin/journal the title")
                 exit(1)
             }
@@ -835,7 +991,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // Move Tab to New Window / Merge All Windows leg: OUR re-homing —
         // same pane objects, same shell process, one extra host; merge folds
         // the workspace back into one host with identity intact.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 21.8) {
+        probe.step(after: 0.4) {
             // The active workspace holds several hosts by now; act on the
             // multi-tab one (moveTabToNewWindow needs a tab to leave behind).
             guard let host = self.hosts.first(where: { h in
@@ -876,8 +1032,13 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 print("UIPROBE-FAIL move-to-new-window/merge must re-home the same panes with the process untouched")
                 exit(1)
             }
+            // COMPLETION SENTINEL: harnesses must require this line — exit 0
+            // without it means the process died early (a premature clean exit
+            // once slipped through a 45-run loop as a false green).
+            print("UIPROBE-DONE all-legs-complete")
             exit(0)
         }
+        probe.start()
     }
 
     // MARK: - Tab context menu (built by TabStripView per right-click)

@@ -43,7 +43,7 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     private(set) var workspaceBar: WorkspaceBarView?
     private let gearButton = ChipButton()
     private(set) var tabStrip: TabStripView!
-    private let contentContainer = NSView()
+    private let contentContainer = TabContentContainerView()
     private let blurView = NSVisualEffectView()
     /// FR-59 in-window crossfade: the outgoing content's snapshot, fading out
     /// over the swapped-in workspace (Workspaces.swapTabSets).
@@ -253,7 +253,23 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
             selectedTab = tab
             let root = tab.paneRoot
             root.autoresizingMask = [.width, .height]
-            root.frame = contentContainer.bounds
+            // RESTORED-SPLIT COLLAPSE (founder's blank-pane-after-close class,
+            // 2026-08-31/09-01): on the restore path attach()/select() run
+            // BEFORE the window's first layout pass, so the auto-layouted
+            // container still reports 0x0 here. Assigning that squeezed every
+            // buildNode-built NSSplitView through zero size — the divider
+            // position collapsed and the tree re-expanded with ALL width on
+            // the first pane (restored 2-pane tabs presented 979/0 from
+            // launch). Force the layout pass first so real bounds exist; if
+            // the container STILL has no size, keep the tab's pre-attach
+            // frame — TabContentContainerView.layout() adopts the real bounds
+            // the moment they exist, and the tree never passes through zero.
+            if contentContainer.bounds.width < 1 || contentContainer.bounds.height < 1 {
+                window?.contentView?.layoutSubtreeIfNeeded()
+            }
+            if contentContainer.bounds.width >= 1, contentContainer.bounds.height >= 1 {
+                root.frame = contentContainer.bounds
+            }
             contentContainer.addSubview(root)
         }
         tab.noteSelected()
@@ -469,5 +485,21 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
 
     func windowDidMove(_ notification: Notification) {
         app.memory?.scheduleFrameSave()
+    }
+}
+
+/// The host's tab-content container. Its layout pass pins the hosted pane
+/// root to its bounds whenever they are real — the structural guarantee that
+/// a tree attached before the window's first layout (the restore path) adopts
+/// the container's true size at the first opportunity instead of riding an
+/// autoresize delta computed from a 0x0 parent (which mis-sizes splits and
+/// was the restored-split zero-width collapse).
+private final class TabContentContainerView: NSView {
+    override func layout() {
+        super.layout()
+        guard bounds.width >= 1, bounds.height >= 1 else { return }
+        for sub in subviews where sub.frame != bounds {
+            sub.frame = bounds
+        }
     }
 }
