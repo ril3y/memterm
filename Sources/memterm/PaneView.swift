@@ -40,6 +40,95 @@ class PaneView: LocalProcessTerminalView {
     /// nil keeps SwiftTerm's delegate default (NSSound.beep()).
     var bellSoundName: String?
 
+    // -- SCROLL UX: selection survives scroll --
+    /// The user's `allow_mouse_reporting` config intent. SwiftTerm's own
+    /// `allowMouseReporting` flag DOUBLES as "clear the native selection on
+    /// every output chunk" (AppleTerminalView.feedPrepare — internal, not
+    /// overridable — and MacTerminalView.linefeed both call selectNone
+    /// whenever it is true, verified in SwiftTerm 1.20.0). That was the
+    /// founder bug "selecting text loses selection when output scrolls":
+    /// with the flag at its default, ANY streaming output killed the
+    /// selection, even with no app tracking the mouse. The view-level flag
+    /// is therefore DERIVED, never set directly:
+    ///     allowMouseReporting = configured && terminal.mouseMode != .off
+    /// Every SwiftTerm mouse-forwarding site tests
+    /// `allowMouseReporting && mouseMode.sendXxx()`, so routing to vim/htop
+    /// is unchanged the moment they enable tracking. `mouseMode` only
+    /// mutates while bytes are parsed, and every byte path into a pane is
+    /// ours (dataReceived below; SerialPaneView.ingest), so syncing on both
+    /// sides of each feed holds the invariant everywhere. The Terminal layer
+    /// already anchors selections to buffer content
+    /// (SelectionScrollAnchoringTests); this makes that anchoring reach the
+    /// screen.
+    var mouseReportingConfigured = true {
+        didSet { syncAllowMouseReporting() }
+    }
+
+    func syncAllowMouseReporting() {
+        let effective = MouseReportingPolicy.effectiveAllowMouseReporting(
+            configured: mouseReportingConfigured,
+            mouseModeActive: getTerminal().mouseMode != .off)
+        if allowMouseReporting != effective { allowMouseReporting = effective }
+    }
+
+    // -- SCROLL UX: overlay scrollbar --
+    /// The auto-hiding per-pane scroll band (OverlayScrollerView.swift).
+    /// Installed lazily on first superview attach; serial panes inherit it.
+    private(set) var scrollerOverlay: OverlayScrollerView?
+    /// Space reserved at the pane's bottom edge (the serial footer bar) that
+    /// the scroll band must not cover.
+    var scrollerBottomInset: CGFloat = 0 {
+        didSet { scrollerOverlay?.bottomInset = scrollerBottomInset }
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        installScrollUXIfNeeded()
+    }
+
+    private func installScrollUXIfNeeded() {
+        guard scrollerOverlay == nil, superview != nil else { return }
+        // Retire SwiftTerm's built-in NSScroller: as a STANDALONE overlay
+        // scroller it never flashes on scroll activity, and its .knobSlot
+        // (click-to-page) case is unimplemented upstream — while it still
+        // reserves a right-edge gutter (reservedScrollerWidth goes to 0 once
+        // it is hidden; verified in MacTerminalView.swift). The overlay band
+        // replaces it without costing columns.
+        // Hidden first (reservedScrollerWidth keys off isHidden), then OUT of
+        // the tree: a dead hidden view whose constraints anchor to the pane
+        // is pointless layout-engine load. (Note: removing it does NOT cure
+        // the quiet-probe stale-frame quirk — see
+        // ProbeLegs.probeRepairPaneFrame — window-level autolayout manages
+        // pane frames regardless; this removal is cleanup, not the fix.)
+        for sub in subviews where sub is NSScroller {
+            sub.isHidden = true
+            sub.removeFromSuperview()
+        }
+        let overlay = OverlayScrollerView()
+        overlay.pane = self
+        overlay.bottomInset = scrollerBottomInset
+        addSubview(overlay)
+        overlay.updateFrameToBand()
+        scrollerOverlay = overlay
+        // Recompute cols against the reclaimed gutter width — DEFERRED:
+        // viewDidMoveToSuperview fires inside addSubview, possibly inside a
+        // layout pass, and a reentrant setFrameSize there corrupts the
+        // layout engine's frame bookkeeping for reparented panes.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.setFrameSize(self.frame.size)
+        }
+    }
+
+    /// TerminalViewDelegate scroll tick (LocalProcessTerminalView routes it
+    /// here; open — verified). Fires for BOTH user scrolls (wheel/keyboard →
+    /// scrollTo) and output-driven scrolling, per scrolled line during
+    /// floods — noteScrollActivity is O(1)-cheap by contract.
+    override func scrolled(source: TerminalView, position: Double) {
+        super.scrolled(source: source, position: position)
+        scrollerOverlay?.noteScrollActivity()
+    }
+
     // -- Search state (FR-4, plumbing in FindBar.swift) --
     /// This pane's ⌘F find bar, created lazily on first use.
     var findBar: PaneFindBar?
@@ -92,8 +181,16 @@ class PaneView: LocalProcessTerminalView {
     /// DispatchQueue.main (its default dispatchQueue — verified in
     /// LocalProcess.swift), so this runs on the main thread; super parses the
     /// bytes into the terminal first.
+    ///
+    /// SCROLL UX: allowMouseReporting is synced on BOTH sides of the feed —
+    /// before, so SwiftTerm's feed-time selection clears see the derived
+    /// value (selection survives streaming output while no app tracks the
+    /// mouse); after, so a mouse-mode change parsed from THIS chunk reaches
+    /// event routing before the next click.
     override func dataReceived(slice: ArraySlice<UInt8>) {
+        syncAllowMouseReporting()
         super.dataReceived(slice: slice)
+        syncAllowMouseReporting()
         onOutputActivity?()
     }
 

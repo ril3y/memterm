@@ -396,7 +396,10 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         pane.optionAsMetaKey = config.optionAsMeta
         pane.bellStyle = config.terminalBellStyle
         pane.bellSoundName = config.bellSound
-        pane.allowMouseReporting = config.allowMouseReporting
+        // SCROLL UX: the config intent, not SwiftTerm's raw flag — the pane
+        // derives allowMouseReporting from intent AND live mouseMode so
+        // streaming output cannot clear a selection (see PaneView).
+        pane.mouseReportingConfigured = config.allowMouseReporting
         if config.lineSpacing != 1.0 { pane.lineSpacing = CGFloat(config.lineSpacing) }
         pane.processDelegate = self
         // Transparency is background-color ALPHA (SwiftTerm's CoreText path
@@ -844,7 +847,7 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             pane.optionAsMetaKey = config.optionAsMeta
             pane.bellStyle = config.terminalBellStyle
             pane.bellSoundName = config.bellSound
-            pane.allowMouseReporting = config.allowMouseReporting
+            pane.mouseReportingConfigured = config.allowMouseReporting
             // Live cursor restyle (Terminal.setCursorStyle is public —
             // verified in SwiftTerm's Terminal.swift:4123).
             pane.getTerminal().setCursorStyle(config.terminalCursorStyle)

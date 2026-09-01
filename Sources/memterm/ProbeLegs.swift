@@ -1,5 +1,6 @@
 import AppKit
 import MemtermCore
+import SwiftTerm
 
 // MEMTERM_UI_PROBE harness v2 (TESTING.md §2). Every leg from the asyncAfter
 // cascade lives on as a NAMED ProbeStep — same assertions (the keep-list is
@@ -648,6 +649,7 @@ extension MemtermAppDelegate {
         }
 
         addClosePaneSteps(probe, mode: mode)
+        addScrollUXSteps(probe)
         addSerialSteps(probe)
         addWorkspaceCloseSteps(probe, probeWorkspaceId: { probeWorkspaceId })
         addTabGestureSteps(probe)
@@ -744,6 +746,409 @@ extension MemtermAppDelegate {
             }))
     }
 
+    // MARK: - SCROLL UX legs (selection survives scroll + overlay scrollbar)
+
+    /// Buffer-absolute row (a Position row) whose full trimmed text equals
+    /// `exact` — the scroll-invariant walk PaneView.scrollbackText uses.
+    /// Exact match keeps the shell's ECHOED command line (prompt + command)
+    /// from shadowing the command's OUTPUT line.
+    private func probeAbsoluteRow(of exact: String, in pane: PaneView) -> Int? {
+        let terminal = pane.getTerminal()
+        var row = terminal.buffer.totalLinesTrimmed
+        while let line = terminal.getScrollInvariantLine(row: row) {
+            if line.translateToString(trimRight: true) == exact {
+                return row - terminal.buffer.totalLinesTrimmed
+            }
+            row += 1
+        }
+        return nil
+    }
+
+    /// PROBE-ONLY frame repair for the geometry-asserting scroll-UX legs.
+    /// Quiet-mode quirk, verified pre-existing at HEAD f253ed3 with a frame
+    /// tracer: after tab-select gestures, a layout-engine pass in the
+    /// never-displayed offscreen window can re-apply STALE zero-size derived
+    /// constraints to a presented pane
+    /// (NSViewActuallyUpdateFrameFromLayoutEngine ← [NSView layout]); a real
+    /// on-screen display pass refreshes them, which quiet runs never get.
+    /// Re-adopting the superview bounds is exactly what that display pass
+    /// would settle on. Model-level legs never need this.
+    private func probeRepairPaneFrame(_ pane: PaneView) {
+        if pane.bounds.width < 50 || pane.bounds.height < 50,
+           let sv = pane.superview, sv.bounds.width >= 50, sv.bounds.height >= 50 {
+            pane.frame = sv.bounds
+        }
+        pane.scrollerOverlay?.updateFrameToBand()
+    }
+
+    /// A real mouse event aimed at a point in `view`'s own coordinates, for
+    /// driving the overlay scroller's actual event handlers.
+    private func probeMouseEvent(_ type: NSEvent.EventType, in view: NSView,
+                                 at point: NSPoint) -> NSEvent? {
+        NSEvent.mouseEvent(with: type,
+                           location: view.convert(point, to: nil),
+                           modifierFlags: [],
+                           timestamp: ProcessInfo.processInfo.systemUptime,
+                           windowNumber: view.window?.windowNumber ?? 0,
+                           context: nil, eventNumber: 0, clickCount: 1,
+                           pressure: 1)
+    }
+
+    /// Founder asks (SCROLL UX stage): 1) a selection is anchored to buffer
+    /// CONTENT — it scrolls with the text, survives streaming output, and a
+    /// mid-drag extension stays glued to where the drag started (headless
+    /// twin: SelectionScrollAnchoringTests); 2) every pane carries an
+    /// auto-hiding overlay scrollbar — appears on scroll activity, knob
+    /// proportional and draggable, track clicks page, fades ~1s idle, and
+    /// eats no terminal events while hidden. Stateless behaviors — fresh
+    /// mode is sufficient (they run in restored too via the shared list,
+    /// which is free extra coverage).
+    // swiftlint:disable:next function_body_length
+    private func addScrollUXSteps(_ probe: ProbeRunner) {
+        var pane: PaneView?
+        var savedCopyOnSelect = true
+        var selectionTextBefore: String?
+
+        probe.add(ProbeStep(
+            name: "selection-scroll-setup", timeout: 12,
+            action: { [self] in
+                // A tab whose pane PRESENTS with real bounds, selected via
+                // the real gesture path. (Quiet-mode quirk, PROBE-ONLY — see
+                // probeRepairPaneFrame: a tab re-selected by the earlier
+                // gesture legs can carry zero-frame layout-engine constants
+                // that a display pass would refresh but an offscreen run
+                // never does — so these legs pick a healthy tab instead of
+                // fighting the engine.)
+                guard let host = hosts.first(where: { $0.window?.isVisible == true })
+                        ?? keyHost(),
+                      let controller = host.tabs.first(where: { c in
+                          c.allPanes().contains {
+                              !($0 is SerialPaneView) && $0.bounds.width >= 50
+                                  && $0.bounds.height >= 50
+                          }
+                      }),
+                      let target = controller.allPanes()
+                          .first(where: { !($0 is SerialPaneView) }) else {
+                    probeFail("scroll-ux: no presented shell pane")
+                }
+                host.select(controller)
+                pane = target
+                // Keep the runner's clipboard out of it: copy-on-select would
+                // clobber the pasteboard on every selection this leg makes.
+                savedCopyOnSelect = target.copyOnSelect
+                target.copyOnSelect = false
+                target.send(txt: "printf 'SELMARKA-one\\n'; seq 1 5\r")
+            },
+            // NOTE: no geometry conditions or frame repairs in the SELECTION
+            // legs — they certify model/selection truth, which holds on a
+            // zero-framed quiet-mode pane, and a frame repair goes through
+            // resizeSubviews, which clears the selection by design.
+            condition: { [self] in
+                guard let pane else { return false }
+                return probeAbsoluteRow(of: "SELMARKA-one", in: pane) != nil
+                    && probeAbsoluteRow(of: "5", in: pane) != nil
+            },
+            onFailure: { [self] in
+                for (i, h) in hosts.enumerated() {
+                    print("UIPROBE-SCROLLUX host[\(i)] ws=\(h.workspaceId ?? "nil") visible=\(h.window?.isVisible == true) selected=\(h.selectedTab?.tabId.prefix(8) ?? "nil") tabs=\(h.tabs.map { "\($0.tabId.prefix(8)):\($0.allPanes().map { p in "\(Int(p.bounds.width))x\(Int(p.bounds.height))" })" })")
+                }
+                if let pane {
+                    var chain: [String] = []
+                    var v: NSView? = pane
+                    while let view = v {
+                        chain.append("\(type(of: view)):\(Int(view.frame.width))x\(Int(view.frame.height))")
+                        v = view.superview
+                    }
+                    print("UIPROBE-SCROLLUX pane_chain=\(chain.joined(separator: " < "))")
+                }
+            }))
+
+        // The founder bug itself: with a selection standing, STREAMING output
+        // must neither clear it nor move it off its content. (SwiftTerm
+        // 1.20.0 cleared it in feedPrepare/linefeed whenever
+        // allowMouseReporting was true — the config default — even with no
+        // app tracking the mouse; PaneView now derives that flag.)
+        probe.add(ProbeStep(
+            name: "selection-survives-stream", timeout: 15,
+            action: { [self] in
+                guard let pane, let row = probeAbsoluteRow(of: "SELMARKA-one", in: pane)
+                else { probeFail("selection leg: marker row not found") }
+                // The drag path's own service calls (mouseDown/mouseDragged
+                // route through exactly these — verified in
+                // MacTerminalView.swift).
+                let selection = pane.selection!
+                selection.setSoftStart(bufferPosition: Position(col: 0, row: row))
+                selection.startSelection()
+                selection.dragExtend(bufferPosition: Position(col: 12, row: row))
+                selectionTextBefore = pane.getSelection()
+                guard selectionTextBefore?.contains("SELMARKA-one") == true else {
+                    probeFail("selection leg: seeded selection reads \(selectionTextBefore ?? "nil")")
+                }
+                pane.send(txt: "seq 1 200; echo selstream-done\r")
+            },
+            condition: { [self] in
+                guard let pane else { return false }
+                return probeAbsoluteRow(of: "selstream-done", in: pane) != nil
+            },
+            assert: {
+                guard let pane else { throw ProbeFailure("pane lost") }
+                let text = pane.getSelection()
+                print("UIPROBE-SELECTION active=\(pane.selectionActive) text=\(text?.debugDescription ?? "nil") can_scroll=\(pane.canScroll)")
+                guard pane.selectionActive else {
+                    throw ProbeFailure("streaming output cleared the selection (the founder bug)")
+                }
+                guard text == selectionTextBefore else {
+                    throw ProbeFailure("selection drifted off its content: \(text?.debugDescription ?? "nil") != \(selectionTextBefore?.debugDescription ?? "nil")")
+                }
+                guard pane.canScroll else {
+                    throw ProbeFailure("stream did not scroll the buffer — leg proved nothing")
+                }
+            },
+            onFailure: {
+                print("UIPROBE-SELECTION tail=\(pane?.scrollbackText(maxLines: 60).suffix(300) ?? "")")
+            }))
+
+        // Mid-drag: with the button conceptually down, output streams, the
+        // anchor stays glued to its content, and the continuing drag extends
+        // over the content now under the pointer.
+        probe.add(ProbeStep(
+            name: "selection-mid-drag-glued", timeout: 15,
+            action: { [self] in
+                guard let pane, let row = probeAbsoluteRow(of: "selstream-done", in: pane)
+                else { probeFail("mid-drag leg: anchor row not found") }
+                let selection = pane.selection!
+                selection.setSoftStart(bufferPosition: Position(col: 0, row: row))
+                selection.startSelection()
+                selection.dragExtend(bufferPosition: Position(col: 14, row: row))
+                selectionTextBefore = pane.getSelection()
+                pane.send(txt: "seq 1 60; echo middrag-done\r")
+            },
+            condition: { [self] in
+                guard let pane else { return false }
+                return probeAbsoluteRow(of: "middrag-done", in: pane) != nil
+            },
+            assert: { [self] in
+                guard let pane else { throw ProbeFailure("pane lost") }
+                guard pane.selectionActive, pane.getSelection() == selectionTextBefore else {
+                    throw ProbeFailure("in-flight drag lost its content anchor (got \(pane.getSelection()?.debugDescription ?? "nil"))")
+                }
+                guard let target = probeAbsoluteRow(of: "middrag-done", in: pane) else {
+                    throw ProbeFailure("mid-drag leg: target row vanished")
+                }
+                // The drag continues to the CURRENT position of later
+                // content — what mouseDragged passes for the pointer now.
+                pane.selection.dragExtend(bufferPosition: Position(col: 12, row: target))
+                let extended = pane.getSelection() ?? ""
+                print("UIPROBE-SELECTION mid_drag_glued=true extended_len=\(extended.count)")
+                guard extended.contains("selstream-done"), extended.contains("middrag-done") else {
+                    throw ProbeFailure("drag extension not glued to content (got \(extended.debugDescription.prefix(120)))")
+                }
+                pane.selectNone()
+                pane.copyOnSelect = savedCopyOnSelect
+            }))
+
+        // The derived-flag contract both ways: an app enabling mouse tracking
+        // gets its events (allowMouseReporting flips on), and turning it off
+        // restores feed-time selection preservation.
+        probe.add(ProbeStep(
+            name: "mouse-reporting-flag-syncs", timeout: 10,
+            action: { pane?.send(txt: "printf '\\e[?1000h'; echo mr-on\r") },
+            condition: { [self] in
+                guard let pane else { return false }
+                return probeAbsoluteRow(of: "mr-on", in: pane) != nil
+            },
+            assert: {
+                guard let pane else { throw ProbeFailure("pane lost") }
+                let mode = pane.getTerminal().mouseMode
+                print("UIPROBE-MOUSEREPORT mode_active=\(mode != .off) allow=\(pane.allowMouseReporting)")
+                guard mode != .off else { throw ProbeFailure("\\e[?1000h did not enable mouse mode") }
+                guard pane.allowMouseReporting else {
+                    throw ProbeFailure("allowMouseReporting not restored for a mouse-tracking app")
+                }
+            }))
+        probe.add(ProbeStep(
+            name: "mouse-reporting-flag-clears", timeout: 10,
+            action: { pane?.send(txt: "printf '\\e[?1000l'; echo mr-off\r") },
+            condition: { [self] in
+                guard let pane else { return false }
+                return probeAbsoluteRow(of: "mr-off", in: pane) != nil
+            },
+            assert: {
+                guard let pane else { throw ProbeFailure("pane lost") }
+                guard pane.getTerminal().mouseMode == .off else {
+                    throw ProbeFailure("\\e[?1000l did not disable mouse mode")
+                }
+                guard !pane.allowMouseReporting else {
+                    throw ProbeFailure("allowMouseReporting stuck on — feed-time clears would return")
+                }
+            }))
+
+        // ---- Overlay scrollbar ----
+        probe.add(ProbeStep(
+            name: "overlay-scroller-appears", timeout: 15,
+            action: {
+                pane?.send(txt: "seq 1 250\r")
+            },
+            condition: { [self] in
+                guard let pane else { return false }
+                probeRepairPaneFrame(pane)
+                return pane.canScroll && pane.bounds.height >= 100
+                    && probeAbsoluteRow(of: "250", in: pane) != nil
+            },
+            assert: {
+                guard let pane, let overlay = pane.scrollerOverlay else {
+                    throw ProbeFailure("no overlay scroller installed on the pane")
+                }
+                // Scroll to mid-history: activity must present the bar with a
+                // plausible, proportional knob.
+                pane.scroll(toPosition: 0.5)
+                guard overlay.probeVisible else {
+                    throw ProbeFailure("overlay scroller did not appear on scroll activity")
+                }
+                guard let knob = overlay.probeKnobFrame() else {
+                    throw ProbeFailure("overlay scroller has no knob while scrollable")
+                }
+                let track = overlay.bounds.height
+                print("UIPROBE-SCROLLER visible=true knob_y=\(Int(knob.minY)) knob_h=\(Int(knob.height)) track_h=\(Int(track)) position=\(String(format: "%.2f", pane.scrollPosition)) thumb=\(String(format: "%.3f", pane.scrollThumbsize))")
+                guard knob.height >= OverlayScrollerLayout.minKnobLength,
+                      knob.height < track / 2 else {
+                    throw ProbeFailure("knob geometry implausible: h=\(knob.height) of track=\(track)")
+                }
+                guard abs(pane.scrollPosition - 0.5) < 0.1 else {
+                    throw ProbeFailure("scroll(toPosition: 0.5) landed at \(pane.scrollPosition)")
+                }
+                // Rendered-bitmap truth (§2.3): VISIBLE pass only, the same
+                // split the composited chrome truths use. In quiet offscreen
+                // runs cacheDisplay's internal layout pass re-zeroes the band
+                // (the stale-engine quirk above) faster than any repair, so
+                // the pixel half of this leg belongs to the run where real
+                // display passes keep frames honest. Knob and track are white
+                // at different ALPHAS, so the capture is composited over a
+                // known dark ground first; an undrawn overlay stays uniform
+                // and fails.
+                // Rendered-bitmap truth (§2.3): render the band's own
+                // drawing (the exact draw() body, parameterized) into an
+                // offscreen context of KNOWN geometry and assert real pixels
+                // over a dark ground. Deliberately not a cacheDisplay or
+                // window capture: cacheDisplay's internal layout pass
+                // re-zeroes the band via the stale-engine quirk documented on
+                // probeRepairPaneFrame, and CGWindowListCreateImage needs an
+                // on-screen composited window — neither exists in quiet runs.
+                let renderSize = NSSize(width: OverlayScrollerLayout.bandWidth,
+                                        height: 400)
+                let composed = NSImage(size: renderSize)
+                composed.lockFocus()
+                // Ground OPPOSITE the theme's knob color (light themes draw a
+                // black-alpha knob — the light-theme matrix leg caught a
+                // black-on-black uniform sample here).
+                (overlay.probeDarkGround ? NSColor.black : NSColor.white).setFill()
+                NSRect(origin: .zero, size: renderSize).fill()
+                overlay.renderBand(in: NSRect(origin: .zero, size: renderSize),
+                                   metrics: OverlayScrollerMetrics(
+                                       trackLength: renderSize.height,
+                                       proportion: pane.scrollThumbsize,
+                                       position: CGFloat(pane.scrollPosition)))
+                composed.unlockFocus()
+                guard let tiff = composed.tiffRepresentation,
+                      let bmp = NSBitmapImageRep(data: tiff) else {
+                    throw ProbeFailure("overlay band render unavailable")
+                }
+                // Middle third — the knob sits there at position 0.5.
+                let middle = CGRect(x: 0, y: renderSize.height / 3,
+                                    width: renderSize.width,
+                                    height: renderSize.height / 3)
+                try assertRendered(bmp, region: middle, what: "overlay scroller knob")
+                print("UIPROBE-SCROLLER band_rendered_ok=true")
+            },
+            onFailure: {
+                if let pane, let overlay = pane.scrollerOverlay {
+                    print("UIPROBE-SCROLLER hidden=\(overlay.isHidden) alpha=\(overlay.alphaValue) frame=\(overlay.frame) pane_bounds=\(pane.bounds) can_scroll=\(pane.canScroll)")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "overlay-scroller-drag", timeout: 8,
+            assert: { [self] in
+                if let pane { probeRepairPaneFrame(pane) }
+                guard let pane, let overlay = pane.scrollerOverlay,
+                      let knob = overlay.probeKnobFrame() else {
+                    throw ProbeFailure("drag leg: no knob")
+                }
+                let grab = NSPoint(x: knob.midX, y: knob.midY)
+                guard let down = probeMouseEvent(.leftMouseDown, in: overlay, at: grab) else {
+                    throw ProbeFailure("drag leg: could not synthesize events")
+                }
+                overlay.mouseDown(with: down)
+                guard overlay.probeVisible else {
+                    throw ProbeFailure("bar not pinned visible during a knob drag")
+                }
+                // To the very top of the track → oldest scrollback.
+                let top = NSPoint(x: knob.midX, y: knob.height / 2)
+                overlay.mouseDragged(with: probeMouseEvent(.leftMouseDragged, in: overlay, at: top)!)
+                let atTop = pane.scrollPosition
+                // And to the very bottom → live edge.
+                let bottom = NSPoint(x: knob.midX, y: overlay.bounds.height - knob.height / 2)
+                overlay.mouseDragged(with: probeMouseEvent(.leftMouseDragged, in: overlay, at: bottom)!)
+                let atBottom = pane.scrollPosition
+                overlay.mouseUp(with: probeMouseEvent(.leftMouseUp, in: overlay, at: bottom)!)
+                print("UIPROBE-SCROLLER drag_top_position=\(String(format: "%.3f", atTop)) drag_bottom_position=\(String(format: "%.3f", atBottom))")
+                guard atTop < 0.01 else {
+                    throw ProbeFailure("knob drag to top landed at \(atTop), want 0")
+                }
+                guard atBottom > 0.99 else {
+                    throw ProbeFailure("knob drag to bottom landed at \(atBottom), want 1")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "overlay-scroller-track-page", timeout: 8,
+            assert: { [self] in
+                if let pane { probeRepairPaneFrame(pane) }
+                guard let pane, let overlay = pane.scrollerOverlay,
+                      let knob = overlay.probeKnobFrame() else {
+                    throw ProbeFailure("page leg: no knob")
+                }
+                // Knob sits at the bottom (previous leg): click ABOVE it.
+                let before = pane.getTerminal().buffer.yDisp
+                let above = NSPoint(x: knob.midX, y: max(knob.minY - 10, 1))
+                overlay.mouseDown(with: probeMouseEvent(.leftMouseDown, in: overlay, at: above)!)
+                overlay.mouseUp(with: probeMouseEvent(.leftMouseUp, in: overlay, at: above)!)
+                let after = pane.getTerminal().buffer.yDisp
+                let rows = pane.getTerminal().rows
+                print("UIPROBE-SCROLLER page_up_ydisp \(before)->\(after) rows=\(rows)")
+                guard after == max(before - rows, 0), after < before else {
+                    throw ProbeFailure("track click above the knob did not page up (\(before)->\(after))")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "overlay-scroller-fades", timeout: 10,
+            action: {
+                // Back to the live bottom for the legs that follow; that is
+                // itself scroll activity — the fade condition then waits out
+                // the ~1s idle delay.
+                pane?.scroll(toPosition: 1.0)
+            },
+            condition: { pane?.scrollerOverlay?.probeVisible == false },
+            assert: {
+                guard let pane, let overlay = pane.scrollerOverlay else {
+                    throw ProbeFailure("fade leg: overlay lost")
+                }
+                // Hidden bar must not eat terminal mouse events: hit-testing
+                // its band resolves to nothing.
+                let bandPoint = NSPoint(x: overlay.frame.midX, y: overlay.frame.midY)
+                guard overlay.hitTest(bandPoint) == nil else {
+                    throw ProbeFailure("hidden scroller still intercepts mouse events in its band")
+                }
+                print("UIPROBE-SCROLLER faded=true hit_test_transparent=true")
+            },
+            onFailure: {
+                if let overlay = pane?.scrollerOverlay {
+                    print("UIPROBE-SCROLLER hidden=\(overlay.isHidden) alpha=\(overlay.alphaValue)")
+                }
+            }))
+    }
+
     // MARK: - Serial legs (pty pair — real /dev/cu.* NEVER touched; keep-list)
 
     private func addSerialSteps(_ probe: ProbeRunner) {
@@ -790,6 +1195,54 @@ extension MemtermAppDelegate {
             onFailure: {
                 let text = serialPane?.scrollbackText(maxLines: 200) ?? ""
                 print("UIPROBE-SERIAL rx_rendered=false tail=\(text.suffix(300))")
+            }))
+        // SCROLL UX: serial panes carry the same overlay scroll band, with
+        // its track stopped above the footer strip. Loopback RX fills the
+        // scrollback; a programmatic scroll must present the bar.
+        var serialBurst: [UInt8] = []
+        probe.add(ProbeStep(
+            name: "serial-scroller-band", timeout: 12,
+            action: {
+                var burst = ""
+                for i in 1...150 { burst += "srl-\(i)\r\n" }
+                serialBurst = Array(burst.utf8)
+            },
+            condition: { [self] in
+                // The master fd is NONBLOCKING and the pty buffer is small:
+                // the ~1.3KB burst goes out in short writes retried across
+                // polls as the pane's reader drains the slave side.
+                if !serialBurst.isEmpty {
+                    let n = serialBurst.withUnsafeBytes {
+                        write(serialMasterFD, $0.baseAddress, $0.count)
+                    }
+                    if n > 0 { serialBurst.removeFirst(n) }
+                }
+                guard let pane = serialPane else { return false }
+                probeRepairPaneFrame(pane)
+                return serialBurst.isEmpty && pane.canScroll
+                    && pane.scrollbackText(maxLines: 300).contains("srl-150")
+            },
+            assert: { [self] in
+                guard let pane = serialPane, let overlay = pane.scrollerOverlay else {
+                    throw ProbeFailure("serial pane has no overlay scroller")
+                }
+                probeRepairPaneFrame(pane)
+                let expectedHeight = pane.bounds.height - SerialFooterView.barHeight
+                guard abs(overlay.frame.height - expectedHeight) <= 1 else {
+                    throw ProbeFailure("scroll band overlaps the serial footer (band_h=\(overlay.frame.height) pane_h=\(pane.bounds.height))")
+                }
+                pane.scrollUp(lines: 5)
+                guard overlay.probeVisible, let knob = overlay.probeKnobFrame() else {
+                    throw ProbeFailure("serial overlay scroller did not appear on scroll")
+                }
+                print("UIPROBE-SCROLLER serial_band=true band_h=\(Int(overlay.frame.height)) knob_h=\(Int(knob.height))")
+                // Back to the live edge so later serial legs read fresh RX.
+                pane.scroll(toPosition: 1.0)
+            },
+            onFailure: {
+                if let pane = serialPane {
+                    print("UIPROBE-SCROLLER serial can_scroll=\(pane.canScroll) overlay=\(String(describing: pane.scrollerOverlay?.frame))")
+                }
             }))
         // CRLF TX transform: the pane's Enter (CR) must arrive as CRLF; the
         // nonblocking master read accumulates across condition polls.

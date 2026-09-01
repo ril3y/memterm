@@ -33,7 +33,15 @@ let package = Package(
         ),
         .testTarget(
             name: "MemtermCoreTests",
-            dependencies: ["MemtermCore"],
+            // SwiftTerm is here for the SCROLL UX stage's headless
+            // Terminal-layer tests (SelectionScrollAnchoringTests): selection
+            // coordinates must stay anchored to buffer content across
+            // feed-driven scroll/trim, which is a SwiftTerm truth the AppKit
+            // probe legs build on.
+            dependencies: [
+                "MemtermCore",
+                .product(name: "SwiftTerm", package: "SwiftTerm")
+            ],
             path: "Tests/MemtermCoreTests"
         )
     ]

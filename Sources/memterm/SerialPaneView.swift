@@ -187,7 +187,11 @@ final class SerialPaneView: PaneView {
     // MARK: - RX (feed) / TX (send override)
 
     /// Incoming bytes, on the main queue (SerialConnection's callbackQueue).
+    /// SCROLL UX: allowMouseReporting syncs on both sides of the feed, same
+    /// contract as PaneView.dataReceived — serial streams must not clear a
+    /// selection either.
     private func ingest(_ data: Data) {
+        syncAllowMouseReporting()
         if hexMode {
             var text = hexFormatter.append(data)
             if !text.isEmpty {
@@ -197,6 +201,7 @@ final class SerialPaneView: PaneView {
         } else {
             feed(byteArray: ArraySlice([UInt8](data)))
         }
+        syncAllowMouseReporting()
         onOutputActivity?()
     }
 
@@ -365,6 +370,8 @@ final class SerialPaneView: PaneView {
             footer.heightAnchor.constraint(equalToConstant: SerialFooterView.barHeight),
         ])
         footerView = footer
+        // SCROLL UX: the overlay scroll band stops above the footer strip.
+        scrollerBottomInset = SerialFooterView.barHeight
         refreshFooter()
         footer.updateCounters(tx: footerModel.txBytes, rx: footerModel.rxBytes)
     }
