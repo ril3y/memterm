@@ -942,13 +942,28 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
     }
 }
 
-/// Titlebar chip button whose right-click shows the same menu the left-click
-/// action pops up (FR-58). NSView's default rightMouseDown displays whatever
-/// menu(for:) returns.
+/// Chrome-row button whose right-click shows the menu its menuProvider
+/// returns (FR-58) — the two Settings gears are its users. NSView's default
+/// rightMouseDown displays whatever menu(for:) returns.
 final class ChipButton: NSButton {
     var menuProvider: (() -> NSMenu?)?
 
     override func menu(for event: NSEvent) -> NSMenu? {
         menuProvider?() ?? super.menu(for: event)
+    }
+
+    /// One Settings-gear setup for both homes (workspace-bar row, and the
+    /// tab strip's fallback gear shown when that row is hidden): left-click
+    /// opens Preferences, right-click pops the workspace switcher.
+    func configureAsSettingsGear(app: MemtermAppDelegate) {
+        menuProvider = { [weak app] in app?.makeWorkspacePopUpMenu() }
+        isBordered = false
+        setButtonType(.momentaryChange)
+        image = NSImage(systemSymbolName: "gearshape",
+                        accessibilityDescription: "Settings")
+        contentTintColor = .secondaryLabelColor
+        toolTip = "Settings (right-click: workspaces)"
+        target = app
+        action = #selector(MemtermAppDelegate.openPreferences(_:))
     }
 }

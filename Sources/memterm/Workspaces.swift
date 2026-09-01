@@ -655,9 +655,7 @@ extension MemtermAppDelegate {
         for workspace in list { byId[workspace.id] = workspace }
         for host in hosts {
             let workspace = host.workspaceId.flatMap { byId[$0] }
-            host.updateWorkspaceChip(
-                name: workspace?.name ?? "Workspace",
-                color: Self.nsColor(hex: workspace?.color ?? StateStore.defaultWorkspaceColor))
+            host.updateGearTooltip(workspaceName: workspace?.name ?? "Workspace")
             host.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId,
                                     activity: activity)
         }

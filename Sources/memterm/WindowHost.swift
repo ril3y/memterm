@@ -109,17 +109,7 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         workspaceBar = bar
         bar.translatesAutoresizingMaskIntoConstraints = false
         barRow.addSubview(bar)
-        gearButton.menuProvider = { [weak self] in
-            self.map { $0.app.makeWorkspacePopUpMenu() }
-        }
-        gearButton.isBordered = false
-        gearButton.setButtonType(.momentaryChange)
-        gearButton.image = NSImage(systemSymbolName: "gearshape",
-                                   accessibilityDescription: "Settings")
-        gearButton.contentTintColor = .secondaryLabelColor
-        gearButton.toolTip = "Settings (right-click: workspaces)"
-        gearButton.target = app
-        gearButton.action = #selector(MemtermAppDelegate.openPreferences(_:))
+        gearButton.configureAsSettingsGear(app: app)
         gearButton.translatesAutoresizingMaskIntoConstraints = false
         barRow.addSubview(gearButton)
         barRow.translatesAutoresizingMaskIntoConstraints = false
@@ -205,10 +195,9 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         tabs.first { tab in tab.allPanes().contains { $0 === pane } }
     }
 
-    func attach(_ tab: TerminalWindowController, at index: Int? = nil, select: Bool) {
+    func attach(_ tab: TerminalWindowController, select: Bool) {
         tab.host = self
-        let insertAt = min(index ?? tabs.count, tabs.count)
-        tabs.insert(tab, at: insertAt)
+        tabs.append(tab)
         updateChromeVisibility()
         tabStrip.reload()
         if select || selectedTab == nil {
@@ -449,8 +438,11 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         updateChromeVisibility()  // workspace_bar visibility follows config flips
     }
 
-    func updateWorkspaceChip(name: String, color: NSColor) {
-        gearButton.toolTip = "Settings — workspace: \(name) (right-click to switch)"
+    /// Names the active workspace on the bar-row gear's tooltip. (When the
+    /// workspace row is hidden, the strip's fallback gear keeps its generic
+    /// tooltip — accepted divergence, tooltip-only.)
+    func updateGearTooltip(workspaceName: String) {
+        gearButton.toolTip = "Settings — workspace: \(workspaceName) (right-click to switch)"
     }
 
     func beginWorkspaceRename(_ workspaceId: String) {

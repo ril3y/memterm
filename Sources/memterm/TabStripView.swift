@@ -78,15 +78,7 @@ final class TabStripView: NSVisualEffectView {
         plusButton.action = #selector(MemtermAppDelegate.newWindowForTab(_:))
         addSubview(plusButton)
 
-        gearButton.menuProvider = { [weak app] in app?.makeWorkspacePopUpMenu() }
-        gearButton.isBordered = false
-        gearButton.setButtonType(.momentaryChange)
-        gearButton.image = NSImage(systemSymbolName: "gearshape",
-                                   accessibilityDescription: "Settings")
-        gearButton.contentTintColor = .secondaryLabelColor
-        gearButton.toolTip = "Settings (right-click: workspaces)"
-        gearButton.target = app
-        gearButton.action = #selector(MemtermAppDelegate.openPreferences(_:))
+        gearButton.configureAsSettingsGear(app: app)
         gearButton.isHidden = true
         addSubview(gearButton)
 
@@ -425,10 +417,6 @@ final class TabItemView: NSView {
             label.textColor = .secondaryLabelColor
         }
         label.font = NSFont.systemFont(ofSize: 11, weight: selected ? .semibold : .medium)
-    }
-
-    func applyActivity(_ state: TabActivityState) {
-        activityView.apply(state: selected ? .idle : state)
     }
 
     override func viewDidChangeEffectiveAppearance() {

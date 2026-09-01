@@ -293,12 +293,6 @@ final class MemoryEngine {
         try? String(contentsOf: scrollbackURL(for: paneId), encoding: .utf8)
     }
 
-    // MARK: - Restore support
-
-    func loadStateForRestore() -> [WindowRestore] {
-        store.loadState()
-    }
-
     // MARK: - Flush (quit / poweroff)
 
     /// Call BEFORE isTerminating is set: windows must still be open so the
