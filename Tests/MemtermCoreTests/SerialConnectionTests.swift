@@ -78,6 +78,38 @@ final class SerialConnectionTests: XCTestCase {
         XCTAssertEqual(received, Data("from-device".utf8))
     }
 
+    func testOnTrafficReportsRxAndTxByteCounts() throws {
+        // The footer-bar counter hook: write() reports TX bytes that reached
+        // the fd, the read pump reports RX bytes, both on the callback queue.
+        let pty = try openPTY()
+        let queue = DispatchQueue(label: "test.serial.traffic")
+        let conn = SerialConnection(path: pty.slavePath, callbackQueue: queue)
+        defer { conn.close() }
+        try conn.open(settings: SerialSettings())
+
+        var rxTotal = 0, txTotal = 0
+        let sawTx = expectation(description: "tx counted")
+        let sawRx = expectation(description: "rx counted")
+        var txFulfilled = false, rxFulfilled = false
+        conn.onTraffic = { rx, tx in
+            rxTotal += rx
+            txTotal += tx
+            if txTotal >= 12, !txFulfilled { txFulfilled = true; sawTx.fulfill() }
+            if rxTotal >= 11, !rxFulfilled { rxFulfilled = true; sawRx.fulfill() }
+        }
+
+        try conn.write(Data("hello serial".utf8))          // 12 bytes TX
+        _ = readMaster(pty.master, count: 12)
+        wait(for: [sawTx], timeout: 2)
+        XCTAssertEqual(txTotal, 12)
+        XCTAssertEqual(rxTotal, 0)
+
+        write(pty.master, "from-device", 11)               // 11 bytes RX
+        wait(for: [sawRx], timeout: 2)
+        XCTAssertEqual(rxTotal, 11)
+        XCTAssertEqual(txTotal, 12)
+    }
+
     func testTermiosAppliedAndReadBack() throws {
         let pty = try openPTY()
         let conn = SerialConnection(path: pty.slavePath,

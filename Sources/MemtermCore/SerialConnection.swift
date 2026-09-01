@@ -38,6 +38,13 @@ public struct SerialModemLines: Equatable {
     public let rts: Bool
     public let cts: Bool
     public let carrierDetect: Bool
+
+    public init(dtr: Bool, rts: Bool, cts: Bool, carrierDetect: Bool) {
+        self.dtr = dtr
+        self.rts = rts
+        self.cts = cts
+        self.carrierDetect = carrierDetect
+    }
 }
 
 public final class SerialConnection {
@@ -49,6 +56,11 @@ public final class SerialConnection {
     /// Clean EOF from the peer (device unplugged / master side closed);
     /// the connection tears itself down first, then fires this once.
     public var onDisconnect: (() -> Void)?
+    /// Byte-count deltas `(rx, tx)` as they cross the fd — the read pump
+    /// reports what it read, write() reports what it actually wrote (partial
+    /// writes before a timeout included). Fired on `callbackQueue`; the
+    /// footer bar's lifetime counters hang off this.
+    public var onTraffic: ((Int, Int) -> Void)?
 
     private let callbackQueue: DispatchQueue
     private let readQueue = DispatchQueue(label: "memterm.serial.read")
@@ -168,9 +180,15 @@ public final class SerialConnection {
             }
             break
         }
-        if !collected.isEmpty, let handler = onData {
-            let data = collected
-            callbackQueue.async { handler(data) }
+        if !collected.isEmpty {
+            if let traffic = onTraffic {
+                let count = collected.count
+                callbackQueue.async { traffic(count, 0) }
+            }
+            if let handler = onData {
+                let data = collected
+                callbackQueue.async { handler(data) }
+            }
         }
         if sawEOF { disconnectNow() }
     }
@@ -214,6 +232,15 @@ public final class SerialConnection {
         let deadline = Date(timeIntervalSinceNow: timeout)
         let bytes = [UInt8](data)
         var written = 0
+        // TX counter hook: report what actually reached the fd, on success
+        // AND on a throw after partial progress — the counter is about bytes
+        // on the wire, not about call outcomes.
+        defer {
+            if written > 0, let traffic = onTraffic {
+                let count = written
+                callbackQueue.async { traffic(0, count) }
+            }
+        }
         while written < bytes.count {
             let n = bytes.withUnsafeBytes {
                 Darwin.write(fd, $0.baseAddress! + written, $0.count - written)

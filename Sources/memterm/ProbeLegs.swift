@@ -819,6 +819,135 @@ extension MemtermAppDelegate {
             onFailure: {
                 print("UIPROBE-SERIAL tx_bytes=\(serialTxReceived.utf8.count) crlf_transform=false got=\(serialTxReceived.debugDescription)")
             }))
+        // Footer bar (founder ask): strip pinned to the serial pane's bottom;
+        // TX/RX lifetime counters advanced by the loopback bytes above and
+        // painted through the ≤4 Hz throttle (the condition rides the
+        // trailing flush, not a clock).
+        probe.add(ProbeStep(
+            name: "serial-footer-counters", timeout: 10,
+            condition: {
+                guard let pane = serialPane, let footer = pane.footerView else { return false }
+                return pane.footerModel.rxBytes > 0 && pane.footerModel.txBytes > 0
+                    && footer.probeRxText != "RX 0 B" && footer.probeTxText != "TX 0 B"
+            },
+            assert: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    throw ProbeFailure("serial pane lost (footer leg)")
+                }
+                // Pinned to the bottom edge, full width, 22 pt (find-bar family).
+                pane.layoutSubtreeIfNeeded()
+                let frame = footer.frame
+                guard footer.superview === pane,
+                      frame.height == SerialFooterView.barHeight,
+                      frame.minY <= 1, frame.width >= pane.bounds.width - 1 else {
+                    throw ProbeFailure("footer not pinned to the pane bottom (frame=\(frame) pane=\(pane.bounds))")
+                }
+                // Painted truth: the labels carry the model's formatted totals.
+                let model = pane.footerModel
+                guard footer.probeTxText == "TX \(SerialFooterModel.formatBytes(model.txBytes))",
+                      footer.probeRxText == "RX \(SerialFooterModel.formatBytes(model.rxBytes))" else {
+                    throw ProbeFailure("footer counters disagree with the model (\(footer.probeTxText) / \(footer.probeRxText) vs tx=\(model.txBytes) rx=\(model.rxBytes))")
+                }
+                guard footer.currentLinkState == .connected else {
+                    throw ProbeFailure("footer state dot not connected-green while connected")
+                }
+                // HEX badge rides the hex lens (toggled on in serial-tx-crlf).
+                guard footer.probeHexBadgeVisible == pane.hexMode else {
+                    throw ProbeFailure("HEX badge=\(footer.probeHexBadgeVisible) disagrees with hex lens=\(pane.hexMode)")
+                }
+                // Rendered-bitmap truth for the strip itself (§2.3 discipline).
+                if let bmp = probeBitmap(pane) {
+                    try assertRendered(bmp, region: footer.convert(footer.bounds, to: pane),
+                                       what: "serial footer strip")
+                }
+                print("UIPROBE-SERIAL footer_present=true tx=\(footer.probeTxText) rx=\(footer.probeRxText) hex_badge=\(footer.probeHexBadgeVisible)")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL footer_present=\(serialPane?.footerView != nil) model_tx=\(serialPane?.footerModel.txBytes ?? -1) model_rx=\(serialPane?.footerModel.rxBytes ?? -1) tx_label=\(serialPane?.footerView?.probeTxText ?? "-") rx_label=\(serialPane?.footerView?.probeRxText ?? "-")")
+            }))
+        // Baud change from the footer control applies termios on the LIVE fd
+        // (the port never closes) — asserted by kernel readback through the
+        // currentTermios test seam, then round-tripped home so the journal
+        // leg's 115200-8N1 fixture settings stand.
+        probe.add(ProbeStep(
+            name: "serial-footer-baud-live", timeout: 8,
+            action: {
+                // Same NSMenuItem + action a human selection drives; only the
+                // modal popUp is skipped (a probe cannot dismiss a tracking menu).
+                serialPane?.footerView?.probeSelectBaud(9600)
+            },
+            condition: {
+                guard let pane = serialPane, var t = pane.currentTermiosForProbe()
+                else { return false }
+                return cfgetispeed(&t) == 9600 && cfgetospeed(&t) == 9600
+            },
+            assert: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    throw ProbeFailure("serial pane lost (baud leg)")
+                }
+                guard pane.isConnected else {
+                    throw ProbeFailure("baud change closed the port — must apply live")
+                }
+                guard pane.setup.settings.baud == 9600,
+                      footer.probeBaudTitle == "9600",
+                      pane.paneTitle.contains("@ 9600") else {
+                    throw ProbeFailure("baud did not propagate (settings=\(pane.setup.settings.compactString) footer=\(footer.probeBaudTitle) title=\(pane.paneTitle))")
+                }
+                print("UIPROBE-SERIAL baud_live_applied=true termios_ispeed=9600 footer_baud=\(footer.probeBaudTitle) still_connected=true")
+                // Round-trip home (also proves a second live apply).
+                footer.probeSelectBaud(115200)
+                guard var t = pane.currentTermiosForProbe(),
+                      cfgetispeed(&t) == 115200, pane.setup.settings.baud == 115200 else {
+                    throw ProbeFailure("return to 115200 did not land on the fd")
+                }
+            },
+            onFailure: {
+                var speed: speed_t = 0
+                if var t = serialPane?.currentTermiosForProbe() { speed = cfgetispeed(&t) }
+                print("UIPROBE-SERIAL baud_live_applied=false termios_ispeed=\(speed) settings=\(serialPane?.setup.settings.compactString ?? "-") connected=\(serialPane?.isConnected == true)")
+            }))
+        // DTR/RTS chips: filled = asserted, click toggles — driven through
+        // the REAL chip button action (gesture fidelity). Ptys ENOTTY every
+        // modem-line ioctl, so the pane's stub seam stands in for the fd;
+        // the gesture path footer → pane → line state is what's under test.
+        probe.add(ProbeStep(
+            name: "serial-footer-dtr-chip", timeout: 8,
+            action: {
+                guard let pane = serialPane else { probeFail("serial pane lost (dtr leg)") }
+                pane.probeModemLinesStub = SerialModemLines(dtr: false, rts: true,
+                                                            cts: false, carrierDetect: false)
+                pane.refreshFooter()
+                pane.footerView?.dtrChip.performClick(nil)
+            },
+            condition: {
+                serialPane?.probeModemLinesStub?.dtr == true
+                    && serialPane?.footerView?.dtrChip.isFilled == true
+            },
+            assert: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    throw ProbeFailure("serial pane lost (dtr leg)")
+                }
+                // RTS chip mirrors its line too (stubbed asserted).
+                guard footer.rtsChip.isFilled else {
+                    throw ProbeFailure("RTS chip not filled while the line is asserted")
+                }
+                // Second toggle through the same gesture: chip empties.
+                footer.dtrChip.performClick(nil)
+                guard pane.probeModemLinesStub?.dtr == false, !footer.dtrChip.isFilled else {
+                    throw ProbeFailure("DTR chip did not reflect the toggle back off")
+                }
+                // The footer never steals first responder from the terminal.
+                if let fr = pane.window?.firstResponder as? NSView,
+                   fr.isDescendant(of: footer) {
+                    throw ProbeFailure("footer control took first responder: \(fr)")
+                }
+                pane.probeModemLinesStub = nil
+                pane.refreshFooter()
+                print("UIPROBE-SERIAL dtr_chip_reflects=true rts_chip_filled_when_asserted=true footer_never_steals_focus=true")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL dtr_chip_reflects=false stub_dtr=\(serialPane?.probeModemLinesStub?.dtr == true) chip_filled=\(serialPane?.footerView?.dtrChip.isFilled == true)")
+            }))
         probe.add(ProbeStep(
             name: "serial-hex-echo", timeout: 10,
             condition: {
@@ -862,7 +991,12 @@ extension MemtermAppDelegate {
                     && !pane.isConnected
             },
             assert: {
-                print("UIPROBE-SERIAL disconnect_banner=true still_connected=false")
+                // Footer dot: unplug arms auto-reconnect — orange, driven by
+                // the same liveness/hotplug machinery as the banner.
+                guard serialPane?.footerView?.currentLinkState == .reconnecting else {
+                    throw ProbeFailure("footer dot not reconnecting-orange after unplug (state=\(String(describing: serialPane?.footerView?.currentLinkState)))")
+                }
+                print("UIPROBE-SERIAL disconnect_banner=true still_connected=false footer_state=reconnecting")
             },
             onFailure: {
                 let text = serialPane?.scrollbackText(maxLines: 200) ?? ""
@@ -913,6 +1047,13 @@ extension MemtermAppDelegate {
                 guard !pane.isConnected, pane.pendingReconnectOffer else {
                     throw ProbeFailure("serial restore offer (consent gate)")
                 }
+                // Footer on the RESTORED pane: present, gray dot (waiting on
+                // the ⌘R consent gesture — never auto-open).
+                guard let footer = pane.footerView,
+                      footer.currentLinkState == .disconnected else {
+                    throw ProbeFailure("restored serial footer missing or not disconnected-gray (state=\(String(describing: pane.footerView?.currentLinkState)))")
+                }
+                print("UIPROBE-SERIAL restored_footer_present=true footer_state=disconnected")
                 // ⌘R with the device absent: an honest line, no open.
                 typeResumeCommand(nil)
             },

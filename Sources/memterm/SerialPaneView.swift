@@ -55,11 +55,23 @@ final class SerialPaneView: PaneView {
     /// Fired when connect/disconnect state changes (title refresh).
     var onSerialStateChanged: (() -> Void)?
 
+    // -- Footer bar (SerialFooterModel owns the logic; the strip is thin) --
+    /// Lifetime TX/RX counters + repaint throttle. Lives on the PANE, so the
+    /// counts survive reconnects by construction.
+    private(set) var footerModel = SerialFooterModel()
+    private(set) var footerView: SerialFooterView?
+    private var footerFlushTimer: Timer?
+    /// Test seam (ptys answer every modem-line ioctl with ENOTTY): when set,
+    /// DTR/RTS reads and toggles go through this stub instead of the fd, so
+    /// the probe can drive the chip gesture end to end. nil in real use.
+    var probeModemLinesStub: SerialModemLines?
+
     init(setup: Setup, frame: NSRect, font: NSFont, options: TerminalOptions) {
         self.setup = setup
         super.init(frame: frame, font: font, options: options)
         paneTitle = SerialAdapter.paneTitle(path: setup.path, baud: setup.settings.baud)
         shellPath = nil
+        installFooter()
     }
 
     @available(*, unavailable)
@@ -82,6 +94,7 @@ final class SerialPaneView: PaneView {
         let conn = SerialConnection(path: setup.path)
         conn.onData = { [weak self] data in self?.ingest(data) }
         conn.onDisconnect = { [weak self] in self?.handleDisconnect() }
+        conn.onTraffic = { [weak self] rx, tx in self?.noteTraffic(rx: rx, tx: tx) }
         try conn.open(settings: setup.settings)
         connection = conn
         isConnected = true
@@ -89,6 +102,7 @@ final class SerialPaneView: PaneView {
         pendingReconnectOffer = false
         paneTitle = SerialAdapter.paneTitle(path: setup.path, baud: setup.settings.baud)
         onSerialStateChanged?()
+        refreshFooter()
     }
 
     /// Closes the connection without any banner (pane close / app teardown).
@@ -97,6 +111,8 @@ final class SerialPaneView: PaneView {
         connection?.close()
         connection = nil
         isConnected = false
+        footerFlushTimer?.invalidate()
+        footerFlushTimer = nil
     }
 
     /// EOF / vanished device on a LIVE session: banner + arm auto-reconnect.
@@ -107,6 +123,7 @@ final class SerialPaneView: PaneView {
         awaitingDeviceReturn = true
         feedDim("memterm: device disconnected — will reconnect when it returns")
         onSerialStateChanged?()
+        refreshFooter()
     }
 
     /// IOKit terminated notification for this pane's device. The read pump's
@@ -243,27 +260,47 @@ final class SerialPaneView: PaneView {
         hexMode = on
         hexFormatter = HexDumpFormatter()
         feed(text: "\u{1b}[36m── hex view \(on ? "on" : "off") ──\u{1b}[0m\r\n")
+        refreshFooter()
     }
 
     // MARK: - Line control (explicit user actions only — never on open)
 
     /// Current DTR/RTS/CTS/CD, nil where the device has no modem lines.
     func currentModemLines() -> SerialModemLines? {
-        try? connection?.modemLines()
+        if let stub = probeModemLinesStub { return isConnected ? stub : nil }
+        return try? connection?.modemLines()
     }
 
     func toggleDTR() {
+        if let stub = probeModemLinesStub {  // test seam — see declaration
+            probeModemLinesStub = SerialModemLines(dtr: !stub.dtr, rts: stub.rts,
+                                                   cts: stub.cts,
+                                                   carrierDetect: stub.carrierDetect)
+            feedDim("memterm: DTR \(!stub.dtr ? "asserted" : "deasserted")")
+            refreshFooter()
+            return
+        }
         withModemLines { lines, conn in
             try conn.setModemLine(dtr: !lines.dtr)
             self.feedDim("memterm: DTR \(!lines.dtr ? "asserted" : "deasserted")")
         }
+        refreshFooter()
     }
 
     func toggleRTS() {
+        if let stub = probeModemLinesStub {  // test seam — see declaration
+            probeModemLinesStub = SerialModemLines(dtr: stub.dtr, rts: !stub.rts,
+                                                   cts: stub.cts,
+                                                   carrierDetect: stub.carrierDetect)
+            feedDim("memterm: RTS \(!stub.rts ? "asserted" : "deasserted")")
+            refreshFooter()
+            return
+        }
         withModemLines { lines, conn in
             try conn.setModemLine(rts: !lines.rts)
             self.feedDim("memterm: RTS \(!lines.rts ? "asserted" : "deasserted")")
         }
+        refreshFooter()
     }
 
     func sendBreakSignal() {
@@ -309,6 +346,118 @@ final class SerialPaneView: PaneView {
         } catch {
             feedDim("memterm: line control failed (\(Self.describe(error)))")
         }
+    }
+
+    // MARK: - Footer bar (state dot · port · settings · counters · chips)
+
+    private func installFooter() {
+        let footer = SerialFooterView()
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.onSelectBaud = { [weak self] baud in self?.applyBaud(baud) }
+        footer.onCustomBaud = { [weak self] in self?.promptCustomBaud() }
+        footer.onToggleDTR = { [weak self] in self?.toggleDTR() }
+        footer.onToggleRTS = { [weak self] in self?.toggleRTS() }
+        addSubview(footer)
+        NSLayoutConstraint.activate([
+            footer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: SerialFooterView.barHeight),
+        ])
+        footerView = footer
+        refreshFooter()
+        footer.updateCounters(tx: footerModel.txBytes, rx: footerModel.rxBytes)
+    }
+
+    /// Repaints everything but the counters (those ride the throttle).
+    func refreshFooter() {
+        footerView?.update(
+            state: SerialFooterModel.linkState(isConnected: isConnected,
+                                               awaitingDeviceReturn: awaitingDeviceReturn),
+            portName: SerialAdapter.shortName(forPath: setup.path),
+            settings: setup.settings, hexOn: hexMode, lines: currentModemLines())
+    }
+
+    /// SerialConnection's onTraffic hook (main queue). The model throttles
+    /// repaints to ≤4 Hz; a one-shot trailing timer flushes whatever a burst
+    /// left unpainted, so the counters always settle on the true totals.
+    private func noteTraffic(rx: Int, tx: Int) {
+        if footerModel.recordTraffic(rx: rx, tx: tx,
+                                     now: ProcessInfo.processInfo.systemUptime) {
+            footerView?.updateCounters(tx: footerModel.txBytes, rx: footerModel.rxBytes)
+        } else if footerFlushTimer == nil {
+            footerFlushTimer = Timer.scheduledTimer(withTimeInterval: footerModel.minInterval,
+                                                    repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.footerFlushTimer = nil
+                if self.footerModel.flushPendingRepaint(now: ProcessInfo.processInfo.systemUptime) {
+                    self.footerView?.updateCounters(tx: self.footerModel.txBytes,
+                                                    rx: self.footerModel.rxBytes)
+                }
+            }
+        }
+    }
+
+    /// Footer baud menu selection: re-applies termios on the LIVE fd
+    /// (picocom-style — the port never closes). On failure the old settings
+    /// stand and the failure surfaces as a dim line.
+    func applyBaud(_ baud: Int) {
+        guard baud > 0 else { return }
+        var settings = setup.settings
+        settings.baud = baud
+        applyLiveSettings(settings)
+    }
+
+    /// The general half of applyBaud, for any settings change from footer or
+    /// future UI. Disconnected panes just adopt the settings for the next
+    /// open (the journal picks them up on the next poll).
+    func applyLiveSettings(_ newSettings: SerialSettings) {
+        guard newSettings != setup.settings else { return }
+        if isConnected, let conn = connection {
+            do {
+                try conn.apply(settings: newSettings)
+                feedDim("memterm: line settings now \(newSettings.compactString) (applied live)")
+            } catch {
+                feedDim("memterm: could not apply \(newSettings.compactString) (\(Self.describe(error))) — keeping \(setup.settings.compactString)")
+                refreshFooter()
+                return
+            }
+        }
+        setup.settings = newSettings
+        paneTitle = SerialAdapter.paneTitle(path: setup.path, baud: newSettings.baud)
+        onSerialStateChanged?()
+        refreshFooter()
+    }
+
+    /// "Custom…" in the footer's baud menu: one numeric field, sheet on the
+    /// pane's window (the promptSendHex pattern).
+    private func promptCustomBaud() {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Custom Baud Rate"
+        alert.informativeText = "Applied live to the open port. Non-standard rates use the driver's arbitrary-rate path."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 160, height: 24))
+        field.placeholderString = "\(setup.settings.baud)"
+        field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Apply")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self else { return }
+            let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+            guard let baud = Int(text), baud > 0 else {
+                if !text.isEmpty { self.feedDim("memterm: not a baud rate: \(text)") }
+                return
+            }
+            self.applyBaud(baud)
+        }
+    }
+
+    /// Test seam: termios readback off the live fd, so the probe can assert
+    /// a footer baud change actually reached the kernel (nil when closed).
+    func currentTermiosForProbe() -> termios? {
+        try? connection?.currentTermios()
     }
 
     // MARK: - Journal / restore support
