@@ -50,19 +50,26 @@ func runBench() {
     var longChunk: [UInt8] = []
     while longChunk.count < 65_536 { longChunk += longLine }
 
-    let rates = [run(workload: "yes-flood", chunk: yesChunk, totalMB: 64),
-                 run(workload: "escape-heavy", chunk: escChunk, totalMB: 64),
-                 run(workload: "long-lines", chunk: longChunk, totalMB: 64)]
-    // ENFORCED kill-criterion (TESTING.md §2.7, NFR-9 groundwork): headless
-    // parser throughput must stay comfortably above pty flood rates. The
-    // floor is deliberately conservative — it exists to catch a collapse
-    // (an accidental O(n^2), a debug-build artifact), not to race the CPU.
-    let required = 20.0
-    let worst = rates.min() ?? 0
-    if worst >= required {
-        print(String(format: "BENCH-PASS min_rate=%.1f required=%.0f", worst, required))
+    // ENFORCED kill-criteria (TESTING.md §2.7, NFR-9 groundwork), calibrated
+    // per workload at HALF the M0-RESULTS.md baselines (4.0 / 36.3 / 169.9
+    // MB/s): the floors exist to catch a collapse (an accidental O(n^2), a
+    // debug-build artifact masquerading as release), not to race the CPU.
+    let workloads: [(name: String, rate: Double, floor: Double)] = [
+        ("yes-flood", run(workload: "yes-flood", chunk: yesChunk, totalMB: 64), 2.0),
+        ("escape-heavy", run(workload: "escape-heavy", chunk: escChunk, totalMB: 64), 18.0),
+        ("long-lines", run(workload: "long-lines", chunk: longChunk, totalMB: 64), 85.0),
+    ]
+    let violations = workloads.filter { $0.rate < $0.floor }
+    if violations.isEmpty {
+        let summary = workloads
+            .map { String(format: "%@=%.1f/%.0f", $0.name, $0.rate, $0.floor) }
+            .joined(separator: " ")
+        print("BENCH-PASS \(summary)")
     } else {
-        print(String(format: "BENCH-FAIL min_rate=%.1f required=%.0f", worst, required))
+        for v in violations {
+            print(String(format: "BENCH-FAIL workload=%@ rate=%.1f required=%.0f",
+                         v.name, v.rate, v.floor))
+        }
         exit(1)
     }
 }

@@ -124,7 +124,7 @@ printf '[theme]\nbackground = "#1d1f21"\nforeground = "#c5c8c6"\ncursor = "#c5c8
 MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" "$BIN" --config-dump > "$LOG/config-dump.log" 2>&1
 check "config-dump" "$LOG/config-dump.log" "^config: "
 
-"$BIN" --bench   > "$LOG/bench.log" 2>&1;  check "bench"   "$LOG/bench.log"   "BENCH-PASS min_rate="
+"$BIN" --bench   > "$LOG/bench.log" 2>&1;  check "bench"   "$LOG/bench.log"   "BENCH-PASS "
 "$BIN" --latency > "$LOG/latency.log" 2>&1; check "latency" "$LOG/latency.log" "LATENCY-PASS p95_total="
 "$BIN" --flood   > "$LOG/flood.log" 2>&1;  check "flood"   "$LOG/flood.log"   "FLOOD-PASS worst_stall="
 
