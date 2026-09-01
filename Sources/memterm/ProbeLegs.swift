@@ -272,6 +272,18 @@ extension MemtermAppDelegate {
                     try assertChipVisible(chipFrame: frame, in: bmp,
                                           what: "chip \(id.prefix(8))")
                 }
+                // Text half (meta-gate hardening): the whole-chip sample can
+                // be carried by the color dot / active background while the
+                // NAME is invisible — sample each label's own region so
+                // washed-out text fails on its own.
+                let labels = bar.probeChipLabelFrames()
+                guard labels.count == chips.count else {
+                    throw ProbeFailure("chip labels missing: \(labels.count) labels for \(chips.count) chips")
+                }
+                for (id, frame) in labels {
+                    try assertChipVisible(chipFrame: frame, in: bmp,
+                                          what: "chip \(id.prefix(8)) label text")
+                }
                 // Success-path evidence for the verify report (§3.4 item 5):
                 // what the gate SAW, per config, human-eyeballable.
                 if let shot = probeScreenshot(bar, name: "chip-bar-opacity-\(config.windowOpacity)") {

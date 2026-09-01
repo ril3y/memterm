@@ -163,6 +163,19 @@ final class WorkspaceBarView: NSVisualEffectView {
             return (id, chip.convert(chip.bounds, to: self))
         }
     }
+
+    /// TESTING.md §2.3 (bug 2, text half): each chip's LABEL frame in bar
+    /// coordinates. The whole-chip sample can be carried by the color dot /
+    /// active background while the text itself is invisible — meta-gate
+    /// mutation (chip text alpha 0.05) proved it — so the gate samples the
+    /// text region separately.
+    func probeChipLabelFrames() -> [(id: String, frame: NSRect)] {
+        chipsById.compactMap { id, chip in
+            guard chip.superview != nil, chip.frame.width >= 1,
+                  chip.probeLabelFrame.width >= 1 else { return nil }
+            return (id, chip.convert(chip.probeLabelFrame, to: self))
+        }
+    }
 }
 
 /// One workspace chip: color dot + name, rounded background when active,
@@ -287,6 +300,10 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     var probeTitle: String {
         "\(name)\(isActive ? "*" : "")\(isParked ? "(parked)" : "")"
     }
+
+    /// The name label's frame (chip coordinates) — the text region the bug-2
+    /// gate samples independently of the dot/background decorations.
+    var probeLabelFrame: NSRect { label.frame }
 
     func configure(name: String, color: NSColor, isActive: Bool, isParked: Bool,
                    activity: TabActivityState = .idle) {
