@@ -390,6 +390,13 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         window.backgroundColor = opaque
             ? bg : bg.withAlphaComponent(config.effectiveOpacity)
         blurView.isHidden = opaque || !config.windowBlur
+        // The chrome rows never go translucent (founder bug 2026-09-01: at
+        // window_opacity 0.37 the workspace chips washed out to invisible —
+        // "we cannot see the workspaces"). Transparency is a terminal-content
+        // effect; the strip/bar keep a solid ground like every browser's tab
+        // bar over a translucent page.
+        chromeStack.wantsLayer = true
+        chromeStack.layer?.backgroundColor = bg.withAlphaComponent(1).cgColor
     }
 
     /// Called by tabs when their title, color, or activity mark changed.
