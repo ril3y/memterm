@@ -72,6 +72,15 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         window.title = "memterm"
         // Custom chrome: the strip draws titles; native tabbing is OFF.
         window.titleVisibility = .hidden
+        // Founder bug 2026-09-01 ("no workspaces bar, looks all the same"):
+        // with .fullSizeContentView the titlebar still paints its material
+        // OVER the content's top band — exactly where the workspace bar row
+        // sits — hiding it on every real launch. Content-view bitmap probes
+        // could not see this (they render below the titlebar overlay); only
+        // a composited window capture can. Transparent titlebar lets the
+        // chrome rows show through; the bar's leadingInset already clears
+        // the traffic lights.
+        window.titlebarAppearsTransparent = true
         window.tabbingMode = .disallowed
         if let frame {
             window.setFrame(frame, display: false)
