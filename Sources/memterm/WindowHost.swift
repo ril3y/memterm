@@ -59,13 +59,16 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     init(app: MemtermAppDelegate, frame: NSRect?) {
         self.app = app
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let window = NSWindow(
-            contentRect: rect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable,
-                        .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
+        let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable,
+                                             .resizable, .fullSizeContentView]
+        // Quiet probe/smoke runs (TESTING.md §2.5) position windows offscreen
+        // — ProbeQuietWindow disables AppKit's frame constraining so they
+        // stay there.
+        let window = ProbeSupport.quiet
+            ? ProbeQuietWindow(contentRect: rect, styleMask: styleMask,
+                               backing: .buffered, defer: false)
+            : NSWindow(contentRect: rect, styleMask: styleMask,
+                       backing: .buffered, defer: false)
         window.title = "memterm"
         // Custom chrome: the strip draws titles; native tabbing is OFF.
         window.titleVisibility = .hidden
@@ -74,6 +77,10 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
             window.setFrame(frame, display: false)
         } else {
             window.center()
+        }
+        if ProbeSupport.quiet {
+            window.setFrameOrigin(NSPoint(x: -4000 - window.frame.width,
+                                          y: window.frame.origin.y))
         }
         if let bg = app.config.themeBackgroundColor { window.backgroundColor = bg }
         super.init(window: window)

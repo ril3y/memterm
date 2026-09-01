@@ -57,12 +57,17 @@ final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTermi
         let shellName = (shell as NSString).lastPathComponent
         termView.startProcess(executable: shell, execName: "-\(shellName)")
 
+        // TESTING.md §2.7: every perf gate log self-identifies its binary and
+        // records occlusion state so numbers are interpretable.
+        let occluded = !window.occlusionState.contains(.visible)
         switch mode {
         case .interactive:
             break
         case .latency:
+            print("LATENCY-BEGIN build=\(BuildStamp.describe) occluded=\(occluded)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.runLatencyProbe() }
         case .flood:
+            print("FLOOD-BEGIN build=\(BuildStamp.describe) occluded=\(occluded)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.runFloodProbe() }
         }
     }
@@ -125,7 +130,21 @@ final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTermi
                      d.count, percentile(d, 0.5), percentile(d, 0.95), d.last ?? .nan))
         print(String(format: "pty echo rtt   n=%3d  p50=%6.2f ms  p95=%6.2f ms  max=%6.2f ms",
                      r.count, percentile(r, 0.5), percentile(r, 0.95), r.last ?? .nan))
-        print("kill-criterion check (REQUIREMENTS.md M0): p95 draw+rtt < 35 ms required")
+        // ENFORCED kill-criterion (REQUIREMENTS.md M0 / TESTING.md §2.7): the
+        // probe stops describing its threshold and starts applying it — a
+        // violation exits nonzero. A waiver happens in verify.sh with a
+        // printed reason, never by this probe silently passing.
+        let p95Total = percentile(d, 0.95) + percentile(r, 0.95)
+        let required = 35.0
+        if p95Total.isFinite, p95Total < required, !d.isEmpty, !r.isEmpty {
+            print(String(format: "LATENCY-PASS p95_total=%.2f required=%.0f", p95Total, required))
+            fflush(stdout)
+            exit(0)
+        } else {
+            print(String(format: "LATENCY-FAIL p95=%.2f required=%.0f", p95Total, required))
+            fflush(stdout)
+            exit(1)
+        }
     }
 
     /// Flood: 32 MB of tiny lines fed on the main loop with a display every
@@ -157,8 +176,18 @@ final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTermi
                 print("memterm M0 flood probe (in-window, main-loop feed + 60Hz display)")
                 print(String(format: "fed %d MB in %.2f s  ->  %.1f MB/s;  worst main-thread stall %.1f ms",
                              totalBytes / 1_048_576, dt, Double(totalBytes) / 1_048_576.0 / dt, worstStall))
-                print("kill-criterion check: UI must not freeze (stall ~< 100 ms) under flood")
-                NSApp.terminate(nil)
+                // ENFORCED kill-criterion (TESTING.md §2.7): UI must not
+                // freeze under flood — worst main-thread stall < 100 ms.
+                let required = 100.0
+                if worstStall < required {
+                    print(String(format: "FLOOD-PASS worst_stall=%.1f required=%.0f", worstStall, required))
+                    fflush(stdout)
+                    exit(0)
+                } else {
+                    print(String(format: "FLOOD-FAIL worst_stall=%.1f required=%.0f", worstStall, required))
+                    fflush(stdout)
+                    exit(1)
+                }
             }
         }
         pump()
@@ -202,12 +231,15 @@ func installAppIcon() {
     }
 }
 
-func runApp(mode: RunMode, smoke: Bool = false) {
+func runApp(mode: RunMode, smoke: SmokeRun? = nil) {
     let app = NSApplication.shared
-    app.setActivationPolicy(.regular)
+    // Quiet mode (TESTING.md §2.5): probes must be cheap to run on every
+    // commit — screen-stealing is why gates get skipped. Accessory policy, no
+    // dock bounce, no focus theft; MEMTERM_PROBE_VISIBLE=1 restores .regular.
+    app.setActivationPolicy(ProbeSupport.quiet ? .accessory : .regular)
     installAppIcon()
     let delegate: NSApplicationDelegate = mode == .interactive
-        ? MemtermAppDelegate(smokeMode: smoke)
+        ? MemtermAppDelegate(smokeRun: smoke)
         : ProbeAppDelegate(mode: mode)
     app.delegate = delegate
     app.run()

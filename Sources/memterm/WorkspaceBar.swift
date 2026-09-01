@@ -154,6 +154,15 @@ final class WorkspaceBarView: NSVisualEffectView {
     func chipActivityForProbe(workspaceId: String) -> TabActivityState? {
         chipsById[workspaceId]?.activityState
     }
+
+    /// TESTING.md §2.3 (bug 2 regression): each chip's frame in bar
+    /// coordinates, for rendered-bitmap contrast sampling.
+    func probeChipFrames() -> [(id: String, frame: NSRect)] {
+        chipsById.compactMap { id, chip in
+            guard chip.superview != nil, chip.frame.width >= 1 else { return nil }
+            return (id, chip.convert(chip.bounds, to: self))
+        }
+    }
 }
 
 /// One workspace chip: color dot + name, rounded background when active,

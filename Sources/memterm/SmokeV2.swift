@@ -1,0 +1,303 @@
+import AppKit
+import MemtermCore
+
+// Smoke v2 (TESTING.md §2.6): the two-run capture→restore shape is kept —
+// run 1 (--smoke=save) saves through the REAL capture pipeline and exits
+// without teardown (deliberate crash simulation), run 2 (--smoke=verify)
+// asserts through the REAL launch-restore pipeline. What changed: explicit
+// run selection (no inference from restoredAnything), fresh mktemp state dirs
+// (main.swift enforces the marker/empty-dir protocol), the SMOKE sentinel
+// protocol under ProbeRunner, and the restored-geometry golden.
+//
+// Keep-list preserved verbatim: identity sets over controllers AND panes,
+// kill(pid,0) on the original shell pids, byte-identical frame checks across
+// FR-59 switches, FR-56 forget-on-user-close, parked-not-restored, the real
+// zsh integration history check, restoredDividerCount, and run 1's
+// exit()-as-crash-simulation (named: SMOKE-SAVE crash-sim=true).
+
+extension MemtermAppDelegate {
+
+    func runSmoke(run: SmokeRun, restoredAnything: Bool) {
+        ProbeSupport.refuseRealStateDir(prefix: "SMOKE")
+        print("SMOKE-STATE-DIR \(MemoryEngine.baseDir.path)")
+        let smoke = ProbeRunner(prefix: "SMOKE", mode: run.rawValue)
+        smoke.diagnostics = { [weak self] _ in
+            guard let self else { return }
+            for (i, controller) in self.controllers.enumerated() {
+                print("SMOKE-DUMP tree[\(i)]:\n\(controller.probeTreeDump())")
+            }
+        }
+        switch run {
+        case .save: buildSaveSteps(smoke)
+        case .verify:
+            guard restoredAnything else {
+                print("SMOKE-FAIL run=verify restored nothing from \(MemoryEngine.baseDir.path)")
+                exit(1)
+            }
+            buildVerifySteps(smoke)
+        }
+        smoke.run()
+    }
+
+    // MARK: - Run 1: --smoke=save
+
+    private func buildSaveSteps(_ smoke: ProbeRunner) {
+        // FR-59 live-switch leg state: Default's identity before switching.
+        var workspaceB: String?
+        var defaultControllerIds = Set<ObjectIdentifier>()
+        var defaultPaneIds = Set<ObjectIdentifier>()
+        var defaultPids: [pid_t] = []
+        var defaultFrame = NSRect.zero
+        func defaultControllers() -> [TerminalWindowController] {
+            controllers.filter { $0.workspaceId == StateStore.defaultWorkspaceId }
+        }
+
+        // Build 1 window / 2 tabs / 3 panes, cd one pane; the REAL capture
+        // pipeline (2 s poll + zsh integration hooks) records it. The
+        // condition waits on the pipeline's OUTPUT, not on a wall clock.
+        smoke.add(ProbeStep(
+            name: "save-build-fixtures",
+            action: { [self] in
+                controllers.first?.splitCurrentPane(vertical: true)
+                newWindowForTab(nil)
+                controllers.first?.allPanes().first?.send(txt: "cd /tmp\r")
+            }))
+        smoke.add(ProbeStep(
+            name: "save-capture", timeout: 30,
+            condition: { [self] in
+                guard defaultControllers().count == 2,
+                      defaultControllers().flatMap({ $0.allPanes() }).count == 3,
+                      let pane = controllers.first?.allPanes().first
+                else { return false }
+                // The kernel-truth cwd poll (2 s cadence) must have observed
+                // the cd'd pane IN /tmp — not just any cwd — before the
+                // journal is worth flushing.
+                guard let cwd = pane.lastKnownCwd, cwd.hasSuffix("/tmp") else {
+                    return false
+                }
+                // And the REAL zsh integration must have written the command
+                // into the per-tab history (when it applies at all).
+                if config.shellIntegration,
+                   ShellIntegration.isZsh(shellPath: pane.shellPath ?? ""),
+                   let engine = memory, engine.shellIntegrationDir != nil {
+                    let histURL = ShellIntegration.histFileURL(
+                        dir: engine.historyDir, paneId: pane.paneId)
+                    let hist = (try? String(contentsOf: histURL, encoding: .utf8)) ?? ""
+                    return hist.contains("cd /tmp")
+                }
+                return true
+            },
+            assert: { [self] in
+                memory?.flushSync()
+                guard let counts = memory?.store.counts() else {
+                    throw ProbeFailure("no store")
+                }
+                print("SMOKE-SAVED windows=\(counts.windows) tabs=\(counts.tabs) panes=\(counts.panes)")
+                // Per-tab shell history: the pane that ran 'cd /tmp' runs the
+                // REAL zsh integration — its .hist file must hold the command.
+                if let pane = controllers.first?.allPanes().first, let engine = memory {
+                    let shellPath = pane.shellPath ?? ""
+                    if config.shellIntegration,
+                       ShellIntegration.isZsh(shellPath: shellPath),
+                       engine.shellIntegrationDir != nil {
+                        let histURL = ShellIntegration.histFileURL(
+                            dir: engine.historyDir, paneId: pane.paneId)
+                        let hist = (try? String(contentsOf: histURL, encoding: .utf8)) ?? ""
+                        guard hist.contains("cd /tmp") else {
+                            throw ProbeFailure("pane history missing 'cd /tmp' at \(histURL.path) (contents: \(hist.prefix(200)))")
+                        }
+                        print("SMOKE-HIST captured=true entries=\(hist.split(separator: "\n").count)")
+                    } else {
+                        print("SMOKE-HIST skipped (shell \(shellPath) is not zsh or integration off)")
+                    }
+                }
+            }))
+
+        // FR-59 leg: record Default's identity, switch to fresh workspace B —
+        // Default's tabs must stay LIVE (same objects, processes untouched).
+        smoke.add(ProbeStep(
+            name: "save-live-switch-hide", timeout: 10,
+            action: { [self] in
+                let defaults = defaultControllers()
+                defaultControllerIds = Set(defaults.map(ObjectIdentifier.init))
+                let panes = defaults.flatMap { $0.allPanes() }
+                defaultPaneIds = Set(panes.map(ObjectIdentifier.init))
+                defaultPids = panes.compactMap { $0.process?.shellPid }
+                defaultFrame = defaults.first?.window?.frame ?? .zero
+                guard defaults.count == 2, panes.count == 3, defaultPids.count == 3 else {
+                    probeFail("live-switch precondition: tabs=\(defaults.count) panes=\(panes.count) pids=\(defaultPids.count)")
+                }
+                workspaceB = createWorkspace(named: "B")
+                if let b = workspaceB { switchToWorkspace(b) }
+            },
+            condition: {
+                // Hidden, not closed: windows off screen, shells alive,
+                // controllers still registered.
+                let defaults = defaultControllers()
+                let hidden = !defaults.isEmpty
+                    && defaults.allSatisfy { $0.window?.isVisible != true }
+                let alive = defaultPids.allSatisfy { kill($0, 0) == 0 }
+                let sameObjects = Set(defaults.map(ObjectIdentifier.init)) == defaultControllerIds
+                return hidden && alive && sameObjects
+            },
+            onFailure: {
+                let defaults = defaultControllers()
+                print("SMOKE-DEBUG live-switch hide: hidden=\(defaults.allSatisfy { $0.window?.isVisible != true }) alive=\(defaultPids.allSatisfy { kill($0, 0) == 0 }) sameObjects=\(Set(defaults.map(ObjectIdentifier.init)) == defaultControllerIds)")
+            }))
+        smoke.add(ProbeStep(
+            name: "save-live-switch-show", timeout: 10,
+            action: { [self] in switchToWorkspace(StateStore.defaultWorkspaceId) },
+            condition: {
+                let defaults = defaultControllers()
+                return defaults.contains { $0.window?.isVisible == true }
+                    && Set(defaults.map(ObjectIdentifier.init)) == defaultControllerIds
+            },
+            assert: {
+                let defaults = defaultControllers()
+                let panes = defaults.flatMap { $0.allPanes() }
+                let sameObjects = Set(defaults.map(ObjectIdentifier.init)) == defaultControllerIds
+                // Identity on the PANE object graph too, not just controllers.
+                let samePanes = Set(panes.map(ObjectIdentifier.init)) == defaultPaneIds
+                let visible = defaults.contains { $0.window?.isVisible == true }
+                // kill(pid,0) on the ORIGINAL pre-switch pids, post round-trip.
+                let survivors = defaultPids.filter { kill($0, 0) == 0 }.count
+                let dividers = panes.reduce(0) { $0 + $1.restoredDividerCount }
+                // Byte-identical frames under the swap model.
+                let framesStable = defaults.first?.window?.frame == defaultFrame
+                guard sameObjects, samePanes, visible, survivors == defaultPids.count,
+                      !defaultPids.isEmpty, dividers == 0, framesStable else {
+                    throw ProbeFailure("live-switch show: sameObjects=\(sameObjects) samePanes=\(samePanes) visible=\(visible) pids=\(survivors)/\(defaultPids.count) dividers=\(dividers) framesStable=\(framesStable) before=\(defaultFrame) after=\(String(describing: defaults.first?.window?.frame))")
+                }
+                print("SMOKE-LIVE-SWITCH pids_survived=\(survivors) same_panes=\(samePanes) frames_stable=\(framesStable)")
+            }))
+
+        // Park leg (FR-51): B — hidden but live — gets parked (the explicit
+        // destructive-but-remembered gesture).
+        smoke.add(ProbeStep(
+            name: "save-park-b",
+            assert: { [self] in
+                guard let engine = memory, let b = workspaceB else {
+                    throw ProbeFailure("no workspace B to park")
+                }
+                parkWorkspace(b)
+                engine.flushSync()
+                let list = engine.store.listWorkspaces()
+                let parked = list.filter(\.isParked).count
+                let activeTabs = engine.store.loadState(workspaceId: activeWorkspaceId)
+                    .reduce(0) { $0 + $1.tabs.count }
+                print("SMOKE-WS workspaces=\(list.count) parked=\(parked) active_tabs=\(activeTabs)")
+                guard parked == 1 else { throw ProbeFailure("B not parked") }
+            }))
+
+        // FR-56 leg: deliberately close the single-pane tab — a user gesture,
+        // so it must be forgotten; run 2 asserts it is NOT restored.
+        smoke.add(ProbeStep(
+            name: "save-close-forget",
+            assert: { [self] in
+                guard let doomed = controllers.first(where: {
+                    $0.workspaceId == activeWorkspaceId && $0.allPanes().count == 1
+                }) else {
+                    throw ProbeFailure("no single-pane tab to close")
+                }
+                print("SMOKE-CLOSED tab=\(doomed.tabId)")
+                doomed.close()  // active-workspace user close: forgets
+            }))
+        smoke.add(ProbeStep(
+            name: "save-final-flush",
+            assert: { [self] in
+                guard let engine = memory else { throw ProbeFailure("no engine") }
+                engine.flushSync()
+                let counts = engine.store.counts()
+                print("SMOKE-AFTER-CLOSE windows=\(counts.windows) tabs=\(counts.tabs) panes=\(counts.panes)")
+                // Protocol marker (§2.6): --smoke=verify refuses a dir
+                // without it.
+                let marker = MemoryEngine.baseDir
+                    .appendingPathComponent(SmokeRun.markerFileName)
+                try? "saved-by \(BuildStamp.describe)\n".write(to: marker, atomically: true,
+                                                               encoding: .utf8)
+                // Deliberate exit()-without-teardown at PASS (the runner's
+                // exit(0) skips applicationShouldTerminate): the journal
+                // must survive a hard kill — a feature, named in the output.
+                print("SMOKE-SAVE crash-sim=true")
+            }))
+    }
+
+    // MARK: - Run 2: --smoke=verify
+
+    private func buildVerifySteps(_ smoke: ProbeRunner) {
+        smoke.add(ProbeStep(
+            name: "verify-restored-topology", timeout: 15,
+            condition: { [self] in
+                !hosts.filter { !$0.tabs.isEmpty }.isEmpty
+                    && controllers.flatMap({ $0.allPanes() })
+                        .allSatisfy { $0.frame.width >= 1 && $0.frame.height >= 1 }
+            },
+            assert: { [self] in
+                let windows = hosts.filter { !$0.tabs.isEmpty }.count
+                let panes = controllers.flatMap { $0.allPanes() }
+                let cwds = panes.compactMap { $0.lastKnownCwd }
+                print("SMOKE-RESTORED windows=\(windows) tabs=\(controllers.count) panes=\(panes.count) cwds=\(cwds)")
+                // Workspace assertions: parked B is listed but NOT restored.
+                guard let store = memory?.store else { throw ProbeFailure("no store") }
+                let list = store.listWorkspaces()
+                guard let b = list.first(where: { $0.name == "B" }), b.isParked else {
+                    throw ProbeFailure("workspace B missing or not parked")
+                }
+                if controllers.contains(where: { $0.workspaceId == b.id }) {
+                    throw ProbeFailure("parked workspace B was restored")
+                }
+                // FR-56: the deliberately-closed tab from run 1 must NOT be
+                // restored, while the split tab (2 panes) is.
+                guard controllers.count == 1, panes.count == 2 else {
+                    throw ProbeFailure("close-forget: expected 1 tab / 2 panes restored, got \(controllers.count) tab(s) / \(panes.count) pane(s)")
+                }
+                let parked = list.filter(\.isParked).count
+                print("SMOKE-WS workspaces=\(list.count) parked=\(parked) active_tabs=\(controllers.count)")
+            }))
+
+        // Restored-geometry golden (§2.6): dump (pane → rect, dividerCount,
+        // focusedTab, firstResponder target) at a fixed window size and diff
+        // against the committed golden — the PreMigrationRestoreTests
+        // byte-fixture pattern lifted one layer up. This is bug 1's cross-
+        // reboot twin: a restore that presents collapsed geometry diffs loud.
+        smoke.add(ProbeStep(
+            name: "verify-restore-geometry-golden", timeout: 10,
+            assert: { [self] in
+                guard let host = hosts.first(where: { !$0.tabs.isEmpty }),
+                      let window = host.window, let tab = host.selectedTab else {
+                    throw ProbeFailure("no restored window for the geometry golden")
+                }
+                var frame = window.frame
+                frame.size = NSSize(width: 980, height: 640)
+                window.setFrame(frame, display: true)
+                window.contentView?.layoutSubtreeIfNeeded()
+                let panes = tab.allPanes()
+                let focusedIndex = host.tabs.firstIndex { $0 === host.selectedTab } ?? -1
+                let dividers = panes.reduce(0) { $0 + $1.restoredDividerCount }
+                let frTarget = window.firstResponder is PaneView ? "pane"
+                    : String(describing: type(of: window.firstResponder as Any))
+                var lines = ["window=980x640 tabs=\(host.tabs.count) focused=\(focusedIndex) first_responder=\(frTarget) dividers=\(dividers)"]
+                for (i, pane) in panes.enumerated() {
+                    let r = pane.convert(pane.bounds, to: tab.paneRoot)
+                    lines.append("pane\(i)=\(Int(r.minX.rounded())),\(Int(r.minY.rounded())),\(Int(r.width.rounded())),\(Int(r.height.rounded()))")
+                }
+                let dump = lines.joined(separator: "\n")
+                for line in lines { print("SMOKE-GEOMETRY \(line)") }
+                guard let goldenPath = ProcessInfo.processInfo
+                    .environment["MEMTERM_SMOKE_GOLDEN"], !goldenPath.isEmpty else {
+                    smoke.skipLine(step: "verify-restore-geometry-golden",
+                                   reason: "MEMTERM_SMOKE_GOLDEN unset (dump printed above)")
+                    return
+                }
+                guard let golden = try? String(contentsOfFile: goldenPath, encoding: .utf8)
+                else {
+                    throw ProbeFailure("golden file unreadable at \(goldenPath)")
+                }
+                let want = golden.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard dump == want else {
+                    throw ProbeFailure("restored geometry diverged from golden \(goldenPath):\nGOT:\n\(dump)\nWANT:\n\(want)")
+                }
+                print("SMOKE-GEOMETRY golden=match")
+            }))
+    }
+}

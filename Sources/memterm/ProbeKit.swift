@@ -1,0 +1,400 @@
+import AppKit
+import MemtermCore
+
+// ProbeKit — the harness v2 core (TESTING.md §2). One event-driven step queue
+// replaces the asyncAfter cascade: steps run sequentially, each gated on a
+// polled CONDITION with a per-step timeout, never on a wall-clock offset —
+// which deletes the "fixed clock racing async work" defect class (bug 4)
+// instead of patching legs one at a time. The runner owns process exit: no
+// probe path can exit without either the PASS sentinel (full completion), a
+// FAIL line naming a step, or the atexit ABORT line — a partial run can NEVER
+// read green (bug 4's completion-sentinel escape).
+
+// MARK: - Failure plumbing
+
+struct ProbeFailure: Error {
+    let reason: String
+    init(_ reason: String) { self.reason = reason }
+}
+
+/// Fails the CURRENT step of the active runner (prints the FAIL sentinel,
+/// dumps diagnostics, exits 1). Legacy leg bodies call this instead of the
+/// old silent `exit(1)` — by construction every failure names a step.
+func probeFail(_ reason: String) -> Never {
+    if let runner = ProbeRunner.current {
+        runner.fail(reason: reason)
+    }
+    print("PROBE-FAIL (no runner) reason=\(reason)")
+    fflush(stdout)
+    exit(1)
+}
+
+// MARK: - Environment / mode support
+
+/// Explicit smoke run selection (TESTING.md §2.6).
+enum SmokeRun: String {
+    case save, verify
+
+    /// Written by --smoke=save on completion; --smoke=verify refuses a state
+    /// dir that lacks it.
+    static let markerFileName = "smoke-save-complete.marker"
+}
+
+enum ProbeSupport {
+    static var isUIProbe: Bool {
+        ProcessInfo.processInfo.environment["MEMTERM_UI_PROBE"] == "1"
+    }
+
+    /// fresh | restored | observe (TESTING.md §2.4). Default fresh.
+    static var mode: String {
+        ProcessInfo.processInfo.environment["MEMTERM_PROBE_MODE"] ?? "fresh"
+    }
+
+    /// MEMTERM_PROBE_VISIBLE=1 opts into on-screen windows + real fullscreen
+    /// + the composited pixel pass; the default is quiet (§2.5).
+    static var visible: Bool {
+        ProcessInfo.processInfo.environment["MEMTERM_PROBE_VISIBLE"] == "1"
+    }
+
+    static var smokeArg: String? {
+        for arg in CommandLine.arguments.dropFirst() where arg.hasPrefix("--smoke") {
+            return arg
+        }
+        return nil
+    }
+
+    static var isSmoke: Bool { smokeArg != nil }
+
+    /// Quiet automated run: accessory activation, no activate(), offscreen
+    /// windows. True for probe AND smoke unless MEMTERM_PROBE_VISIBLE=1.
+    static var quiet: Bool { (isUIProbe || isSmoke) && !visible }
+
+    /// Where failure screenshots / bitmaps land.
+    static var outDir: URL {
+        if let dir = ProcessInfo.processInfo.environment["MEMTERM_PROBE_OUT"],
+           !dir.isEmpty {
+            return URL(fileURLWithPath: dir, isDirectory: true)
+        }
+        return FileManager.default.temporaryDirectory
+            .appendingPathComponent("memterm-probe-out", isDirectory: true)
+    }
+
+    /// Isolation hard gate (TESTING.md §2.2, belt-and-suspenders): a probe or
+    /// smoke run must be structurally unable to touch the founder's real
+    /// state — the probe deletes journal rows and scrollback through the
+    /// FR-56 forget path. Exit 2, printed reason, if the resolved state dir
+    /// is anywhere under ~/Library/Application Support/memterm.
+    static func refuseRealStateDir(prefix: String) {
+        let real = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("memterm").standardizedFileURL.path
+        let resolved = MemoryEngine.baseDir.standardizedFileURL.path
+        if resolved == real || resolved.hasPrefix(real + "/") {
+            print("\(prefix)-FAIL refusing to run against the real state dir \(resolved) — set MEMTERM_STATE_DIR to an isolated location")
+            fflush(stdout)
+            exit(2)
+        }
+    }
+}
+
+// MARK: - Step + runner
+
+struct ProbeStep {
+    let name: String                // machine-parseable, e.g. "close-pane"
+    let timeout: TimeInterval       // per-step budget
+    let action: () -> Void          // perform the gesture / mutation
+    let condition: () -> Bool       // polled on main every 50 ms until true
+    let assert: () throws -> Void   // outcome assertions once condition holds
+    let onFailure: () -> Void       // extra leg-specific diagnostics
+
+    init(name: String, timeout: TimeInterval = 10,
+         action: @escaping () -> Void = {},
+         condition: @escaping () -> Bool = { true },
+         assert: @escaping () throws -> Void = {},
+         onFailure: @escaping () -> Void = {}) {
+        self.name = name
+        self.timeout = timeout
+        self.action = action
+        self.condition = condition
+        self.assert = assert
+        self.onFailure = onFailure
+    }
+}
+
+final class ProbeRunner {
+    /// The active runner — read by the atexit abort guard and probeFail().
+    private(set) static var current: ProbeRunner?
+
+    let prefix: String              // "UIPROBE" or "SMOKE"
+    let mode: String                // fresh | restored | observe | save | verify
+    private var steps: [ProbeStep] = []
+    private(set) var completed = 0
+    private(set) var finished = false
+    private var currentStepName = "(setup)"
+    private var currentStepStarted: TimeInterval = 0
+    /// App-supplied diagnostics dump (tree dumps, window list, tabs debug,
+    /// screenshot) run on every failure before exit.
+    var diagnostics: (String) -> Void = { _ in }
+
+    var totalSteps: Int { steps.count }
+
+    init(prefix: String, mode: String) {
+        self.prefix = prefix
+        self.mode = mode
+    }
+
+    func add(_ step: ProbeStep) { steps.append(step) }
+
+    /// TESTING.md §2.4: a STATEFUL step (a gesture whose behavior depends on
+    /// where its target state came from) registers for BOTH the fresh and
+    /// restored manifests by construction — the shared step list is what
+    /// makes fresh-only stateful coverage structurally impossible. In
+    /// observe mode (the side-effect quarantine) stateful gesture steps are
+    /// excluded: observe creates and forces nothing.
+    func addStateful(_ step: ProbeStep) {
+        guard mode != "observe" else { return }
+        steps.append(step)
+    }
+
+    /// Config-conditional skip: legal, loud, and never a pass (§2.2).
+    func skipLine(step: String, reason: String) {
+        print("\(prefix)-SKIP step=\(step) reason=\(reason)")
+    }
+
+    func run() {
+        ProbeRunner.current = self
+        installProbeAbortGuard()
+        try? FileManager.default.createDirectory(at: ProbeSupport.outDir,
+                                                 withIntermediateDirectories: true)
+        // The manifest line: every gate log self-identifies its binary
+        // (bug 5) and its world before the first step runs.
+        print("\(prefix)-BEGIN steps=\(steps.count) build=\(BuildStamp.describe) mode=\(mode) statedir=\(MemoryEngine.baseDir.path) quiet=\(ProbeSupport.quiet)")
+        fflush(stdout)
+        advance()
+    }
+
+    func fail(reason: String) -> Never {
+        let waited = Int((ProcessInfo.processInfo.systemUptime - currentStepStarted) * 1000)
+        finished = true  // suppress the ABORT line — this exit is accounted for
+        print("\(prefix)-FAIL step=\(currentStepName) waited=\(waited) reason=\(reason)")
+        diagnostics(currentStepName)
+        fflush(stdout)
+        exit(1)
+    }
+
+    private func advance() {
+        guard completed < steps.count else {
+            finished = true
+            // Success sentinel — the ONLY green. Runners grep for it with
+            // matching counts; exit code 0 alone is never a pass.
+            let runTag = prefix == "SMOKE" ? " run=\(mode)" : ""
+            print("\(prefix)-PASS\(runTag) steps=\(completed)/\(steps.count)")
+            if prefix == "UIPROBE" {
+                print("UIPROBE-DONE all-legs-complete")  // legacy sentinel
+            }
+            fflush(stdout)
+            onAllStepsComplete()
+            exit(0)
+        }
+        let step = steps[completed]
+        currentStepName = step.name
+        currentStepStarted = ProcessInfo.processInfo.systemUptime
+        step.action()
+        pollCondition(step)
+    }
+
+    /// Runs after PASS is printed, before exit(0) — smoke's save run hangs
+    /// its marker write here.
+    var onAllStepsComplete: () -> Void = {}
+
+    private func pollCondition(_ step: ProbeStep) {
+        let deadline = currentStepStarted + step.timeout
+        func poll() {
+            if step.condition() {
+                do {
+                    try step.assert()
+                } catch let failure as ProbeFailure {
+                    step.onFailure()
+                    fail(reason: failure.reason)
+                } catch {
+                    step.onFailure()
+                    fail(reason: String(describing: error))
+                }
+                let ms = Int((ProcessInfo.processInfo.systemUptime - currentStepStarted) * 1000)
+                completed += 1
+                print("\(prefix)-STEP \(completed)/\(steps.count) name=\(step.name) ms=\(ms)")
+                fflush(stdout)
+                DispatchQueue.main.async { self.advance() }
+                return
+            }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                step.onFailure()
+                fail(reason: "timeout waiting for condition")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: poll)
+        }
+        poll()
+    }
+}
+
+/// Crash-safe teardown sentinel: if the process exits by ANY path other than
+/// the runner's own PASS/FAIL (early clean exit, last-window-close, crash-ish
+/// teardown), the log ends in an ABORT line — an early exit can never be
+/// mistaken for green again (bug 4).
+private var probeAbortGuardInstalled = false
+func installProbeAbortGuard() {
+    guard !probeAbortGuardInstalled else { return }
+    probeAbortGuardInstalled = true
+    atexit {
+        if let runner = ProbeRunner.current, !runner.finished {
+            print("\(runner.prefix)-ABORT completed=\(runner.completed)/\(runner.totalSteps)")
+            fflush(stdout)
+        }
+    }
+}
+
+// MARK: - Frame + pixel assertion helpers (TESTING.md §2.3 — the layer bugs
+// 1 and 2 lived above every model-level assertion)
+
+/// The view's own rendering (cacheDisplay). NOTE, so nobody "fixes" it: this
+/// does NOT see window-server compositing — opacity/blur/occlusion truths
+/// need probeWindowImage in a visible run.
+func probeBitmap(_ view: NSView) -> NSBitmapImageRep? {
+    guard view.bounds.width >= 1, view.bounds.height >= 1 else { return nil }
+    guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+    view.cacheDisplay(in: view.bounds, to: rep)
+    return rep
+}
+
+/// The composited on-screen window image (window-server truth). Visible runs
+/// only; returns nil without screen-capture permission.
+func probeWindowImage(_ window: NSWindow) -> CGImage? {
+    CGWindowListCreateImage(.null, .optionIncludingWindow,
+                            CGWindowID(window.windowNumber), [.boundsIgnoreFraming])
+}
+
+/// Writes a PNG of `view` (or the key window's content view) for failure
+/// forensics; returns the path when written.
+@discardableResult
+func probeScreenshot(_ view: NSView?, name: String) -> String? {
+    guard let view, let rep = probeBitmap(view),
+          let png = rep.representation(using: .png, properties: [:]) else { return nil }
+    let url = ProbeSupport.outDir.appendingPathComponent("\(name).png")
+    try? FileManager.default.createDirectory(at: ProbeSupport.outDir,
+                                             withIntermediateDirectories: true)
+    do {
+        try png.write(to: url)
+        return url.path
+    } catch { return nil }
+}
+
+/// Bug-1 class: a pane must PRESENT with real size — frame-in-window width
+/// and height at least `minSide`, inside a non-zero container.
+func assertPaneGeometry(_ pane: NSView, paneId: String,
+                        minSide: CGFloat = 50) throws {
+    let frame = pane.frame
+    guard frame.width >= minSide, frame.height >= minSide else {
+        throw ProbeFailure("pane \(paneId.prefix(8)) collapsed: frame=\(Int(frame.width))x\(Int(frame.height)) (min \(Int(minSide)))")
+    }
+    if let container = pane.superview {
+        guard container.bounds.width >= 1, container.bounds.height >= 1 else {
+            throw ProbeFailure("pane \(paneId.prefix(8)) sits in a zero-sized container")
+        }
+    }
+}
+
+private func sampleColors(_ bmp: NSBitmapImageRep, region: CGRect,
+                          grid: Int = 16) -> [NSColor] {
+    // Region is in (bottom-left-origin) view points; the rep is top-left
+    // origin and may be Retina-scaled.
+    let sx = CGFloat(bmp.pixelsWide) / max(bmp.size.width, 1)
+    let sy = CGFloat(bmp.pixelsHigh) / max(bmp.size.height, 1)
+    var colors: [NSColor] = []
+    for i in 0..<grid {
+        for j in 0..<grid {
+            let viewX = region.minX + region.width * (CGFloat(i) + 0.5) / CGFloat(grid)
+            let viewY = region.minY + region.height * (CGFloat(j) + 0.5) / CGFloat(grid)
+            let px = Int(viewX * sx)
+            let py = Int((max(bmp.size.height, 1) - viewY) * sy)
+            guard px >= 0, py >= 0, px < bmp.pixelsWide, py < bmp.pixelsHigh,
+                  let color = bmp.colorAt(x: px, y: py) else { continue }
+            colors.append(color)
+        }
+    }
+    return colors
+}
+
+/// Bug-1 class, pixel half: the region actually RENDERED something — it is
+/// non-empty and non-uniform (>= 2 distinct quantized colors on a 16x16
+/// sample grid). A blank/collapsed pane fails here even when its frame lies.
+func assertRendered(_ bmp: NSBitmapImageRep, region: CGRect,
+                    what: String) throws {
+    guard region.width >= 1, region.height >= 1 else {
+        throw ProbeFailure("\(what): empty region \(region)")
+    }
+    let colors = sampleColors(bmp, region: region)
+    guard !colors.isEmpty else {
+        throw ProbeFailure("\(what): no samples inside the bitmap")
+    }
+    var quantized = Set<String>()
+    for color in colors {
+        guard let c = color.usingColorSpace(.sRGB) else { continue }
+        quantized.insert(String(format: "%02x%02x%02x",
+                                Int(c.redComponent * 15), Int(c.greenComponent * 15),
+                                Int(c.blueComponent * 15)))
+    }
+    guard quantized.count >= 2 else {
+        throw ProbeFailure("\(what): rendered uniformly (\(quantized.first ?? "no color")) — nothing visibly drawn")
+    }
+}
+
+/// WCAG relative-luminance contrast between two colors (AppKit-side twin of
+/// MemtermCore.ChromeContrast, for sampled NSColors).
+func contrastRatio(_ a: NSColor, _ b: NSColor) -> CGFloat {
+    func luminance(_ color: NSColor) -> CGFloat {
+        guard let c = color.usingColorSpace(.sRGB) else { return 0 }
+        func channel(_ v: CGFloat) -> CGFloat {
+            v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channel(c.redComponent) + 0.7152 * channel(c.greenComponent)
+            + 0.0722 * channel(c.blueComponent)
+    }
+    let la = luminance(a), lb = luminance(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+}
+
+/// Bug-2 regression, rendered half: the chip's REGION of the composited
+/// chrome bitmap must contain visibly contrasting pixels (glyphs vs chip
+/// ground) — a washed-out/invisible chip samples near-uniform and fails.
+func assertChipVisible(chipFrame: CGRect, in bmp: NSBitmapImageRep,
+                       what: String, minRatio: CGFloat = 1.6) throws {
+    let colors = sampleColors(bmp, region: chipFrame)
+    guard colors.count >= 8 else {
+        throw ProbeFailure("\(what): chip region yielded \(colors.count) samples")
+    }
+    var best: CGFloat = 1.0
+    // Lightest vs darkest sample bounds the max pairwise ratio.
+    var lightest = colors[0], darkest = colors[0]
+    var lightLum: CGFloat = -1, darkLum: CGFloat = 2
+    for color in colors {
+        guard let c = color.usingColorSpace(.sRGB) else { continue }
+        let lum = 0.2126 * c.redComponent + 0.7152 * c.greenComponent + 0.0722 * c.blueComponent
+        if lum > lightLum { lightLum = lum; lightest = color }
+        if lum < darkLum { darkLum = lum; darkest = color }
+    }
+    best = contrastRatio(lightest, darkest)
+    guard best >= minRatio else {
+        throw ProbeFailure("\(what): chip renders at contrast \(String(format: "%.2f", best)) < \(minRatio) — visually washed out")
+    }
+}
+
+// MARK: - Quiet-mode window (TESTING.md §2.5)
+
+/// Probe windows in quiet mode live offscreen; AppKit's default
+/// constrainFrameRect would drag them back onto a screen, so the probe
+/// window class disables constraining entirely.
+final class ProbeQuietWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+}

@@ -3,6 +3,14 @@ import MemtermCore
 
 let arguments = CommandLine.arguments.dropFirst()
 
+// --version FIRST, before any other flag (TESTING.md §3.1): every gate and
+// every human can ask a binary exactly what it is. A dev build answers
+// "dev-unstamped" and can never satisfy the verify.sh identity check.
+if arguments.contains("--version") {
+    print("memterm \(BuildStamp.version) (\(BuildStamp.gitHash)) built \(BuildStamp.buildTimeUTC)")
+    exit(0)
+}
+
 if arguments.contains("--bench") {
     runBench()
     exit(0)
@@ -24,14 +32,78 @@ if arguments.contains("--config-dump") {
 let mode: RunMode = arguments.contains("--latency") ? .latency
                   : arguments.contains("--flood") ? .flood
                   : .interactive
-// --smoke: deterministic capture/restore self-test (see MemtermApp.runSmoke).
-// It defaults the state dir to a stable temp location (two consecutive runs
-// share it — run 1 saves, run 2 restores) so the gate is hermetic and never
-// touches ~/Library/Application Support/memterm. MEMTERM_STATE_DIR overrides.
-let smokeMode = arguments.contains("--smoke")
-if smokeMode, ProcessInfo.processInfo.environment["MEMTERM_STATE_DIR"] == nil {
-    let smokeDir = (NSTemporaryDirectory() as NSString)
-        .appendingPathComponent("memterm-smoke")
-    setenv("MEMTERM_STATE_DIR", smokeDir, 1)
+
+// --smoke=save / --smoke=verify (TESTING.md §2.6): run selection is explicit;
+// the old inference-from-restoredAnything (and the stable $TMPDIR/memterm-smoke
+// dir two runs silently shared) are gone.
+var smokeRun: SmokeRun?
+for arg in arguments where arg.hasPrefix("--smoke") {
+    switch arg {
+    case "--smoke=save": smokeRun = .save
+    case "--smoke=verify": smokeRun = .verify
+    default:
+        print("SMOKE-FAIL bare --smoke is not a run: use --smoke=save (capture run) or --smoke=verify (restore run)")
+        exit(2)
+    }
 }
-runApp(mode: mode, smoke: smokeMode)
+
+let uiProbe = ProcessInfo.processInfo.environment["MEMTERM_UI_PROBE"] == "1"
+
+// The probe and the smoke are different worlds; combining them is a harness
+// bug, rejected loudly (TESTING.md §2.1).
+if uiProbe, smokeRun != nil {
+    print("UIPROBE-FAIL MEMTERM_UI_PROBE=1 cannot be combined with --smoke")
+    exit(2)
+}
+
+// State isolation, ENFORCED not conventional (TESTING.md §2.2): any probe or
+// smoke-save launch without MEMTERM_STATE_DIR gets a fresh temp dir; a
+// smoke-verify without one has nothing to verify and fails loudly.
+if uiProbe || smokeRun != nil {
+    let env = ProcessInfo.processInfo.environment
+    if env["MEMTERM_STATE_DIR"] == nil || env["MEMTERM_STATE_DIR"]?.isEmpty == true {
+        if smokeRun == .verify {
+            print("SMOKE-FAIL --smoke=verify needs MEMTERM_STATE_DIR pointing at a --smoke=save capture")
+            exit(2)
+        }
+        let fresh = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("memterm-\(uiProbe ? "probe" : "smoke")-\(UUID().uuidString.prefix(8))")
+        try? FileManager.default.createDirectory(atPath: fresh,
+                                                 withIntermediateDirectories: true)
+        setenv("MEMTERM_STATE_DIR", fresh, 1)
+    }
+
+    // Config isolation (§2.2): probe/smoke runs never read — and never write
+    // a default file into — ~/.config/memterm. Unset means built-in defaults
+    // materialized at a temp path.
+    if env["MEMTERM_CONFIG_PATH"] == nil || env["MEMTERM_CONFIG_PATH"]?.isEmpty == true {
+        let configPath = (ProcessInfo.processInfo.environment["MEMTERM_STATE_DIR"]!
+            as NSString).appendingPathComponent("probe-config.toml")
+        setenv("MEMTERM_CONFIG_PATH", configPath, 1)
+    }
+
+    // Belt one of two (the other sits in runUIProbe/runSmoke): never against
+    // the founder's real state.
+    ProbeSupport.refuseRealStateDir(prefix: uiProbe ? "UIPROBE" : "SMOKE")
+
+    // Smoke run preconditions (§2.6): save refuses a non-empty dir; verify
+    // refuses a dir without the save marker.
+    let stateDir = ProcessInfo.processInfo.environment["MEMTERM_STATE_DIR"]!
+    let fm = FileManager.default
+    if smokeRun == .save {
+        let contents = (try? fm.contentsOfDirectory(atPath: stateDir)) ?? []
+        if !contents.isEmpty {
+            print("SMOKE-FAIL --smoke=save refuses non-empty state dir \(stateDir) (contents: \(contents))")
+            exit(2)
+        }
+    }
+    if smokeRun == .verify {
+        let marker = (stateDir as NSString).appendingPathComponent(SmokeRun.markerFileName)
+        if !fm.fileExists(atPath: marker) {
+            print("SMOKE-FAIL --smoke=verify: \(stateDir) carries no \(SmokeRun.markerFileName) — not a --smoke=save capture")
+            exit(2)
+        }
+    }
+}
+
+runApp(mode: mode, smoke: smokeRun)

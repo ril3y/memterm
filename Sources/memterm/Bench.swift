@@ -12,7 +12,8 @@ private final class NullTerminalDelegate: TerminalDelegate {
 
 private func megabytes(_ bytes: Int) -> Double { Double(bytes) / 1_048_576.0 }
 
-private func run(workload name: String, chunk: [UInt8], totalMB: Int) {
+@discardableResult
+private func run(workload name: String, chunk: [UInt8], totalMB: Int) -> Double {
     let delegate = NullTerminalDelegate()
     let term = Terminal(delegate: delegate, options: TerminalOptions(cols: 120, rows: 40))
     let targetBytes = totalMB * 1_048_576
@@ -26,9 +27,11 @@ private func run(workload name: String, chunk: [UInt8], totalMB: Int) {
     let rate = megabytes(fed) / dt
     print(String(format: "%-14s %6.0f MB in %6.2f s  ->  %8.1f MB/s",
                  (name as NSString).utf8String!, megabytes(fed), dt, rate))
+    return rate
 }
 
 func runBench() {
+    print("BENCH-BEGIN build=\(BuildStamp.describe)")
     print("memterm M0 bench — SwiftTerm headless throughput (120x40 grid)")
 
     // 1. `yes`-style flood: tiny lines, maximal scroll pressure.
@@ -47,7 +50,19 @@ func runBench() {
     var longChunk: [UInt8] = []
     while longChunk.count < 65_536 { longChunk += longLine }
 
-    run(workload: "yes-flood", chunk: yesChunk, totalMB: 64)
-    run(workload: "escape-heavy", chunk: escChunk, totalMB: 64)
-    run(workload: "long-lines", chunk: longChunk, totalMB: 64)
+    let rates = [run(workload: "yes-flood", chunk: yesChunk, totalMB: 64),
+                 run(workload: "escape-heavy", chunk: escChunk, totalMB: 64),
+                 run(workload: "long-lines", chunk: longChunk, totalMB: 64)]
+    // ENFORCED kill-criterion (TESTING.md §2.7, NFR-9 groundwork): headless
+    // parser throughput must stay comfortably above pty flood rates. The
+    // floor is deliberately conservative — it exists to catch a collapse
+    // (an accidental O(n^2), a debug-build artifact), not to race the CPU.
+    let required = 20.0
+    let worst = rates.min() ?? 0
+    if worst >= required {
+        print(String(format: "BENCH-PASS min_rate=%.1f required=%.0f", worst, required))
+    } else {
+        print(String(format: "BENCH-FAIL min_rate=%.1f required=%.0f", worst, required))
+        exit(1)
+    }
 }

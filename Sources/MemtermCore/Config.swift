@@ -129,8 +129,16 @@ public struct Config {
     /// Valid `serial_tx_line_ending` values (SerialLineEnding raw values).
     public static let serialLineEndings = SerialLineEnding.configValues
 
+    /// MEMTERM_CONFIG_PATH overrides the config location, parallel to
+    /// MEMTERM_STATE_DIR (TESTING.md §2.2): probe/smoke runs and the verify
+    /// config matrix point this at generated files so gate coverage never
+    /// silently depends on — or writes into — the runner's ~/.config/memterm.
     public static var configURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let override = ProcessInfo.processInfo.environment["MEMTERM_CONFIG_PATH"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/memterm/config.toml")
     }
 
