@@ -2,6 +2,7 @@ import AppKit
 import MemtermClaudeBrowser
 import MemtermCore
 import MemtermExtensionKit
+import MemtermTimeline
 import SwiftTerm
 
 // MEMTERM_UI_PROBE harness v2 (TESTING.md §2). Every leg from the asyncAfter
@@ -3044,6 +3045,12 @@ extension MemtermAppDelegate {
     private func addArchiveSteps(_ probe: ProbeRunner) {
         var doomedTabId: String?
         var doomedPaneIds: [String] = []
+        var doomedWorkspaceName: String?
+        // The FTS fixture: a known command written as the first doomed pane's
+        // .hist (the zsh hook's exact extended-history format — the hook
+        // itself can't run: probe panes execute no commands). Archived at
+        // close, found by the timeline-search leg.
+        let needleCommand = "timeline-probe-needle --from-hist"
         probe.addStateful(ProbeStep(
             name: "archive-on-close", timeout: 10,
             action: { [self] in
@@ -3051,6 +3058,18 @@ extension MemtermAppDelegate {
                 if let host = keyHost(), let tab = host.selectedTab {
                     doomedTabId = tab.tabId
                     doomedPaneIds = tab.allPanes().map { $0.paneId }
+                    doomedWorkspaceName = memory?.store.listWorkspaces()
+                        .first { $0.id == (controllers.first(where: { $0.tabId == tab.tabId })?.workspaceId ?? "") }?
+                        .name
+                }
+                if let engine = memory, let paneId = doomedPaneIds.first,
+                   let line = ShellIntegration.formatHistoryLine(
+                       epoch: Int(Date().timeIntervalSince1970),
+                       command: needleCommand) {
+                    try? line.write(
+                        to: ShellIntegration.histFileURL(dir: engine.historyDir,
+                                                         paneId: paneId),
+                        atomically: true, encoding: .utf8)
                 }
                 // The archive reads the pane's LIVE rows for its metadata,
                 // so the new tab must be captured before the close.
@@ -3105,6 +3124,15 @@ extension MemtermAppDelegate {
                 print("UIPROBE-ARCHIVE sessions=\(rows.map(\.id)) reason=user-close live_clean=true")
             }))
 
+        // The timeline legs consume the just-archived sessions; they must
+        // run between archive-on-close and forget-everything (which wipes
+        // the archive by design).
+        addTimelineSteps(probe,
+                         doomedTabId: { doomedTabId },
+                         doomedPaneIds: { doomedPaneIds },
+                         doomedWorkspaceName: { doomedWorkspaceName },
+                         needleCommand: needleCommand)
+
         // Forget Everything leaves an EMPTY archive (the amended FR-56's
         // other half: explicit Forget stays TRUE deletion). Runs LAST — it
         // wipes the isolated probe state dir's memory by design.
@@ -3126,6 +3154,359 @@ extension MemtermAppDelegate {
                 guard count == 0, leftovers.isEmpty else {
                     throw ProbeFailure("Forget Everything left archive rows=\(count) files=\(leftovers)")
                 }
+            }))
+    }
+
+    // MARK: - Timeline legs (FR-43/54: the archive train's second kit
+    // consumer). Registered between archive-on-close (their fixture) and
+    // forget-everything (which wipes the archive by design). Same discipline
+    // as the claude-browser legs: every mutation+assertion pair runs inside
+    // ONE synchronous assert block so MemoryEngine's 2 s poll never
+    // interleaves with a staged snapshot.
+
+    // swiftlint:disable:next function_body_length
+    private func addTimelineSteps(_ probe: ProbeRunner,
+                                  doomedTabId: @escaping () -> String?,
+                                  doomedPaneIds: @escaping () -> [String],
+                                  doomedWorkspaceName: @escaping () -> String?,
+                                  needleCommand: String) {
+        func timelineBits() throws -> (ExtensionHostRuntime, TimelineExtension) {
+            guard let runtime = extensionRuntime,
+                  let ext = runtime.compiledInExtension(
+                      id: TimelineExtension.extensionId) as? TimelineExtension
+            else { throw ProbeFailure("timeline extension not compiled in") }
+            return (runtime, ext)
+        }
+        /// The archived rows of the archive-on-close tab, newest first.
+        func doomedRows() throws -> [ArchivedSessionRow] {
+            guard let engine = memory, let tabId = doomedTabId() else {
+                throw ProbeFailure("timeline legs lost the archived tab")
+            }
+            return engine.store.archivedSessions(limit: 200)
+                .filter { $0.tabId == tabId }
+        }
+
+        // Panel opens (⌘⇧T Window-menu item exists), the archived sessions
+        // present as cards under a Today header, newest first, attributed to
+        // their workspace by name; the content renders pixels.
+        probe.addStateful(ProbeStep(
+            name: "timeline-panel", timeout: 10,
+            assert: {
+                let (runtime, ext) = try timelineBits()
+                guard let menuItem = NSApp.windowsMenu?.items
+                    .first(where: { $0.title == "Timeline" }),
+                      menuItem.keyEquivalent == "t",
+                      menuItem.keyEquivalentModifierMask == [.command, .shift] else {
+                    throw ProbeFailure("Timeline (⌘⇧T) missing from the Window menu")
+                }
+                runtime.showPanel(id: TimelineExtension.panelId)
+                guard let window = runtime.panelWindow(id: TimelineExtension.panelId),
+                      window.isVisible, let panel = ext.probePanel else {
+                    throw ProbeFailure("timeline panel did not open")
+                }
+                ext.refreshNow()
+                window.layoutIfNeeded()
+                let rows = panel.probeVisibleRows()
+                // Sessions lead with Today; in a restored world a parked
+                // workspace's card section (FR-54, seeded by --smoke=save)
+                // legitimately precedes it — but ONLY that section may.
+                guard let todayIndex = rows.firstIndex(of: "header:Today") else {
+                    throw ProbeFailure("timeline has no Today header: \(rows.prefix(4))")
+                }
+                let leading = rows[..<todayIndex]
+                guard leading.allSatisfy({ $0 == "header:Parked Workspaces"
+                        || $0.hasPrefix("workspace:") }) else {
+                    throw ProbeFailure("unexpected rows before Today: \(Array(leading))")
+                }
+                let archived = try doomedRows()
+                guard !archived.isEmpty else {
+                    throw ProbeFailure("no archived sessions for the timeline leg")
+                }
+                guard let wsName = doomedWorkspaceName() else {
+                    throw ProbeFailure("timeline leg lost the workspace attribution fixture")
+                }
+                // Newest-first: the archive-on-close sessions are the newest
+                // archive rows, so the first session row is theirs — and it
+                // carries the workspace attribution.
+                guard rows.count > todayIndex + 1,
+                      rows[todayIndex + 1] == "session:\(archived[0].id) ws=\(wsName)" else {
+                    throw ProbeFailure("first card wrong: \(rows.prefix(todayIndex + 2)) expected session:\(archived[0].id) ws=\(wsName)")
+                }
+                for row in archived {
+                    guard rows.contains("session:\(row.id) ws=\(wsName)") else {
+                        throw ProbeFailure("archived session \(row.id) missing from timeline rows")
+                    }
+                }
+                // Rendered half (§2.3): the panel content actually paints.
+                guard let bmp = probeBitmap(panel.view) else {
+                    throw ProbeFailure("timeline view yielded no bitmap")
+                }
+                try assertRendered(bmp, region: panel.view.bounds, what: "timeline panel")
+                probeCompositedShot(window, name: "timeline-panel")
+                print("UIPROBE-TIMELINE rows=\(rows.count) today_first=true attribution=\(wsName)")
+            }))
+
+        // Search: the FTS index over archived COMMAND history finds the
+        // .hist fixture command; a garbage query shows the no-matches empty
+        // state; clearing restores the full list.
+        probe.addStateful(ProbeStep(
+            name: "timeline-search", timeout: 10,
+            assert: {
+                let (runtime, ext) = try timelineBits()
+                guard let panel = ext.probePanel else {
+                    throw ProbeFailure("panel not built (search leg)")
+                }
+                guard let needlePane = doomedPaneIds().first else {
+                    throw ProbeFailure("no fixture pane (search leg)")
+                }
+                let expected = try doomedRows().filter { $0.paneId == needlePane }
+                guard expected.count == 1 else {
+                    throw ProbeFailure("fixture pane archived \(expected.count) rows")
+                }
+                // Kit-surface truth first: the card carries the command as
+                // its preview (last command wins).
+                let hits = runtime.host.archive.search("timeline-probe-needle")
+                guard hits.map(\.id.raw) == [String(expected[0].id)],
+                      hits[0].preview == needleCommand else {
+                    throw ProbeFailure("archive.search mismatch: \(hits.map { "\($0.id.raw):\($0.preview)" })")
+                }
+                // Panel search narrows to exactly that card.
+                panel.probeSetSearch("timeline-probe-needle")
+                let rows = panel.probeVisibleRows()
+                guard rows.count == 2, rows[0] == "header:Today",
+                      rows[1].hasPrefix("session:\(expected[0].id) ") else {
+                    throw ProbeFailure("search rows wrong: \(rows)")
+                }
+                panel.probeSetSearch("zzz-no-such-command")
+                let empty = panel.probeEmptyState()
+                guard empty.visible, empty.title == "No matches" else {
+                    throw ProbeFailure("no-matches empty state absent: \(empty)")
+                }
+                panel.probeSetSearch("")
+                guard panel.probeEmptyState().visible == false,
+                      panel.probeVisibleRows().count > 2 else {
+                    throw ProbeFailure("clearing the search did not restore the list")
+                }
+                print("UIPROBE-TIMELINE-SEARCH hit=\(expected[0].id) preview_ok=true empty_state_ok=true")
+            }))
+
+        // Reopen Here: a fresh tab opens and receives the frozen scrollback
+        // as a feed()-only ghost with the honest divider line.
+        probe.addStateful(ProbeStep(
+            name: "timeline-reopen-ghost", timeout: 10,
+            assert: { [self] in
+                let (_, ext) = try timelineBits()
+                guard let panel = ext.probePanel else {
+                    throw ProbeFailure("panel not built (reopen leg)")
+                }
+                guard let target = try doomedRows().first else {
+                    throw ProbeFailure("no archived session to reopen")
+                }
+                panel.probeSetSearch("")
+                guard panel.probeSelectSession(id: String(target.id)) else {
+                    throw ProbeFailure("could not select archived session \(target.id)")
+                }
+                let before = Set(controllers.map(\.tabId))
+                guard panel.probeReopenSelected() else {
+                    throw ProbeFailure("Reopen Here failed")
+                }
+                guard let fresh = controllers.first(where: { !before.contains($0.tabId) }),
+                      let pane = fresh.currentPane() else {
+                    throw ProbeFailure("reopen did not open a new tab with a pane")
+                }
+                let text = pane.scrollbackText(maxLines: 400)
+                guard text.contains("── restored — "), pane.restoredDividerCount >= 1 else {
+                    throw ProbeFailure("ghost divider missing from the reopened tab")
+                }
+                print("UIPROBE-TIMELINE-REOPEN new_tab=\(fresh.tabId.prefix(8)) session=\(target.id) ghost_divider=true")
+            }))
+
+        // Resume: an archived claude session's card warrants Resume; the
+        // action runs the SAME consent-gated stageResume flow — offer line
+        // feed()-only in the new tab, command armed behind ⌘R, nothing
+        // reaches the pty.
+        var resumeTabId: String?
+        var resumePaneId: String?
+        let resumeSessionUUID = "dddd4444-timeline-probe"
+        probe.addStateful(ProbeStep(
+            name: "timeline-resume", timeout: 10,
+            action: { [self] in
+                newWindowForTab(nil)
+                if let host = keyHost(), let tab = host.selectedTab {
+                    resumeTabId = tab.tabId
+                    resumePaneId = tab.allPanes().first?.paneId
+                }
+                memory?.flushSync()
+            },
+            condition: { [self] in
+                guard let paneId = resumePaneId else { return false }
+                let restored = memory?.store.loadState() ?? []
+                return restored.contains { win in
+                    win.tabs.contains { $0.panes[paneId] != nil }
+                }
+            },
+            assert: { [self] in
+                let (runtime, ext) = try timelineBits()
+                guard let engine = memory, let tabId = resumeTabId,
+                      let paneId = resumePaneId, let panel = ext.probePanel,
+                      let doomed = controllers.first(where: { $0.tabId == tabId })
+                else { throw ProbeFailure("resume leg lost its fixture tab") }
+                // Stage the claude snapshot and close INSIDE one synchronous
+                // block (writer-queue ordering lands the snapshot before the
+                // archive reads it; the 2 s poll cannot interleave).
+                engine.store.upsertSnapshot(paneId, exe: "claude", argv: ["claude"],
+                                            pid: 0, adapter: ClaudeAdapter.name,
+                                            adapterState: ["sessionId": resumeSessionUUID])
+                doomed.close()
+                engine.store.barrier()
+                let rows = engine.store.archivedSessions(limit: 50)
+                    .filter { $0.tabId == tabId }
+                guard rows.count == 1 else {
+                    throw ProbeFailure("resume fixture archived \(rows.count) rows")
+                }
+                // The kit card carries the resume warrant, resolved core-side.
+                guard let card = runtime.host.archive
+                    .query(ArchiveQuery(limit: 50))
+                    .first(where: { $0.id.raw == String(rows[0].id) }),
+                      card.claudeSessionId?.raw == resumeSessionUUID,
+                      card.kind == .claude else {
+                    throw ProbeFailure("archived claude card lacks the resume warrant")
+                }
+                ext.refreshNow()
+                guard panel.probeSelectSession(id: String(rows[0].id)) else {
+                    throw ProbeFailure("could not select the claude card")
+                }
+                let actions = panel.probeActionState()
+                guard actions.resumeHidden == false else {
+                    throw ProbeFailure("Resume hidden on a claude card")
+                }
+                let before = Set(controllers.map(\.tabId))
+                guard panel.probeResumeSelected() else {
+                    throw ProbeFailure("Resume failed to stage")
+                }
+                guard let fresh = controllers.first(where: { !before.contains($0.tabId) }),
+                      let pane = fresh.currentPane() else {
+                    throw ProbeFailure("resume did not open a new tab")
+                }
+                let expectedCommand = "claude --resume \(resumeSessionUUID)"
+                guard pane.pendingResumeCommand == expectedCommand else {
+                    throw ProbeFailure("pendingResumeCommand=\(pane.pendingResumeCommand ?? "nil") expected \(expectedCommand)")
+                }
+                let text = pane.scrollbackText(maxLines: 400)
+                guard text.contains("press ⌘R to type: \(expectedCommand)") else {
+                    throw ProbeFailure("consent-gated offer line missing from the resumed tab")
+                }
+                guard text.contains("── restored — ") else {
+                    throw ProbeFailure("resume tab missing the ghost divider")
+                }
+                print("UIPROBE-TIMELINE-RESUME card=\(rows[0].id) offer_feed_only=true resume_warrant=true")
+            }))
+
+        // Per-card Forget: TRUE deletion of exactly that session — row, FTS
+        // entry, frozen files — while every other archived session survives.
+        probe.addStateful(ProbeStep(
+            name: "timeline-forget-card", timeout: 10,
+            assert: { [self] in
+                let (runtime, ext) = try timelineBits()
+                guard let engine = memory, let panel = ext.probePanel else {
+                    throw ProbeFailure("panel not built (forget leg)")
+                }
+                guard let needlePane = doomedPaneIds().first,
+                      let target = try doomedRows().first(where: { $0.paneId == needlePane })
+                else { throw ProbeFailure("forget leg lost its target session") }
+                let countBefore = engine.store.archivedSessionCount()
+                let targetDir = StateStore.archiveSessionDir(engine.archiveDir,
+                                                             id: target.id)
+                guard FileManager.default.fileExists(atPath: targetDir.path) else {
+                    throw ProbeFailure("target session has no archive dir to delete")
+                }
+                panel.probeSetSearch("")
+                guard panel.probeSelectSession(id: String(target.id)),
+                      panel.probeForgetSelected() else {
+                    throw ProbeFailure("could not Forget the selected card")
+                }
+                engine.store.barrier()
+                guard engine.store.archivedSession(id: target.id) == nil else {
+                    throw ProbeFailure("forgotten session row survived")
+                }
+                guard !FileManager.default.fileExists(atPath: targetDir.path) else {
+                    throw ProbeFailure("forgotten session's frozen files survived")
+                }
+                guard engine.store.archivedSessionCount() == countBefore - 1 else {
+                    throw ProbeFailure("Forget deleted more than one session (\(countBefore) → \(engine.store.archivedSessionCount()))")
+                }
+                guard runtime.host.archive.search("timeline-probe-needle").isEmpty else {
+                    throw ProbeFailure("FTS entry survived the per-card Forget")
+                }
+                ext.refreshNow()
+                guard !panel.probeVisibleRows()
+                    .contains(where: { $0.hasPrefix("session:\(target.id) ") }) else {
+                    throw ProbeFailure("forgotten card still rendered")
+                }
+                print("UIPROBE-TIMELINE-FORGET session=\(target.id) rows=\(countBefore)→\(countBefore - 1) fts_clean=true files_clean=true")
+            }))
+
+        // FR-54: a parked workspace is one reopenable card; opening it runs
+        // the standard unpark funnel (journal → resurrect).
+        var parkedWorkspaceId: String?
+        var previousWorkspaceId: String?
+        probe.addStateful(ProbeStep(
+            name: "timeline-parked-workspace", timeout: 10,
+            action: { [self] in
+                guard let engine = memory else { return }
+                previousWorkspaceId = activeWorkspaceId
+                parkedWorkspaceId = engine.store.createWorkspace(
+                    name: "TimelinePark", color: "#0a84ff")
+                if let id = parkedWorkspaceId {
+                    engine.store.setWorkspaceParked(id, parked: true)
+                }
+                engine.store.barrier()
+            },
+            assert: { [self] in
+                let (runtime, ext) = try timelineBits()
+                guard let engine = memory, let panel = ext.probePanel,
+                      let parkedId = parkedWorkspaceId,
+                      let previousId = previousWorkspaceId else {
+                    throw ProbeFailure("parked-workspace fixture missing")
+                }
+                // Kit surface: the parked workspace lists as a card.
+                guard runtime.host.workspace.parkedWorkspaces()
+                    .contains(where: { $0.id.raw == parkedId }) else {
+                    throw ProbeFailure("parkedWorkspaces does not list the fixture")
+                }
+                ext.refreshNow()
+                let rows = panel.probeVisibleRows()
+                // The parked section leads; the fixture's card sits in it
+                // (a restored world's seed may park workspaces of its own —
+                // switcher order within the section).
+                guard rows.first == "header:Parked Workspaces",
+                      let cardIndex = rows.firstIndex(of: "workspace:TimelinePark"),
+                      let todayIndex = rows.firstIndex(of: "header:Today"),
+                      cardIndex < todayIndex else {
+                    throw ProbeFailure("parked card not in the leading section: \(rows.prefix(5))")
+                }
+                guard panel.probeSelectWorkspace(name: "TimelinePark") else {
+                    throw ProbeFailure("could not select the parked card")
+                }
+                guard panel.probeActionState().reopenTitle == "Open Workspace" else {
+                    throw ProbeFailure("primary action did not follow the workspace card")
+                }
+                guard panel.probeOpenSelectedWorkspace() else {
+                    throw ProbeFailure("openWorkspace refused the parked card")
+                }
+                guard activeWorkspaceId == parkedId,
+                      engine.store.listWorkspaces()
+                          .first(where: { $0.id == parkedId })?.isParked == false,
+                      controllers.contains(where: { $0.workspaceId == parkedId }) else {
+                    throw ProbeFailure("opening the parked card did not unpark+present it")
+                }
+                // Unparked → its card leaves the timeline.
+                ext.refreshNow()
+                guard !panel.probeVisibleRows().contains("workspace:TimelinePark") else {
+                    throw ProbeFailure("unparked workspace still renders as a parked card")
+                }
+                switchToWorkspace(previousId)  // leave the world as found
+                print("UIPROBE-TIMELINE-PARKED workspace=\(parkedId.prefix(8)) reopened=true card_cleared=true")
             }))
     }
 

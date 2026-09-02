@@ -38,9 +38,11 @@ public protocol MemtermExtension: AnyObject {
     func deactivate()
 }
 
-// MARK: - Host (the ~14-call surface; v0.1 adds claude.tabSessions /
-// revealSession / rootDisplayPath for the browser + badge bet — still zero
-// capability beyond propose-and-display)
+// MARK: - Host (the ~14-call surface; v0.1 added claude.tabSessions /
+// revealSession / rootDisplayPath for the browser + badge bet; v0.2 — the
+// timeline train — enriches SessionCard, adds archive.revealFiles and
+// workspace.parkedWorkspaces/openWorkspace, and makes reopenGhost live.
+// Still zero capability beyond propose-and-display.)
 
 /// Everything an extension can ask the app to do. A plain struct of typed
 /// call surfaces the app fills with its own implementations — there is no
@@ -86,17 +88,68 @@ public struct ArchiveQuery: Equatable {
     public init(limit: Int = 50) { self.limit = limit }
 }
 
-/// One archived-session card (Timeline's render model).
+/// What kind of session an archived card represents — the card's icon.
+/// Resolved CORE-side from the adapter that was live at close; anything
+/// unrecognized presents as a plain shell.
+public enum SessionKind: String, Equatable {
+    case shell
+    case claude
+    case ssh
+    case serial
+}
+
+/// Why the session left the live set (kit mirror of the core close funnel).
+public enum SessionCloseKind: String, Equatable {
+    /// A user gesture (strip ✕, ⌘W, context-menu Close, traffic light…).
+    case userClose
+    /// The shell died on its own (`exit` typed included).
+    case shellExited
+    /// A close reason this kit version does not know — render neutrally.
+    case other
+}
+
+/// One archived-session card (Timeline's render model — kit v0.2 enriched
+/// for the timeline train: attribution, grouping keys, and the resume
+/// warrant all resolved CORE-side so no consumer forks that parsing).
 public struct SessionCard: Equatable {
     public let id: SessionID
     public let title: String
+    /// Denormalized workspace attribution (survives the live workspace row).
+    public let workspaceName: String
+    /// "#rrggbb" chip color; display only.
+    public let workspaceColorHex: String
+    /// The pane's last known working directory, when captured.
+    public let cwd: String?
+    public let kind: SessionKind
+    public let openedAt: Date?
     public let closedAt: Date?
+    public let closeReason: SessionCloseKind
+    /// Opaque reboot-grouping key (the boot-session UUID the pane closed
+    /// under). Two cards with different non-nil stamps closed on different
+    /// boots. Never parsed, only compared.
+    public let bootStamp: String?
+    /// Non-nil when the archived adapter state warrants a Resume offer —
+    /// core validated the id; the consumer passes it straight back to
+    /// workspace.stageResume and never sees a command string.
+    public let claudeSessionId: ClaudeSessionID?
     public let preview: String
 
-    public init(id: SessionID, title: String, closedAt: Date?, preview: String) {
+    public init(id: SessionID, title: String, workspaceName: String,
+                workspaceColorHex: String, cwd: String?, kind: SessionKind,
+                openedAt: Date?, closedAt: Date?, closeReason: SessionCloseKind,
+                bootStamp: String?, claudeSessionId: ClaudeSessionID?,
+                preview: String) {
         self.id = id
         self.title = title
+        self.workspaceName = workspaceName
+        self.workspaceColorHex = workspaceColorHex
+        self.cwd = cwd
+        self.kind = kind
+        self.openedAt = openedAt
         self.closedAt = closedAt
+        self.closeReason = closeReason
+        self.bootStamp = bootStamp
+        self.claudeSessionId = claudeSessionId
         self.preview = preview
     }
 }
@@ -123,15 +176,21 @@ public struct ArchiveHost {
     /// per-card Forget is TRUE deletion: row, search index, frozen files).
     /// .archiveChanged fires after the deletion lands.
     public let requestForget: (SessionID) -> Void
+    /// Asks the APP to reveal the session's frozen archive files in Finder.
+    /// Core re-validates the id and resolves the path itself — the extension
+    /// never holds a filesystem path.
+    public let revealFiles: (SessionID) -> Void
 
     public init(query: @escaping (ArchiveQuery) -> [SessionCard],
                 search: @escaping (String) -> [SessionCard],
                 frozenScrollback: @escaping (SessionID) -> GhostText?,
-                requestForget: @escaping (SessionID) -> Void) {
+                requestForget: @escaping (SessionID) -> Void,
+                revealFiles: @escaping (SessionID) -> Void) {
         self.query = query
         self.search = search
         self.frozenScrollback = frozenScrollback
         self.requestForget = requestForget
+        self.revealFiles = revealFiles
     }
 }
 
@@ -260,6 +319,21 @@ public struct WorkspaceID: Hashable {
     public init(raw: String) { self.raw = raw }
 }
 
+/// A workspace as the timeline may render it (FR-54: a parked workspace is
+/// one reopenable card). Display data only — holding one grants nothing.
+public struct WorkspaceCard: Equatable {
+    public let id: WorkspaceID
+    public let name: String
+    /// "#rrggbb" chip color; display only.
+    public let colorHex: String
+
+    public init(id: WorkspaceID, name: String, colorHex: String) {
+        self.id = id
+        self.name = name
+        self.colorHex = colorHex
+    }
+}
+
 public struct WorkspaceHost {
     /// Opens a NEW tab running a plain shell — never a command — in the given
     /// directory (nil = home; a vanished directory falls back like a restore
@@ -267,11 +341,24 @@ public struct WorkspaceHost {
     /// workspace does not exist.
     public let openTab: (URL?, WorkspaceID?) -> TabRef?
 
-    /// Reopens an archived session's ghost scrollback (feed()-only by
-    /// construction — core's feedRestoredPreamble path). STUB until the
-    /// timeline extension's stage: returns nil (schema v6 is live; the
-    /// reopen UX is the timeline's to define).
+    /// Renders an archived session's frozen scrollback as a ghost into the
+    /// given tab's focused pane — feed()-only by construction (core's
+    /// restored-preamble path: dim ghost text, then one honest divider line).
+    /// nil tab opens a fresh tab in the archived cwd first. Returns the tab
+    /// that received the ghost; nil for an unknown session id, a vanished
+    /// tab, or a serial pane. LIVE since the timeline train (was the kit's
+    /// one documented stub).
     public let reopenGhost: (SessionID, TabRef?) -> TabRef?
+
+    /// The parked workspaces (FR-51/54), switcher order. Live rows — a
+    /// parked workspace is closed-but-kept, and the timeline renders each as
+    /// one reopenable card.
+    public let parkedWorkspaces: () -> [WorkspaceCard]
+
+    /// Asks the APP to open (switch to) a workspace; a parked one reopens
+    /// through the standard unpark path — journal → resurrect, consent-gated
+    /// offers included. False when the workspace does not exist.
+    public let openWorkspace: (WorkspaceID) -> Bool
 
     /// ONE core call that stages a Claude resume offer on a tab's focused
     /// pane: core internally runs the FR-36 claims registry (a UUID already
@@ -286,9 +373,13 @@ public struct WorkspaceHost {
 
     public init(openTab: @escaping (URL?, WorkspaceID?) -> TabRef?,
                 reopenGhost: @escaping (SessionID, TabRef?) -> TabRef?,
+                parkedWorkspaces: @escaping () -> [WorkspaceCard],
+                openWorkspace: @escaping (WorkspaceID) -> Bool,
                 stageResume: @escaping (ClaudeSessionID, TabRef) -> Bool) {
         self.openTab = openTab
         self.reopenGhost = reopenGhost
+        self.parkedWorkspaces = parkedWorkspaces
+        self.openWorkspace = openWorkspace
         self.stageResume = stageResume
     }
 }

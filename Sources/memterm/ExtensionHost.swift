@@ -3,6 +3,7 @@ import CoreServices
 import MemtermClaudeBrowser
 import MemtermCore
 import MemtermExtensionKit
+import MemtermTimeline
 
 // The app-side implementation of MemtermExtensionKit's Host (kit v0):
 // every kit call wired to the EXISTING machinery, so the kit adds surface,
@@ -21,8 +22,9 @@ import MemtermExtensionKit
 //   - settingsSection hangs off the existing Settings tabs.
 //   - archive.* run against the schema v6 sessions/session_fts tables
 //     (founder-amended FR-56); requestForget stays a PROPOSE — core owns
-//     the confirmation and the deletion. reopenGhost remains the one stub,
-//     awaiting the timeline extension's stage.
+//     the confirmation and the deletion. reopenGhost is LIVE with the
+//     timeline train: the frozen scrollback fed as a dim ghost + divider,
+//     feed() only, through the restore preamble's exact semantics.
 //
 // NSObject: the tab-context-menu items target this object (menu validation).
 
@@ -30,10 +32,11 @@ final class ExtensionHostRuntime: NSObject {
     private unowned let app: MemtermAppDelegate
     private(set) var host: MemtermHost!
 
-    /// Compiled-in extensions (decision doc: instantiated at launch). Stage
-    /// 3: the Claude Sessions browser is the first real entry; MemtermTimeline
-    /// follows with the archive train.
-    private var activeExtensions: [any MemtermExtension] = [ClaudeBrowserExtension()]
+    /// Compiled-in extensions (decision doc: instantiated at launch): the
+    /// Claude Sessions browser (stage 3) and the Timeline (the archive
+    /// train's second kit consumer, FR-43/54).
+    private var activeExtensions: [any MemtermExtension] = [ClaudeBrowserExtension(),
+                                                            TimelineExtension()]
 
     /// Probe seam: the compiled-in instance for an id (probes drive the
     /// browser's refresh synchronously instead of racing FSEvents).
@@ -79,7 +82,8 @@ final class ExtensionHostRuntime: NSObject {
                 query: { [weak self] q in self?.archiveCards(limit: q.limit) ?? [] },
                 search: { [weak self] text in self?.archiveSearchCards(text) ?? [] },
                 frozenScrollback: { [weak self] id in self?.archiveFrozenScrollback(id) },
-                requestForget: { [weak self] id in self?.requestArchiveForget(id) }),
+                requestForget: { [weak self] id in self?.requestArchiveForget(id) },
+                revealFiles: { [weak self] id in self?.revealArchiveFiles(id) }),
             claude: ClaudeHost(
                 projects: { Self.mapProjects(Adapters.claudeProjectScans()) },
                 sessions: { project in
@@ -97,7 +101,11 @@ final class ExtensionHostRuntime: NSObject {
                 openTab: { [weak self] cwd, workspaceId in
                     self?.openTab(cwd: cwd, workspaceId: workspaceId)
                 },
-                reopenGhost: { _, _ in nil },  // STUB until the archive train
+                reopenGhost: { [weak self] id, tab in
+                    self?.reopenGhost(id, into: tab)
+                },
+                parkedWorkspaces: { [weak self] in self?.parkedWorkspaceCards() ?? [] },
+                openWorkspace: { [weak self] id in self?.openWorkspace(id) ?? false },
                 stageResume: { [weak self] sessionId, tab in
                     self?.stageResume(sessionId, on: tab) ?? false
                 }),
@@ -136,7 +144,9 @@ final class ExtensionHostRuntime: NSObject {
 
     /// ArchivedSessionRow → SessionCard. Title precedence: the user's custom
     /// tab title, else the last cwd's directory name, else the (denormalized)
-    /// workspace name — always something human. Text is DISPLAY-only at the
+    /// workspace name — always something human. Kind, close reason, and the
+    /// resume warrant are resolved HERE (core side of the firewall) so no
+    /// consumer forks adapter-state parsing. Text is DISPLAY-only at the
     /// consumer (kit contract).
     private static func card(for row: ArchivedSessionRow) -> SessionCard {
         var title = row.customTitle ?? ""
@@ -145,9 +155,38 @@ final class ExtensionHostRuntime: NSObject {
         }
         if title.isEmpty { title = row.workspaceName }
         if title.isEmpty { title = "session" }
-        return SessionCard(id: SessionID(raw: String(row.id)), title: title,
-                           closedAt: Date(timeIntervalSince1970: TimeInterval(row.closedAt)),
-                           preview: row.preview)
+        let kind: SessionKind
+        switch row.adapter {
+        case ClaudeAdapter.name: kind = .claude
+        case SSHAdapter.name: kind = .ssh
+        case SerialAdapter.name: kind = .serial
+        default: kind = .shell
+        }
+        let closeReason: SessionCloseKind
+        switch row.closeReason {
+        case SessionCloseReason.userClose.rawValue: closeReason = .userClose
+        case SessionCloseReason.shellExited.rawValue: closeReason = .shellExited
+        default: closeReason = .other
+        }
+        // The resume warrant: a claude session id that still validates. The
+        // consumer passes it straight back to stageResume — core re-gates
+        // (claims dedupe, denylist, consent) on that call regardless.
+        var claudeSessionId: ClaudeSessionID?
+        if kind == .claude, let sessionId = row.adapterState["sessionId"],
+           Adapters.isValidClaudeSessionId(sessionId) {
+            claudeSessionId = ClaudeSessionID(raw: sessionId)
+        }
+        return SessionCard(
+            id: SessionID(raw: String(row.id)), title: title,
+            workspaceName: row.workspaceName,
+            workspaceColorHex: row.workspaceColor,
+            cwd: row.cwdLast, kind: kind,
+            openedAt: row.openedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            closedAt: Date(timeIntervalSince1970: TimeInterval(row.closedAt)),
+            closeReason: closeReason,
+            bootStamp: row.bootSessionUUID,
+            claudeSessionId: claudeSessionId,
+            preview: row.preview)
     }
 
     private func archiveCards(limit: Int) -> [SessionCard] {
@@ -184,6 +223,17 @@ final class ExtensionHostRuntime: NSObject {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
         engine.forgetArchivedSession(rowid)
+    }
+
+    /// "Reveal Files": Finder-selects the session's frozen archive dir. The
+    /// APP resolves the path (row verified first; ids are integers by type —
+    /// nothing an extension passes can reach outside the archive dir).
+    private func revealArchiveFiles(_ id: SessionID) {
+        guard let engine = app.memory, let rowid = Int64(id.raw),
+              engine.store.archivedSession(id: rowid) != nil else { return }
+        let dir = StateStore.archiveSessionDir(engine.archiveDir, id: rowid)
+        guard FileManager.default.fileExists(atPath: dir.path) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([dir])
     }
 
     // MARK: - Claude mapping (core scan types → kit types)
@@ -271,6 +321,66 @@ final class ExtensionHostRuntime: NSObject {
         app.memory?.scheduleTopologySave()
         app.refreshWorkspaceChips()
         return TabRef(tabId: controller.tabId)
+    }
+
+    private static let ghostDividerFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d h:mm a"
+        return formatter
+    }()
+
+    /// The kit's reopenGhost, LIVE with the timeline train: the archived
+    /// session's frozen scrollback fed as a dim ghost + one honest divider
+    /// into the tab's focused pane — feed() only, exactly the restore path's
+    /// preamble semantics (collapse included, so relaunch piles never
+    /// regrow). nil tab opens a fresh tab in the archived cwd first.
+    private func reopenGhost(_ id: SessionID, into tabRef: TabRef?) -> TabRef? {
+        guard let engine = app.memory, let rowid = Int64(id.raw),
+              let row = engine.store.archivedSession(id: rowid) else { return nil }
+        let target: TabRef?
+        if let tabRef {
+            target = tabRef
+        } else {
+            let cwd = row.cwdLast.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            target = openTab(cwd: cwd, workspaceId: nil)
+        }
+        guard let target,
+              let controller = app.controllers.first(where: { $0.tabId == target.tabId }),
+              let pane = controller.currentPane(), !(pane is SerialPaneView)
+        else { return nil }
+        if let ghost = engine.store.archivedScrollbackText(id: rowid,
+                                                           archiveDir: engine.archiveDir),
+           !ghost.isEmpty {
+            let collapsed = ScrollbackText.collapseRestoredDividers(ghost)
+            pane.feed(text: "\u{1b}[2m" + ScrollbackText.ghostFeedText(collapsed)
+                + "\u{1b}[0m\r\n")
+        }
+        let stamp = row.closedAt > 0
+            ? Self.ghostDividerFormatter.string(
+                from: Date(timeIntervalSince1970: TimeInterval(row.closedAt)))
+            : Self.ghostDividerFormatter.string(from: Date())
+        let divider = ScrollbackText.restoredDividerLine(stamp: stamp)
+        pane.feed(text: "\u{1b}[36m\(divider)\u{1b}[0m\r\n")
+        pane.restoredDividerCount += 1
+        return target
+    }
+
+    /// FR-54: the parked workspaces as reopenable cards, switcher order.
+    private func parkedWorkspaceCards() -> [WorkspaceCard] {
+        (app.memory?.store.listWorkspaces() ?? [])
+            .filter(\.isParked)
+            .map { WorkspaceCard(id: WorkspaceID(raw: $0.id), name: $0.name,
+                                 colorHex: $0.color) }
+    }
+
+    /// Open (switch to) a workspace; a parked one reopens through the
+    /// standard unpark path — journal → resurrect, consent-gated offers and
+    /// all. The SAME funnel as clicking its chip (FR-59 semantics).
+    private func openWorkspace(_ id: WorkspaceID) -> Bool {
+        guard app.memory?.store.listWorkspaces()
+            .contains(where: { $0.id == id.raw }) == true else { return false }
+        app.switchToWorkspace(id.raw)
+        return true
     }
 
     /// The ONE core call (kit contract): claims + adapter composition +

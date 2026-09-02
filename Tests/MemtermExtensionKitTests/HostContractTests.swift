@@ -33,6 +33,9 @@ final class HostContractTests: XCTestCase {
                 },
                 requestForget: { [unowned self] id in
                     calls.append("archive.requestForget \(id.raw)")
+                },
+                revealFiles: { [unowned self] id in
+                    calls.append("archive.revealFiles \(id.raw)")
                 }),
             claude: ClaudeHost(
                 projects: { [unowned self] in
@@ -67,6 +70,15 @@ final class HostContractTests: XCTestCase {
                 },
                 reopenGhost: { [unowned self] id, _ in
                     calls.append("workspace.reopenGhost \(id.raw)"); return nil
+                },
+                parkedWorkspaces: { [unowned self] in
+                    calls.append("workspace.parkedWorkspaces")
+                    return [WorkspaceCard(id: WorkspaceID(raw: "wp"), name: "Parked",
+                                          colorHex: "#8e8e93")]
+                },
+                openWorkspace: { [unowned self] id in
+                    calls.append("workspace.openWorkspace \(id.raw)")
+                    return true
                 },
                 stageResume: { [unowned self] id, tab in
                     calls.append("workspace.stageResume \(id.raw) on=\(tab.tabId)")
@@ -104,6 +116,7 @@ final class HostContractTests: XCTestCase {
             _ = host.archive.search("needle")
             _ = host.archive.frozenScrollback(SessionID(raw: "arch1"))
             host.archive.requestForget(SessionID(raw: "arch2"))
+            host.archive.revealFiles(SessionID(raw: "arch4"))
             let projects = host.claude.projects()
             _ = host.claude.sessions(projects[0])
             _ = host.claude.tabSessions()
@@ -112,6 +125,8 @@ final class HostContractTests: XCTestCase {
             let tab = host.workspace.openTab(URL(fileURLWithPath: "/tmp"),
                                              WorkspaceID(raw: "ws1"))!
             _ = host.workspace.reopenGhost(SessionID(raw: "arch3"), nil)
+            _ = host.workspace.parkedWorkspaces()
+            _ = host.workspace.openWorkspace(WorkspaceID(raw: "wp"))
             _ = host.workspace.stageResume(ClaudeSessionID(raw: "uuid-1"), tab)
             host.ui.registerPanel("probe.panel", "Probe", nil) { NSViewController() }
             host.ui.setBadge(tab, .attention)
@@ -127,7 +142,7 @@ final class HostContractTests: XCTestCase {
         func deactivate() { deactivated = true }
     }
 
-    func testAllSeventeenCallsRouteThroughTheHost() {
+    func testAllTwentyCallsRouteThroughTheHost() {
         let recorder = Recorder()
         let ext = ProbeExtension()
         ext.activate(host: recorder.host)
@@ -136,6 +151,7 @@ final class HostContractTests: XCTestCase {
             "archive.search needle",
             "archive.frozenScrollback arch1",
             "archive.requestForget arch2",
+            "archive.revealFiles arch4",
             "claude.projects",
             "claude.sessions s",
             "claude.tabSessions",
@@ -143,13 +159,15 @@ final class HostContractTests: XCTestCase {
             "claude.rootDisplayPath",
             "workspace.openTab /tmp ws1",
             "workspace.reopenGhost arch3",
+            "workspace.parkedWorkspaces",
+            "workspace.openWorkspace wp",
             "workspace.stageResume uuid-1 on=t1",
             "ui.registerPanel probe.panel Probe",
             "ui.setBadge t1 attention",
             "ui.addTabContextMenuItem Probe Item",
             "ui.settingsSection Probe rows=1",
             "events.subscribe claudeSessionsChanged",
-        ], "the 17-call surface (kit v0.1: +tabSessions/revealSession/rootDisplayPath), each routed exactly once")
+        ], "the 20-call surface (kit v0.2: +archive.revealFiles, workspace.parkedWorkspaces/openWorkspace for the timeline train), each routed exactly once")
         ext.deactivate()
         XCTAssertTrue(ext.deactivated)
     }
@@ -184,12 +202,36 @@ final class HostContractTests: XCTestCase {
         // A stub Host implementation (tests, dry-runs) must stay legal even
         // now that the app's real implementation is live.
         let stub = ArchiveHost(query: { _ in [] }, search: { _ in [] },
-                               frozenScrollback: { _ in nil }, requestForget: { _ in })
+                               frozenScrollback: { _ in nil }, requestForget: { _ in },
+                               revealFiles: { _ in })
         XCTAssertEqual(stub.query(ArchiveQuery()), [])
         XCTAssertEqual(stub.search("anything"), [])
         XCTAssertNil(stub.frozenScrollback(SessionID(raw: "x")))
         stub.requestForget(SessionID(raw: "x"))  // no-op, no crash
+        stub.revealFiles(SessionID(raw: "x"))    // no-op, no crash
         XCTAssertEqual(ArchiveQuery().limit, 50, "default query limit")
+    }
+
+    func testSessionCardCarriesTheTimelineRenderModel() {
+        // Kit v0.2: attribution, grouping keys, and the resume warrant all
+        // live ON the card (resolved core-side) — pins the shape the
+        // timeline compiles against.
+        let card = SessionCard(id: SessionID(raw: "9"), title: "memterm",
+                               workspaceName: "Work", workspaceColorHex: "#ff6b35",
+                               cwd: "/tmp/x", kind: .claude,
+                               openedAt: Date(timeIntervalSince1970: 100),
+                               closedAt: Date(timeIntervalSince1970: 400),
+                               closeReason: .userClose, bootStamp: "boot-a",
+                               claudeSessionId: ClaudeSessionID(raw: "u"),
+                               preview: "swift test")
+        XCTAssertEqual(card, card)
+        XCTAssertEqual(SessionKind(rawValue: "serial"), .serial)
+        XCTAssertEqual(SessionCloseKind.userClose,
+                       SessionCloseKind(rawValue: "userClose"))
+        XCTAssertEqual(WorkspaceCard(id: WorkspaceID(raw: "w"), name: "N",
+                                     colorHex: "#8e8e93"),
+                       WorkspaceCard(id: WorkspaceID(raw: "w"), name: "N",
+                                     colorHex: "#8e8e93"))
     }
 
     func testIdentityTypesAreDistinctAndHashable() {

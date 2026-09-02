@@ -129,7 +129,8 @@ final class ClaudeBrowserTests: XCTestCase {
 
         lazy var host = MemtermHost(
             archive: ArchiveHost(query: { _ in [] }, search: { _ in [] },
-                                 frozenScrollback: { _ in nil }, requestForget: { _ in }),
+                                 frozenScrollback: { _ in nil }, requestForget: { _ in },
+                                 revealFiles: { _ in }),
             claude: ClaudeHost(
                 projects: { [unowned self] in calls.append("projects"); return projects },
                 sessions: { [unowned self] project in
@@ -149,6 +150,8 @@ final class ClaudeBrowserTests: XCTestCase {
                     return openTabResult
                 },
                 reopenGhost: { _, _ in nil },
+                parkedWorkspaces: { [] },
+                openWorkspace: { _ in false },
                 stageResume: { [unowned self] id, tab in
                     calls.append("stageResume \(id.raw) on=\(tab.tabId)")
                     return stageResumeResult

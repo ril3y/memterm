@@ -42,6 +42,13 @@ let package = Package(
             dependencies: ["MemtermExtensionKit"],
             path: "Sources/MemtermClaudeBrowser"
         ),
+        // Second kit consumer (the archive train, FR-43/54): the session
+        // timeline. Same firewall: the kit and NOTHING else.
+        .target(
+            name: "MemtermTimeline",
+            dependencies: ["MemtermExtensionKit"],
+            path: "Sources/MemtermTimeline"
+        ),
         .executableTarget(
             name: "memterm",
             dependencies: [
@@ -49,7 +56,8 @@ let package = Package(
                 "CProcShim",
                 "MemtermCore",
                 "MemtermExtensionKit",
-                "MemtermClaudeBrowser"
+                "MemtermClaudeBrowser",
+                "MemtermTimeline"
             ],
             path: "Sources/memterm"
         ),
@@ -80,6 +88,14 @@ let package = Package(
             name: "MemtermClaudeBrowserTests",
             dependencies: ["MemtermClaudeBrowser", "MemtermExtensionKit"],
             path: "Tests/MemtermClaudeBrowserTests"
+        ),
+        // Timeline extension tests: pure model logic (day grouping, reboot
+        // breaks, parked cards, search-mode rows) + host-call traffic
+        // against a recording mock — headless, no app involved.
+        .testTarget(
+            name: "MemtermTimelineTests",
+            dependencies: ["MemtermTimeline", "MemtermExtensionKit"],
+            path: "Tests/MemtermTimelineTests"
         )
     ]
 )
