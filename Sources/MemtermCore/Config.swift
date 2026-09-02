@@ -43,6 +43,11 @@ public struct Config {
     /// (and written back) so existing config files round-trip without noise.
     public var alwaysShowTabBar = true
     public var scrollbackLines = 10_000
+    /// Founder-amended FR-56 retention: archived sessions (closed tabs'
+    /// frozen scrollback + history) older than this many days are deleted at
+    /// launch. 0 keeps the archive forever. Age-based rather than a size cap:
+    /// "how far back can I search" is the promise users can reason about.
+    public var archiveRetentionDays = 90
     public var shell: String?
     /// FR-5 / per-tab history: spawn zsh panes through the ZDOTDIR wrapper
     /// (per-tab ↑ history, OSC 7 cwd, OSC 133 prompt marks). `false` spawns
@@ -166,6 +171,7 @@ public struct Config {
         if let b = boolean(values["workspace_bar"]) { c.workspaceBar = b }
         if let b = boolean(values["always_show_tab_bar"]) { c.alwaysShowTabBar = b }
         if case .int(let n)? = values["scrollback_lines"], n >= 0 { c.scrollbackLines = n }
+        if case .int(let n)? = values["archive_retention_days"], n >= 0 { c.archiveRetentionDays = n }
         if let s = string(values["shell"]), !s.isEmpty { c.shell = s }
         if let b = boolean(values["shell_integration"]) { c.shellIntegration = b }
         if let b = boolean(values["new_tab_same_cwd"]) { c.newTabSameCwd = b }
@@ -263,6 +269,7 @@ public struct Config {
         lines.append("workspace_bar = \(workspaceBar)")
         lines.append("always_show_tab_bar = \(alwaysShowTabBar)  # no-op: memterm's tab strip is always visible")
         lines.append("scrollback_lines = \(scrollbackLines)")
+        lines.append("archive_retention_days = \(archiveRetentionDays)  # closed-tab archive kept this long; 0 = forever")
         if let shell {
             lines.append("shell = \"\(shell)\"")
         } else {
@@ -330,6 +337,7 @@ public struct Config {
         # always_show_tab_bar = true
 
         # scrollback_lines = 10000
+        # archive_retention_days = 90   # closed-tab archive kept this long; 0 = forever
 
         # Default: $SHELL, run as a login shell.
         # shell = "/bin/zsh"

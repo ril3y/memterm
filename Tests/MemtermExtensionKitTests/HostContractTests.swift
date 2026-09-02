@@ -4,10 +4,13 @@ import MemtermExtensionKit
 
 // Contract tests for the kit surface (kit v0): the Host struct against a
 // mock implementation. These pin the API shape the future extension targets
-// compile against, the archive-STUB contract (empty results until schema
-// v6), the lifecycle protocol, and Subscription semantics. The kit is
-// internal and free to break — but a break must be a deliberate diff here,
-// never an accident.
+// compile against, the archive shapes (finalized with schema v6; a
+// consumer-side stub Host must still be empty-not-crashing), the lifecycle
+// protocol, and Subscription semantics. The kit is internal and free to
+// break — but a break must be a deliberate diff here, never an accident.
+// The REAL archive host's behavior (query/search/frozenScrollback against
+// the sessions tables) is covered store-side by ArchiveTests and end-to-end
+// by the archive-on-close probe leg.
 
 final class HostContractTests: XCTestCase {
 
@@ -178,7 +181,8 @@ final class HostContractTests: XCTestCase {
     }
 
     func testArchiveStubContractIsEmptyNotCrashing() {
-        // The kit's documented v0 contract for a stub Host implementation.
+        // A stub Host implementation (tests, dry-runs) must stay legal even
+        // now that the app's real implementation is live.
         let stub = ArchiveHost(query: { _ in [] }, search: { _ in [] },
                                frozenScrollback: { _ in nil }, requestForget: { _ in })
         XCTAssertEqual(stub.query(ArchiveQuery()), [])

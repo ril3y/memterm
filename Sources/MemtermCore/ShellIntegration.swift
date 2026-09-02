@@ -50,11 +50,17 @@ public enum ShellIntegration {
     /// into the state dir for any setup that doesn't set HISTFILE itself
     /// (oh-my-zsh only sets it when unset, so the default macOS + omz setup
     /// was affected).
-    public static let version = 2
+    /// v3: freeze-before-trim (founder-amended FR-56, the council's data-loss
+    /// finding) — the start-of-shell trim no longer DISCARDS the head lines:
+    /// they roll into the `.hist.trimmed` sidecar first, and the trim only
+    /// runs when the roll succeeded. The sidecar archives (and forgets, and
+    /// orphan-sweeps) together with the .hist itself, so a close never loses
+    /// commands the cap already pushed out of the live file.
+    public static let version = 3
 
     /// Cap semantics (mirrored in the .zshrc trim): when the .hist file
     /// exceeds `trimThreshold` lines at shell start, it is rewritten to the
-    /// last `trimKeep` lines.
+    /// last `trimKeep` lines — the rest rolls into the sidecar (v3).
     public static let trimThreshold = 2000
     public static let trimKeep = 1000
 
@@ -87,6 +93,27 @@ public enum ShellIntegration {
         dir.appendingPathComponent("\(histSafePaneId(paneId)).hist")
     }
 
+    /// The freeze-before-trim sidecar (v3): lines the start-of-shell trim
+    /// rolled out of the live .hist. Written by the zsh hook, archived and
+    /// deleted by Swift alongside the .hist — same sanitizer, same
+    /// containment.
+    public static func histTrimSidecarURL(dir: URL, paneId: String) -> URL {
+        dir.appendingPathComponent("\(histSafePaneId(paneId)).hist.trimmed")
+    }
+
+    /// The command text of one extended-history line (": <epoch>:0;<cmd>"),
+    /// for the archive's FTS index. A line without the prefix (hand-edited
+    /// or foreign) is returned whole — indexing too much beats losing it.
+    /// nil for blank lines.
+    public static func commandText(historyLine: String) -> String? {
+        let trimmed = historyLine.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.hasPrefix(": "),
+              let semi = trimmed.firstIndex(of: ";") else { return trimmed }
+        let cmd = String(trimmed[trimmed.index(after: semi)...])
+        return cmd.isEmpty ? nil : cmd
+    }
+
     // MARK: - History-line formatting (mirror of the preexec hook, for tests)
 
     /// zsh extended-history format. Newlines/carriage returns are flattened
@@ -108,6 +135,15 @@ public enum ShellIntegration {
                                       keep: Int = trimKeep) -> [String] {
         guard lines.count > threshold else { return lines }
         return Array(lines.suffix(keep))
+    }
+
+    /// v3 freeze-before-trim mirror: what the .zshrc trim keeps live and
+    /// what it rolls into the sidecar. `rolled` is empty when under the
+    /// threshold; kept + rolled always partition the input losslessly.
+    public static func trimHistory(lines: [String], threshold: Int = trimThreshold,
+                                   keep: Int = trimKeep) -> (kept: [String], rolled: [String]) {
+        guard lines.count > threshold else { return (lines, []) }
+        return (Array(lines.suffix(keep)), Array(lines.dropLast(keep)))
     }
 
     // MARK: - Child environment
@@ -194,8 +230,16 @@ public enum ShellIntegration {
         : >| "$_memterm_hist_file" 2>/dev/null && command chmod 600 "$_memterm_hist_file" 2>/dev/null
       elif (( $(command wc -l < "$_memterm_hist_file" 2>/dev/null || echo 0) > \(trimThreshold) )); then
         # Start-of-shell trim keeps preexec cheap (one entry = one line).
-        command tail -n \(trimKeep) "$_memterm_hist_file" >| "$_memterm_hist_file.tmp" 2>/dev/null \\
-          && command mv "$_memterm_hist_file.tmp" "$_memterm_hist_file"
+        # v3 freeze-before-trim (FR-56 amended): the head lines ROLL into the
+        # .trimmed sidecar (0600, archives with the session) FIRST, and the
+        # trim only runs when the roll landed — trimming never discards.
+        typeset -gi _memterm_hist_total=$(command wc -l < "$_memterm_hist_file" 2>/dev/null || echo 0)
+        if command head -n $(( _memterm_hist_total - \(trimKeep) )) "$_memterm_hist_file" >>| "$_memterm_hist_file.trimmed" 2>/dev/null; then
+          command chmod 600 "$_memterm_hist_file.trimmed" 2>/dev/null
+          command tail -n \(trimKeep) "$_memterm_hist_file" >| "$_memterm_hist_file.tmp" 2>/dev/null \\
+            && command mv "$_memterm_hist_file.tmp" "$_memterm_hist_file"
+        fi
+        unset _memterm_hist_total
       fi
       _memterm_preexec() {
         # Extended-history line per command; newlines flattened so one entry

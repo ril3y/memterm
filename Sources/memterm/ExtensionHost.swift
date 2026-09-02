@@ -19,8 +19,10 @@ import MemtermExtensionKit
 //   - registerPanel creates a managed panel window (lazily, app-owned
 //     lifecycle/frames).
 //   - settingsSection hangs off the existing Settings tabs.
-//   - archive.* are STUBS until the archive train lands schema v6 (empty
-//     results, documented in the kit).
+//   - archive.* run against the schema v6 sessions/session_fts tables
+//     (founder-amended FR-56); requestForget stays a PROPOSE — core owns
+//     the confirmation and the deletion. reopenGhost remains the one stub,
+//     awaiting the timeline extension's stage.
 //
 // NSObject: the tab-context-menu items target this object (menu validation).
 
@@ -70,12 +72,14 @@ final class ExtensionHostRuntime: NSObject {
         super.init()
         host = MemtermHost(
             archive: ArchiveHost(
-                // STUBS until the archive train (schema v6) — the kit
-                // documents the contract; shapes finalize with the schema.
-                query: { _ in [] },
-                search: { _ in [] },
-                frozenScrollback: { _ in nil },
-                requestForget: { _ in }),
+                // Schema v6 (founder-amended FR-56): the real archive tables.
+                // Read-only cards + one PROPOSE call — the deletion itself is
+                // core's (confirmation UI included), unforgeable by extension
+                // code.
+                query: { [weak self] q in self?.archiveCards(limit: q.limit) ?? [] },
+                search: { [weak self] text in self?.archiveSearchCards(text) ?? [] },
+                frozenScrollback: { [weak self] id in self?.archiveFrozenScrollback(id) },
+                requestForget: { [weak self] id in self?.requestArchiveForget(id) }),
             claude: ClaudeHost(
                 projects: { Self.mapProjects(Adapters.claudeProjectScans()) },
                 sessions: { project in
@@ -126,6 +130,60 @@ final class ExtensionHostRuntime: NSObject {
     func deactivateAll() {
         for ext in activeExtensions { ext.deactivate() }
         subscribers.removeAll()
+    }
+
+    // MARK: - Archive surface (schema v6 — the kit's read-only timeline feed)
+
+    /// ArchivedSessionRow → SessionCard. Title precedence: the user's custom
+    /// tab title, else the last cwd's directory name, else the (denormalized)
+    /// workspace name — always something human. Text is DISPLAY-only at the
+    /// consumer (kit contract).
+    private static func card(for row: ArchivedSessionRow) -> SessionCard {
+        var title = row.customTitle ?? ""
+        if title.isEmpty, let cwd = row.cwdLast, !cwd.isEmpty {
+            title = (cwd as NSString).lastPathComponent
+        }
+        if title.isEmpty { title = row.workspaceName }
+        if title.isEmpty { title = "session" }
+        return SessionCard(id: SessionID(raw: String(row.id)), title: title,
+                           closedAt: Date(timeIntervalSince1970: TimeInterval(row.closedAt)),
+                           preview: row.preview)
+    }
+
+    private func archiveCards(limit: Int) -> [SessionCard] {
+        (app.memory?.store.archivedSessions(limit: limit) ?? []).map(Self.card(for:))
+    }
+
+    private func archiveSearchCards(_ text: String) -> [SessionCard] {
+        (app.memory?.store.searchArchivedSessions(text) ?? []).map(Self.card(for:))
+    }
+
+    private func archiveFrozenScrollback(_ id: SessionID) -> GhostText? {
+        guard let engine = app.memory, let rowid = Int64(id.raw) else { return nil }
+        return engine.store.archivedScrollbackText(id: rowid,
+                                                   archiveDir: engine.archiveDir)
+            .map(GhostText.init(text:))
+    }
+
+    /// The kit's requestForget: CORE owns the confirmation and the deletion
+    /// (FR-56/57 — Forget is unforgeable by extension code). Automated runs
+    /// (probe/smoke) can't click alerts and exercise the store API directly,
+    /// so they skip the sheet.
+    private func requestArchiveForget(_ id: SessionID) {
+        guard let engine = app.memory, let rowid = Int64(id.raw),
+              engine.store.archivedSession(id: rowid) != nil else { return }
+        if !ProbeSupport.isUIProbe && !ProbeSupport.isSmoke {
+            let alert = NSAlert()
+            alert.messageText = "Forget this archived session?"
+            alert.informativeText = """
+                Deletes its record and its frozen scrollback and history \
+                files. This cannot be undone.
+                """
+            alert.addButton(withTitle: "Forget").hasDestructiveAction = true
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        engine.forgetArchivedSession(rowid)
     }
 
     // MARK: - Claude mapping (core scan types → kit types)

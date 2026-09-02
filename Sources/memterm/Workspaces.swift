@@ -211,6 +211,11 @@ extension MemtermAppDelegate {
               !controllers.contains(where: { $0.workspaceId == workspaceId }),
               engine.store.listWorkspaces().contains(where: { $0.id == workspaceId }),
               engine.store.listWorkspaces().count > 1 else { return }
+        // Founder-amended FR-56: this is a USER CLOSE, not an explicit
+        // Forget — the last tab already ARCHIVED itself in teardown, so the
+        // workspace's archived sessions must SURVIVE this cleanup (no
+        // archiveDir passed). Their cards keep the denormalized workspace
+        // name/color the live row is about to lose.
         engine.store.forgetWorkspace(workspaceId, scrollbackDir: engine.scrollbackDir,
                                      historyDir: engine.historyDir)
         materializedWorkspaceIds.remove(workspaceId)
@@ -250,9 +255,11 @@ extension MemtermAppDelegate {
         rebuildWorkspaceMenu()
     }
 
-    /// Forget = purge journal rows AND scrollback files (FR-50/57). The last
-    /// remaining workspace can't be forgotten. Like park, this closes the
-    /// workspace's (possibly hidden) windows itself — switching only hides.
+    /// Forget = purge journal rows AND scrollback files AND (founder-amended
+    /// FR-56: an EXPLICIT Forget is true deletion) the workspace's archived
+    /// sessions (FR-50/57). The last remaining workspace can't be forgotten.
+    /// Like park, this closes the workspace's (possibly hidden) windows
+    /// itself — switching only hides.
     func forgetWorkspace(_ id: String) {
         guard let engine = memory else { return }
         let workspaces = engine.store.listWorkspaces()
@@ -268,11 +275,13 @@ extension MemtermAppDelegate {
             isSwitchingWorkspaces = false
         }
         engine.store.forgetWorkspace(id, scrollbackDir: engine.scrollbackDir,
-                                     historyDir: engine.historyDir)
+                                     historyDir: engine.historyDir,
+                                     archiveDir: engine.archiveDir)
         engine.store.barrier()
         materializedWorkspaceIds.remove(id)
         workspaceActivityForgotten(id)
         rebuildWorkspaceMenu()
+        extensionRuntime?.emit(.archiveChanged)
     }
 
     @discardableResult

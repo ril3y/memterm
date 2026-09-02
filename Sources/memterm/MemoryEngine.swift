@@ -17,6 +17,13 @@ final class MemoryEngine {
     /// Per-tab shell history (.hist files, written by the zsh hooks; FR-56/57
     /// delete them alongside scrollback).
     let historyDir: URL
+    /// The timeline archive (founder-amended FR-56, schema v6): closed tabs'
+    /// frozen scrollback + history live here as <session-rowid>/ dirs. NFR-10
+    /// applies — 0700 dir, 0600 files, local-only.
+    let archiveDir: URL
+    /// Settings ▸ Memory: archived sessions older than this are TRUE-deleted
+    /// at launch (config key archive_retention_days; <= 0 keeps forever).
+    private let archiveRetentionDays: Int
     /// The ZDOTDIR wrapper dir panes spawn with. nil = shell_integration off,
     /// or the install failed (never point ZDOTDIR at a half-written dir — a
     /// missing .zshrc there would silently skip the user's rc).
@@ -49,15 +56,18 @@ final class MemoryEngine {
         self.scrollbackLines = config.scrollbackLines
         self.scrollbackDir = MemoryEngine.baseDir.appendingPathComponent("scrollback")
         self.historyDir = MemoryEngine.baseDir.appendingPathComponent("history")
-        for dir in [scrollbackDir, historyDir] {
+        self.archiveDir = MemoryEngine.baseDir.appendingPathComponent("archive")
+        self.archiveRetentionDays = config.archiveRetentionDays
+        for dir in [scrollbackDir, historyDir, archiveDir] {
             try? FileManager.default.createDirectory(at: dir,
                                                      withIntermediateDirectories: true,
                                                      attributes: [.posixPermissions: 0o700])
         }
         // createDirectory applies the attributes to the leaf only; the base
         // dir (which holds state.db and its WAL sidecars) needs 0700 too
-        // (NFR-10 — plaintext scrollback must not be other-user readable).
-        for dir in [MemoryEngine.baseDir, scrollbackDir, historyDir] {
+        // (NFR-10 — plaintext scrollback must not be other-user readable,
+        // and the archive holds exactly the same plaintext).
+        for dir in [MemoryEngine.baseDir, scrollbackDir, historyDir, archiveDir] {
             try? FileManager.default.setAttributes([.posixPermissions: 0o700],
                                                    ofItemAtPath: dir.path)
         }
@@ -99,8 +109,12 @@ final class MemoryEngine {
         scrollbackTimer = scrollback
         // Launch-time sweep: scrollback/.hist files for panes the journal no
         // longer references (closed panes, old sessions) are deleted, not
-        // hoarded.
-        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir)
+        // hoarded — and archive dirs without a sessions row go with them.
+        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir,
+                                    archiveDir: archiveDir)
+        // Retention (Settings ▸ Memory): enforced once per launch.
+        store.enforceArchiveRetention(maxAgeDays: archiveRetentionDays,
+                                      archiveDir: archiveDir)
     }
 
     // MARK: - Topology (FR-12)
@@ -260,22 +274,77 @@ final class MemoryEngine {
         lastScrollbackHash = lastScrollbackHash.filter { livePaneIds.contains($0.key) }
     }
 
-    // MARK: - Forget (FR-56/57)
+    // MARK: - Archive on close (founder-amended FR-56, schema v6)
 
-    /// FR-57 "Forget Pane Memory" and FR-56 pane close: rows + scrollback +
-    /// shell-history files for one pane go now. For an open pane the next
+    /// Freshens the closing panes' scrollback files (a pane can close between
+    /// 5 s ticks; the buffer is still readable after terminate) so the frozen
+    /// scrollback.txt holds the final screen, then queues the store archive —
+    /// writer-queue ordering guarantees the write lands before the move.
+    private func freezeScrollback(_ panes: [PaneView]) -> [String: Int] {
+        var openedAt: [String: Int] = [:]
+        for pane in panes {
+            openedAt[pane.paneId] = pane.openedAtEpoch
+            let text = pane.scrollbackText(maxLines: scrollbackLines)
+            let url = scrollbackURL(for: pane.paneId)
+            store.onWriter {
+                try? text.write(to: url, atomically: true, encoding: .utf8)
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600], ofItemAtPath: url.path)
+            }
+            lastScrollbackHash[pane.paneId] = nil
+        }
+        return openedAt
+    }
+
+    /// FR-56 (amended): a USER tab close (or its shell exiting) archives —
+    /// journal row into `sessions`, scrollback + .hist MOVED into the
+    /// timeline archive, live tables cleaned exactly as the old forget did.
+    /// The closed tab still never restores; its bytes are now searchable
+    /// instead of gone.
+    func archiveTab(tabId: String, panes: [PaneView], reason: SessionCloseReason) {
+        let openedAt = freezeScrollback(panes)
+        store.archiveTabs([tabId], closeReason: reason, scrollbackDir: scrollbackDir,
+                          historyDir: historyDir, archiveDir: archiveDir,
+                          openedAt: openedAt)
+        app.extensionRuntime?.emit(.archiveChanged)
+    }
+
+    /// FR-56 (amended) for a pane closed inside a still-open tab.
+    func archivePane(_ pane: PaneView, reason: SessionCloseReason) {
+        let openedAt = freezeScrollback([pane])
+        store.archivePanes([pane.paneId], closeReason: reason,
+                           scrollbackDir: scrollbackDir, historyDir: historyDir,
+                           archiveDir: archiveDir, openedAt: openedAt)
+        app.extensionRuntime?.emit(.archiveChanged)
+    }
+
+    // MARK: - Forget (FR-57: EXPLICIT gestures stay TRUE deletion — archive included)
+
+    /// FR-57 "Forget Pane Memory": rows + scrollback + shell-history files +
+    /// any ARCHIVED sessions of this pane go now. For an open pane the next
     /// capture tick starts a fresh trail (the hash reset forces the rewrite
     /// through; the zsh hook recreates the .hist on the next command).
     func forgetPane(_ paneId: String) {
-        store.forgetPanes([paneId], scrollbackDir: scrollbackDir, historyDir: historyDir)
+        store.forgetPanes([paneId], scrollbackDir: scrollbackDir, historyDir: historyDir,
+                          archiveDir: archiveDir)
         lastScrollbackHash[paneId] = nil
+        app.extensionRuntime?.emit(.archiveChanged)
     }
 
-    /// FR-56 deliberate tab close / FR-57 "Forget Tab Memory": the tab's rows,
-    /// its panes, their snapshots, and their scrollback + history files.
+    /// FR-57 "Forget Tab Memory": the tab's rows, its panes, their snapshots,
+    /// their scrollback + history files, and the tab's archived sessions.
     func forgetTab(tabId: String, paneIds: [String]) {
-        store.forgetTabs([tabId], scrollbackDir: scrollbackDir, historyDir: historyDir)
+        store.forgetTabs([tabId], scrollbackDir: scrollbackDir, historyDir: historyDir,
+                         archiveDir: archiveDir)
         for paneId in paneIds { lastScrollbackHash[paneId] = nil }
+        app.extensionRuntime?.emit(.archiveChanged)
+    }
+
+    /// Per-card Forget (timeline / kit requestForget): one archived session,
+    /// TRUE-deleted.
+    func forgetArchivedSession(_ id: Int64) {
+        store.deleteArchivedSession(id: id, archiveDir: archiveDir)
+        app.extensionRuntime?.emit(.archiveChanged)
     }
 
     /// FR-45/57 "Forget Everything" step 1: stop the capture timers and drain
@@ -308,9 +377,10 @@ final class MemoryEngine {
         store.saveTopology(snapshotTopology(), forWorkspaces: app.captureScope())
         saveScrollback(force: true)
         // Queued after the topology rewrite on the writer queue, so the sweep
-        // sees the final pane set: files for user-closed panes go now (FR-56
-        // "close forgets" applies to the bytes, not just the rows).
-        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir)
+        // sees the final pane set (user-closed panes' bytes were already
+        // MOVED to the archive at close — the sweep collects only strays).
+        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir,
+                                    archiveDir: archiveDir)
         store.barrier()
     }
 }

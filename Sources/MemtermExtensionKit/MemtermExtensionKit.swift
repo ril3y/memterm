@@ -62,18 +62,19 @@ public struct MemtermHost {
     }
 }
 
-// MARK: - Archive surface (STUBS until the archive train's schema v6)
+// MARK: - Archive surface (LIVE since schema v6 — founder-amended FR-56)
 //
-// PROVISIONAL SHAPES. The decision doc's sequencing rule: the archive half
-// of this kit is finalized in the same commits that land schema v6 /
-// archive-on-close — freezing a query shape before the schema exists is the
-// single biggest ossification risk. Until then the app's implementation
-// returns empty results / nil / no-ops, and every type below may change
-// freely. The FR-21 private-pane privacy filter is applied CORE-side before
-// any result exists, always.
+// Finalized in the same commits that landed schema v6 / archive-on-close
+// (the decision doc's sequencing rule, honored). Closing a tab archives its
+// session — one card per closed pane, searchable over its command history
+// (FTS5 core-side), frozen scrollback readable on demand. Cards are
+// newest-closed first. The FR-21 private-pane privacy filter is applied
+// CORE-side before any result exists, always.
 
-/// Journal/archive session identity (schema v6). Distinct from
-/// `ClaudeSessionID` — an archived memterm session is not a Claude session.
+/// Journal/archive session identity (schema v6: the sessions rowid, opaque
+/// here). Distinct from `ClaudeSessionID` — an archived memterm session is
+/// not a Claude session. Holding one grants no authority; core re-validates
+/// on every call.
 public struct SessionID: Hashable {
     public let raw: String
     public init(raw: String) { self.raw = raw }
@@ -109,15 +110,18 @@ public struct GhostText: Equatable {
 }
 
 public struct ArchiveHost {
-    /// STUB until schema v6: returns [].
+    /// Archived-session cards, newest-closed first, at most `limit`.
     public let query: (ArchiveQuery) -> [SessionCard]
-    /// STUB until schema v6 (journal FTS): returns [].
+    /// Full-text search over archived COMMAND history (core-side FTS5; raw
+    /// FTS syntax is neutralized core-side — plain words in, cards out).
     public let search: (String) -> [SessionCard]
-    /// STUB until schema v6: returns nil.
+    /// The session's frozen scrollback, read from the archive on demand.
+    /// nil: unknown id, or the session wrote none.
     public let frozenScrollback: (SessionID) -> GhostText?
     /// Hands core a session id; CORE owns the confirmation UI and the
-    /// deletion (FR-56/57 — Forget is unforgeable by extension code).
-    /// STUB until schema v6: no-op.
+    /// deletion (FR-56/57 — Forget is unforgeable by extension code, and a
+    /// per-card Forget is TRUE deletion: row, search index, frozen files).
+    /// .archiveChanged fires after the deletion lands.
     public let requestForget: (SessionID) -> Void
 
     public init(query: @escaping (ArchiveQuery) -> [SessionCard],
@@ -265,7 +269,8 @@ public struct WorkspaceHost {
 
     /// Reopens an archived session's ghost scrollback (feed()-only by
     /// construction — core's feedRestoredPreamble path). STUB until the
-    /// archive train: returns nil.
+    /// timeline extension's stage: returns nil (schema v6 is live; the
+    /// reopen UX is the timeline's to define).
     public let reopenGhost: (SessionID, TabRef?) -> TabRef?
 
     /// ONE core call that stages a Claude resume offer on a tab's focused
@@ -369,7 +374,9 @@ public enum HostEvent: Hashable {
     case claudeSessionsChanged
     /// A tab was torn down (closed by the user, quit, park, forget).
     case tabClosed
-    /// STUB until the archive train: never fires.
+    /// The archive changed: a close archived a session, a Forget (per-card,
+    /// pane/tab/workspace scope, or Everything) deleted archived data.
+    /// Re-run archive.query/search — the payload carries no data.
     case archiveChanged
 }
 

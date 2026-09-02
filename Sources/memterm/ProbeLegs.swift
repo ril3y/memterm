@@ -936,6 +936,11 @@ extension MemtermAppDelegate {
         addWorkspaceCloseSteps(probe, probeWorkspaceId: { probeWorkspaceId })
         addTabGestureSteps(probe)
         addClaudeBrowserSteps(probe)
+        // LAST gesture legs by design: forget-everything-empties-archive
+        // wipes the probe state dir's memory (isolated by MEMTERM_STATE_DIR;
+        // both refuse-real-state-dir belts hold), so nothing may run after it
+        // that depends on captured state.
+        addArchiveSteps(probe)
 
         // Composited pixel pass (visible runs only): the window-server truth
         // cacheDisplay cannot see (§2.3's documented caveat).
@@ -3029,6 +3034,97 @@ extension MemtermAppDelegate {
                 print("UIPROBE-CLAUDEBADGE attn=\(attn) work=\(work) done=\(done) cleared=\(cleared)")
                 guard attn == .unseen, work == .active, done == .idle, cleared == .idle else {
                     throw ProbeFailure("badge states wrong: attn=\(attn) work=\(work) done=\(done) cleared=\(cleared) (want unseen/active/idle/idle)")
+                }
+            }))
+    }
+
+    // MARK: - Archive legs (founder-amended FR-56, schema v6: close =
+    // archive; Forget Everything = TRUE deletion, archive included)
+
+    private func addArchiveSteps(_ probe: ProbeRunner) {
+        var doomedTabId: String?
+        var doomedPaneIds: [String] = []
+        probe.addStateful(ProbeStep(
+            name: "archive-on-close", timeout: 10,
+            action: { [self] in
+                newWindowForTab(nil)
+                if let host = keyHost(), let tab = host.selectedTab {
+                    doomedTabId = tab.tabId
+                    doomedPaneIds = tab.allPanes().map { $0.paneId }
+                }
+                // The archive reads the pane's LIVE rows for its metadata,
+                // so the new tab must be captured before the close.
+                memory?.flushSync()
+            },
+            condition: { [self] in
+                guard doomedTabId != nil, !doomedPaneIds.isEmpty else { return false }
+                let restored = memory?.store.loadState() ?? []
+                return restored.contains { win in
+                    win.tabs.contains { tab in
+                        doomedPaneIds.allSatisfy { tab.panes[$0] != nil }
+                    }
+                }
+            },
+            assert: { [self] in
+                guard let engine = memory, let tabId = doomedTabId,
+                      let doomed = controllers.first(where: { $0.tabId == tabId })
+                else { throw ProbeFailure("archive leg lost its tab") }
+                doomed.close()  // user close through the real funnel
+                engine.store.barrier()
+                // Sessions row + honest reason + frozen files + clean live rows.
+                let rows = engine.store.archivedSessions(limit: 100)
+                    .filter { $0.tabId == tabId }
+                guard rows.count == doomedPaneIds.count,
+                      rows.allSatisfy({ $0.closeReason == SessionCloseReason.userClose.rawValue })
+                else {
+                    throw ProbeFailure("close archived \(rows.count)/\(doomedPaneIds.count) panes (reasons \(rows.map(\.closeReason)))")
+                }
+                for row in rows {
+                    let dir = StateStore.archiveSessionDir(engine.archiveDir, id: row.id)
+                    guard FileManager.default.fileExists(
+                        atPath: dir.appendingPathComponent("scrollback.txt").path) else {
+                        throw ProbeFailure("archived session \(row.id) missing frozen scrollback.txt")
+                    }
+                    // Kit surface round-trip: the frozen text is readable.
+                    guard engine.store.archivedScrollbackText(
+                        id: row.id, archiveDir: engine.archiveDir) != nil else {
+                        throw ProbeFailure("archivedScrollbackText nil for \(row.id)")
+                    }
+                }
+                for paneId in doomedPaneIds {
+                    if FileManager.default.fileExists(
+                        atPath: engine.scrollbackURL(for: paneId).path) {
+                        throw ProbeFailure("live scrollback file survived the archive move")
+                    }
+                }
+                let livePanes = engine.store.loadState().flatMap(\.tabs)
+                    .flatMap { $0.panes.keys }
+                guard doomedPaneIds.allSatisfy({ !livePanes.contains($0) }) else {
+                    throw ProbeFailure("live pane rows survived the archive")
+                }
+                print("UIPROBE-ARCHIVE sessions=\(rows.map(\.id)) reason=user-close live_clean=true")
+            }))
+
+        // Forget Everything leaves an EMPTY archive (the amended FR-56's
+        // other half: explicit Forget stays TRUE deletion). Runs LAST — it
+        // wipes the isolated probe state dir's memory by design.
+        probe.addStateful(ProbeStep(
+            name: "forget-everything-empties-archive", timeout: 10,
+            assert: { [self] in
+                guard let engine = memory,
+                      engine.store.archivedSessionCount() > 0 else {
+                    throw ProbeFailure("archive empty before Forget Everything — leg ordering broken")
+                }
+                let archiveDir = engine.archiveDir
+                forgetEverything()
+                guard let fresh = memory else { throw ProbeFailure("no engine after forget") }
+                fresh.store.barrier()
+                let count = fresh.store.archivedSessionCount()
+                let leftovers = (try? FileManager.default.contentsOfDirectory(
+                    atPath: archiveDir.path)) ?? []
+                print("UIPROBE-FORGET-EVERYTHING archive_rows=\(count) archive_files=\(leftovers.count)")
+                guard count == 0, leftovers.isEmpty else {
+                    throw ProbeFailure("Forget Everything left archive rows=\(count) files=\(leftovers)")
                 }
             }))
     }

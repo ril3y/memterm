@@ -15,6 +15,10 @@ class PaneView: LocalProcessTerminalView {
     // -- Memory engine state --
     /// Stable identity across relaunches; keys the panes table and scrollback file.
     var paneId = UUID().uuidString
+    /// When this pane object came to life (schema v6 sessions.opened_at):
+    /// honest for the live session; a restored pane's clock restarts — the
+    /// archive records the life that actually ran, not its ancestry.
+    let openedAtEpoch = Int(Date().timeIntervalSince1970)
     /// Best-known cwd: kernel truth when the poller has one, else OSC 7,
     /// seeded at spawn so a pre-poll topology save never writes NULL.
     var lastKnownCwd: String?

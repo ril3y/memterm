@@ -189,6 +189,44 @@ public struct WindowRestore {
     }
 }
 
+// MARK: - Archive (schema v6, founder-amended FR-56 2026-09-02)
+
+/// Why a session left the live journal. Enumerates the REAL close funnel:
+/// every user gesture (strip ✕, ⌘W, context-menu Close, close-pane, the
+/// traffic-light close, and the last-tab close that auto-removes a
+/// workspace) is `userClose`; a shell dying on its own (processTerminated,
+/// `exit` typed included) is `shellExited`. Quit / switch / park teardown
+/// never archives — those keep live rows exactly as before — and explicit
+/// Forget gestures never archive either: they are TRUE deletion.
+public enum SessionCloseReason: String {
+    case userClose = "user-close"
+    case shellExited = "shell-exited"
+}
+
+/// One archived session: a pane's frozen identity at the moment it was
+/// closed. Append-only; workspace name/color are denormalized so the card
+/// stays meaningful after the live workspace row is gone (e.g. the
+/// last-tab-close auto-remove).
+public struct ArchivedSessionRow: Equatable {
+    public var id: Int64
+    public var paneId: String
+    public var tabId: String
+    public var workspaceId: String
+    public var workspaceName: String
+    public var workspaceColor: String
+    public var openedAt: Int?
+    public var closedAt: Int
+    public var closeReason: String
+    public var cwdLast: String?
+    public var shell: String?
+    public var adapter: String?
+    public var adapterState: [String: String]
+    public var bootSessionUUID: String?
+    public var customTitle: String?
+    public var tabColor: String?
+    public var preview: String
+}
+
 // MARK: - Store
 
 public final class StateStore {
@@ -372,7 +410,34 @@ public final class StateStore {
         // v4 → v5: serial_profiles (feature/serial UX — per-device remembered
         // line settings, keyed by the port's stable identity). New table only,
         // created in the init exec above; nothing to migrate in place.
-        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')")
+        //
+        // v5 → v6 (founder-amended FR-56, approved 2026-09-02): the archive.
+        // Closing a tab ARCHIVES its scrollback + per-tab history instead of
+        // deleting bytes. `sessions` is the append-only archive journal (one
+        // row per closed pane), `session_fts` an FTS5 index over the pane's
+        // command text (from its .hist file; scrollback is deliberately NOT
+        // indexed — commands are the search key, scrollback stays a frozen
+        // file read on demand). In-place, idempotent, lossless: no existing
+        // v5 row is touched. There is deliberately no
+        // "workspace-forgotten-survivor" close_reason: the last-tab-close
+        // workspace auto-remove is a user close (the tab archived as
+        // user-close before the empty workspace's live row goes), and an
+        // EXPLICIT Forget Workspace deletes its archive scope outright.
+        exec("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY,
+            pane_id TEXT, tab_id TEXT, workspace_id TEXT,
+            workspace_name TEXT, workspace_color TEXT,
+            opened_at INTEGER, closed_at INTEGER,
+            close_reason TEXT,
+            cwd_last TEXT, shell TEXT,
+            adapter TEXT, adapter_state TEXT,
+            boot_session_uuid TEXT,
+            custom_title TEXT, tab_color TEXT,
+            preview TEXT);
+        """)
+        exec("CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(session_id UNINDEXED, commands)")
+        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '6')")
     }
 
     private func columnExists(_ table: String, _ name: String) -> Bool {
@@ -476,8 +541,9 @@ public final class StateStore {
     }
 
     /// Removes one pane's on-disk byte trail: its scrollback file and (FR-56/57
-    /// for the per-tab shell history) its .hist file. Both live under the state
-    /// dir and both die with the same forget gestures.
+    /// for the per-tab shell history) its .hist file plus the freeze-before-trim
+    /// sidecar. All live under the state dir and all die with the same forget
+    /// gestures.
     private static func removePaneFiles(_ paneId: String, scrollbackDir: URL?,
                                         historyDir: URL?) {
         if let scrollbackDir {
@@ -487,6 +553,8 @@ public final class StateStore {
         if let historyDir {
             try? FileManager.default.removeItem(
                 at: ShellIntegration.histFileURL(dir: historyDir, paneId: paneId))
+            try? FileManager.default.removeItem(
+                at: ShellIntegration.histTrimSidecarURL(dir: historyDir, paneId: paneId))
         }
     }
 
@@ -494,7 +562,13 @@ public final class StateStore {
     /// scrollback + shell-history files on disk — forgetting deletes bytes,
     /// not just the index. Files are removed only after the row purge COMMITs,
     /// so a failed transaction never leaves rows pointing at deleted files.
-    public func forgetWorkspace(_ id: String, scrollbackDir: URL?, historyDir: URL? = nil) {
+    /// `archiveDir` non-nil = the founder-amended FR-56 EXPLICIT-forget scope:
+    /// the workspace's ARCHIVED sessions (rows, FTS entries, frozen files)
+    /// die with its live rows. nil keeps the archive — the last-tab-close
+    /// auto-remove path, where the just-archived tab is the survivor the
+    /// archive exists for.
+    public func forgetWorkspace(_ id: String, scrollbackDir: URL?, historyDir: URL? = nil,
+                                archiveDir: URL? = nil) {
         writer.async { [self] in
             var paneIds: [String] = []
             if scrollbackDir != nil || historyDir != nil {
@@ -504,6 +578,10 @@ public final class StateStore {
                       """, [.text(id)]) { stmt in
                     if let paneId = column(stmt, 0) { paneIds.append(paneId) }
                 }
+            }
+            if let archiveDir {
+                deleteArchivedRows(whereSQL: "workspace_id = ?", binds: [.text(id)],
+                                   archiveDir: archiveDir)
             }
             let committed = inTransaction {
                 var ok = true
@@ -529,6 +607,351 @@ public final class StateStore {
         invalidateWorkspaceCache()
     }
 
+    // MARK: Archive (schema v6 — close = archive, founder-amended FR-56)
+
+    /// On-disk home of one archived session's frozen files:
+    /// <archiveDir>/<session-rowid>/{scrollback.txt, history.hist,
+    /// history-trimmed.hist}. Files are MOVED here at close (cheap rename,
+    /// never a copy); NFR-10 perms (0700 dir / 0600 files) are re-asserted
+    /// on every move.
+    public static func archiveSessionDir(_ archiveDir: URL, id: Int64) -> URL {
+        archiveDir.appendingPathComponent(String(id), isDirectory: true)
+    }
+
+    /// Archives every pane of `tabIds` (one sessions row per pane), then
+    /// cleans the live rows exactly as forgetTabs did: pane snapshots, panes,
+    /// tabs, and any window row left with no tabs. The closed tab must never
+    /// RESTORE — but its bytes now live on in the archive instead of dying.
+    /// `openedAt` carries per-pane open timestamps when the caller knows them
+    /// (the live PaneView's creation time); panes closed before their first
+    /// topology capture have no row and archive nothing (the orphan sweep
+    /// collects any stray files).
+    public func archiveTabs(_ tabIds: [String], closeReason: SessionCloseReason,
+                            scrollbackDir: URL?, historyDir: URL?, archiveDir: URL,
+                            openedAt: [String: Int] = [:]) {
+        guard !tabIds.isEmpty else { return }
+        writer.async { [self] in
+            let marks = Array(repeating: "?", count: tabIds.count).joined(separator: ",")
+            let binds = tabIds.map { Bind.text($0) }
+            var paneIds: [String] = []
+            query("SELECT id FROM panes WHERE tab_id IN (\(marks))", binds) { stmt in
+                if let paneId = column(stmt, 0) { paneIds.append(paneId) }
+            }
+            performArchive(paneIds: paneIds, alsoDeleteTabs: tabIds,
+                           closeReason: closeReason, scrollbackDir: scrollbackDir,
+                           historyDir: historyDir, archiveDir: archiveDir,
+                           openedAt: openedAt)
+        }
+    }
+
+    /// Archives exactly these panes (a pane closed inside a still-open tab —
+    /// ⌘⇧W / context-menu Close Pane / its shell exiting) and cleans their
+    /// live rows as forgetPanes did. The tab row stays: the tab is still open.
+    public func archivePanes(_ paneIds: [String], closeReason: SessionCloseReason,
+                             scrollbackDir: URL?, historyDir: URL?, archiveDir: URL,
+                             openedAt: [String: Int] = [:]) {
+        guard !paneIds.isEmpty else { return }
+        writer.async { [self] in
+            performArchive(paneIds: paneIds, alsoDeleteTabs: [],
+                           closeReason: closeReason, scrollbackDir: scrollbackDir,
+                           historyDir: historyDir, archiveDir: archiveDir,
+                           openedAt: openedAt)
+        }
+    }
+
+    /// Writer-queue worker: reads each pane's live rows (pane + tab +
+    /// workspace join, snapshot, boot uuid) and its command history, inserts
+    /// the sessions + FTS rows and deletes the live rows in ONE transaction,
+    /// then MOVES the pane's files into <archive>/<rowid>/ — moves happen
+    /// only after COMMIT, so a failed transaction never strands files, and a
+    /// crash between commit and move leaves files the orphan sweep can see.
+    private func performArchive(paneIds: [String], alsoDeleteTabs: [String],
+                                closeReason: SessionCloseReason,
+                                scrollbackDir: URL?, historyDir: URL?,
+                                archiveDir: URL, openedAt: [String: Int]) {
+        guard db != nil else { return }
+        let now = Int(Date().timeIntervalSince1970)
+        var bootUUID: String?
+        query("SELECT value FROM meta WHERE key = 'boot_session_uuid'", []) { stmt in
+            bootUUID = column(stmt, 0)
+        }
+
+        struct Doomed {
+            var paneId: String
+            var tabId: String
+            var workspaceId: String
+            var workspaceName: String
+            var workspaceColor: String
+            var cwd: String?
+            var shell: String?
+            var customTitle: String?
+            var tabColor: String?
+            var adapter: String?
+            var adapterState: String?
+            var commands: String
+            var preview: String
+        }
+        var doomed: [Doomed] = []
+        for paneId in paneIds {
+            var row: Doomed?
+            query("""
+                  SELECT p.tab_id, p.shell, p.cwd, t.workspace_id, t.title, t.color,
+                         w.name, w.color
+                  FROM panes p
+                  LEFT JOIN tabs t ON p.tab_id = t.id
+                  LEFT JOIN workspaces w ON t.workspace_id = w.id
+                  WHERE p.id = ?
+                  """, [.text(paneId)]) { stmt in
+                row = Doomed(paneId: paneId,
+                             tabId: column(stmt, 0) ?? "",
+                             workspaceId: column(stmt, 3) ?? Self.defaultWorkspaceId,
+                             workspaceName: column(stmt, 6) ?? "",
+                             workspaceColor: column(stmt, 7) ?? Self.defaultWorkspaceColor,
+                             cwd: column(stmt, 2),
+                             shell: column(stmt, 1),
+                             customTitle: column(stmt, 4),
+                             tabColor: column(stmt, 5),
+                             adapter: nil, adapterState: nil,
+                             commands: "", preview: "")
+            }
+            guard var d = row else { continue }  // never captured: nothing to archive
+            query("SELECT adapter, adapter_state FROM pane_snapshot WHERE pane_id = ?",
+                  [.text(paneId)]) { stmt in
+                d.adapter = column(stmt, 0)
+                d.adapterState = column(stmt, 1)
+            }
+            // Command text for FTS + the card preview, from the pane's .hist
+            // (freeze-before-trim sidecar first, so rolled-out lines search
+            // too). Extended-history prefixes are stripped for the index.
+            if let historyDir {
+                var lines: [String] = []
+                for url in [ShellIntegration.histTrimSidecarURL(dir: historyDir, paneId: paneId),
+                            ShellIntegration.histFileURL(dir: historyDir, paneId: paneId)] {
+                    if let text = try? String(contentsOf: url, encoding: .utf8) {
+                        lines.append(contentsOf: text.split(separator: "\n").map(String.init))
+                    }
+                }
+                let commands = lines.compactMap { ShellIntegration.commandText(historyLine: $0) }
+                d.commands = commands.joined(separator: "\n")
+                d.preview = commands.last ?? ""
+            }
+            if d.preview.isEmpty { d.preview = d.cwd ?? "" }
+            doomed.append(d)
+        }
+
+        var movedIds: [(id: Int64, paneId: String)] = []
+        let committed = inTransaction {
+            var ok = true
+            for d in doomed {
+                ok = run("""
+                    INSERT INTO sessions (pane_id, tab_id, workspace_id, workspace_name,
+                        workspace_color, opened_at, closed_at, close_reason, cwd_last,
+                        shell, adapter, adapter_state, boot_session_uuid, custom_title,
+                        tab_color, preview)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, [.text(d.paneId), .text(d.tabId), .text(d.workspaceId),
+                          .text(d.workspaceName), .text(d.workspaceColor),
+                          openedAt[d.paneId].map(Bind.int) ?? .textOrNull(nil),
+                          .int(now), .text(closeReason.rawValue),
+                          .textOrNull(d.cwd), .textOrNull(d.shell),
+                          .textOrNull(d.adapter), .textOrNull(d.adapterState),
+                          .textOrNull(bootUUID), .textOrNull(d.customTitle),
+                          .textOrNull(d.tabColor), .text(d.preview)]) == SQLITE_OK && ok
+                let rowid = sqlite3_last_insert_rowid(db)
+                movedIds.append((rowid, d.paneId))
+                if !d.commands.isEmpty {
+                    ok = run("INSERT INTO session_fts (session_id, commands) VALUES (?, ?)",
+                             [.int(Int(rowid)), .text(d.commands)]) == SQLITE_OK && ok
+                }
+            }
+            // Live-row cleanup, exactly forgetPanes/forgetTabs' shape.
+            let paneMarks = Array(repeating: "?", count: paneIds.count).joined(separator: ",")
+            let paneBinds = paneIds.map { Bind.text($0) }
+            ok = run("DELETE FROM pane_snapshot WHERE pane_id IN (\(paneMarks))", paneBinds) == SQLITE_OK && ok
+            ok = run("DELETE FROM panes WHERE id IN (\(paneMarks))", paneBinds) == SQLITE_OK && ok
+            if !alsoDeleteTabs.isEmpty {
+                let tabMarks = Array(repeating: "?", count: alsoDeleteTabs.count).joined(separator: ",")
+                let tabBinds = alsoDeleteTabs.map { Bind.text($0) }
+                ok = run("DELETE FROM tabs WHERE id IN (\(tabMarks))", tabBinds) == SQLITE_OK && ok
+                ok = run("DELETE FROM windows WHERE id NOT IN (SELECT DISTINCT window_id FROM tabs)") == SQLITE_OK && ok
+            }
+            return ok
+        }
+        guard committed else { return }
+
+        let fm = FileManager.default
+        for (id, paneId) in movedIds {
+            let dir = Self.archiveSessionDir(archiveDir, id: id)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true,
+                                    attributes: [.posixPermissions: 0o700])
+            var moves: [(URL, String)] = []
+            if let scrollbackDir {
+                moves.append((ScrollbackText.fileURL(dir: scrollbackDir, paneId: paneId),
+                              "scrollback.txt"))
+            }
+            if let historyDir {
+                moves.append((ShellIntegration.histFileURL(dir: historyDir, paneId: paneId),
+                              "history.hist"))
+                moves.append((ShellIntegration.histTrimSidecarURL(dir: historyDir, paneId: paneId),
+                              "history-trimmed.hist"))
+            }
+            for (from, name) in moves where fm.fileExists(atPath: from.path) {
+                let to = dir.appendingPathComponent(name)
+                try? fm.removeItem(at: to)
+                try? fm.moveItem(at: from, to: to)
+                try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: to.path)
+            }
+        }
+    }
+
+    // MARK: Archive reads (timeline / kit surface)
+
+    private func archivedSessionRow(_ stmt: OpaquePointer) -> ArchivedSessionRow? {
+        let id = sqlite3_column_int64(stmt, 0)
+        guard id > 0 else { return nil }
+        let openedAt = sqlite3_column_type(stmt, 6) == SQLITE_NULL
+            ? nil : Int(sqlite3_column_int64(stmt, 6))
+        let state = (jsonObject(column(stmt, 12)) as? [String: String]) ?? [:]
+        return ArchivedSessionRow(
+            id: id,
+            paneId: column(stmt, 1) ?? "",
+            tabId: column(stmt, 2) ?? "",
+            workspaceId: column(stmt, 3) ?? "",
+            workspaceName: column(stmt, 4) ?? "",
+            workspaceColor: column(stmt, 5) ?? "",
+            openedAt: openedAt,
+            closedAt: Int(sqlite3_column_int64(stmt, 7)),
+            closeReason: column(stmt, 8) ?? "",
+            cwdLast: column(stmt, 9),
+            shell: column(stmt, 10),
+            adapter: column(stmt, 11),
+            adapterState: state,
+            bootSessionUUID: column(stmt, 13),
+            customTitle: column(stmt, 14),
+            tabColor: column(stmt, 15),
+            preview: column(stmt, 16) ?? "")
+    }
+
+    private static let sessionColumns = """
+        id, pane_id, tab_id, workspace_id, workspace_name, workspace_color,
+        opened_at, closed_at, close_reason, cwd_last, shell, adapter,
+        adapter_state, boot_session_uuid, custom_title, tab_color, preview
+        """
+
+    /// Newest-closed first.
+    public func archivedSessions(limit: Int = 50) -> [ArchivedSessionRow] {
+        writer.sync {
+            var rows: [ArchivedSessionRow] = []
+            query("SELECT \(Self.sessionColumns) FROM sessions ORDER BY closed_at DESC, id DESC LIMIT ?",
+                  [.int(max(0, limit))]) { stmt in
+                if let row = archivedSessionRow(stmt) { rows.append(row) }
+            }
+            return rows
+        }
+    }
+
+    public func archivedSession(id: Int64) -> ArchivedSessionRow? {
+        writer.sync {
+            var row: ArchivedSessionRow?
+            query("SELECT \(Self.sessionColumns) FROM sessions WHERE id = ?",
+                  [.int(Int(id))]) { stmt in
+                row = archivedSessionRow(stmt)
+            }
+            return row
+        }
+    }
+
+    public func archivedSessionCount() -> Int {
+        writer.sync {
+            var n = 0
+            query("SELECT COUNT(*) FROM sessions", []) { stmt in
+                n = Int(sqlite3_column_int64(stmt, 0))
+            }
+            return n
+        }
+    }
+
+    /// FTS5 search over archived command text. User text is tokenized and
+    /// each token double-quoted (implicit AND), so raw FTS syntax (`NEAR`,
+    /// `*`, unbalanced quotes) can never make the query throw.
+    public func searchArchivedSessions(_ text: String, limit: Int = 50) -> [ArchivedSessionRow] {
+        // Tokens with no letter/digit ("*", "--") would tokenize to an empty
+        // phrase inside the quotes; drop them rather than risk FTS syntax.
+        let tokens = text.split(whereSeparator: { $0.isWhitespace || $0 == "\"" })
+            .filter { $0.contains(where: { $0.isLetter || $0.isNumber }) }
+        guard !tokens.isEmpty else { return [] }
+        let match = tokens.map { "\"\($0)\"" }.joined(separator: " ")
+        return writer.sync {
+            var rows: [ArchivedSessionRow] = []
+            query("""
+                  SELECT \(Self.sessionColumns) FROM sessions
+                  WHERE id IN (SELECT session_id FROM session_fts WHERE session_fts MATCH ?)
+                  ORDER BY closed_at DESC, id DESC LIMIT ?
+                  """, [.text(match), .int(max(0, limit))]) { stmt in
+                if let row = archivedSessionRow(stmt) { rows.append(row) }
+            }
+            return rows
+        }
+    }
+
+    /// The frozen scrollback text for one archived session, read from its
+    /// archive dir — nil when the session doesn't exist or wrote none. The
+    /// row is verified first so a fabricated id can never read outside a
+    /// session dir (ids are integers by type; this is belt and suspenders).
+    public func archivedScrollbackText(id: Int64, archiveDir: URL) -> String? {
+        guard archivedSession(id: id) != nil else { return nil }
+        let url = Self.archiveSessionDir(archiveDir, id: id)
+            .appendingPathComponent("scrollback.txt")
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    // MARK: Archive deletion (the ONLY paths that delete archived bytes)
+
+    /// Writer-queue core: deletes the sessions rows matching `whereSQL`,
+    /// their FTS rows, and their archive dirs (dirs after COMMIT).
+    private func deleteArchivedRows(whereSQL: String, binds: [Bind], archiveDir: URL) {
+        guard db != nil else { return }
+        var ids: [Int64] = []
+        query("SELECT id FROM sessions WHERE \(whereSQL)", binds) { stmt in
+            ids.append(sqlite3_column_int64(stmt, 0))
+        }
+        guard !ids.isEmpty else { return }
+        let committed = inTransaction {
+            var ok = true
+            ok = run("DELETE FROM session_fts WHERE session_id IN (SELECT id FROM sessions WHERE \(whereSQL))",
+                     binds) == SQLITE_OK && ok
+            ok = run("DELETE FROM sessions WHERE \(whereSQL)", binds) == SQLITE_OK && ok
+            return ok
+        }
+        if committed {
+            for id in ids {
+                try? FileManager.default.removeItem(
+                    at: Self.archiveSessionDir(archiveDir, id: id))
+            }
+        }
+    }
+
+    /// Per-card Forget (the timeline / kit requestForget path): TRUE
+    /// deletion of one archived session — row, FTS entry, and frozen files.
+    public func deleteArchivedSession(id: Int64, archiveDir: URL) {
+        writer.async { [self] in
+            deleteArchivedRows(whereSQL: "id = ?", binds: [.int(Int(id))],
+                               archiveDir: archiveDir)
+        }
+    }
+
+    /// Retention (Settings ▸ Memory): archived sessions older than
+    /// `maxAgeDays` are TRUE-deleted at launch. `maxAgeDays <= 0` keeps
+    /// everything forever.
+    public func enforceArchiveRetention(maxAgeDays: Int, archiveDir: URL) {
+        guard maxAgeDays > 0 else { return }
+        let cutoff = Int(Date().timeIntervalSince1970) - maxAgeDays * 86_400
+        writer.async { [self] in
+            deleteArchivedRows(whereSQL: "closed_at < ?", binds: [.int(cutoff)],
+                               archiveDir: archiveDir)
+        }
+    }
+
     // MARK: Forget (FR-56/57: close = throw it away; kill memories at every granularity)
 
     /// FR-56/57: purges the journal rows AND scrollback + shell-history files
@@ -536,11 +959,18 @@ public final class StateStore {
     /// open — the next capture starts a fresh trail) and by user-initiated
     /// pane closes (the pane must never restore). Files are removed only
     /// after the row purge COMMITs, mirroring forgetWorkspace.
-    public func forgetPanes(_ paneIds: [String], scrollbackDir: URL?, historyDir: URL? = nil) {
+    /// `archiveDir` non-nil (the EXPLICIT gesture) also TRUE-deletes any
+    /// archived sessions of these panes; nil leaves the archive alone.
+    public func forgetPanes(_ paneIds: [String], scrollbackDir: URL?, historyDir: URL? = nil,
+                            archiveDir: URL? = nil) {
         guard !paneIds.isEmpty else { return }
         writer.async { [self] in
             let marks = Array(repeating: "?", count: paneIds.count).joined(separator: ",")
             let binds = paneIds.map { Bind.text($0) }
+            if let archiveDir {
+                deleteArchivedRows(whereSQL: "pane_id IN (\(marks))", binds: binds,
+                                   archiveDir: archiveDir)
+            }
             let committed = inTransaction {
                 var ok = true
                 ok = run("DELETE FROM pane_snapshot WHERE pane_id IN (\(marks))", binds) == SQLITE_OK && ok
@@ -556,16 +986,23 @@ public final class StateStore {
         }
     }
 
-    /// FR-56: a user-initiated tab close (⌘W, the tab's close button)
-    /// removes the tab's rows, its panes' rows + snapshots + scrollback and
+    /// FR-57 "Forget Tab Memory" (the EXPLICIT gesture — a plain user CLOSE
+    /// goes through archiveTabs since the founder-amended FR-56): removes
+    /// the tab's rows, its panes' rows + snapshots + scrollback and
     /// shell-history files, and any window row left with no tabs — those tabs
     /// must never restore. Quit/switch/park teardown must NOT reach this
     /// (callers gate on their isTerminating / isSwitchingWorkspaces flags).
-    public func forgetTabs(_ tabIds: [String], scrollbackDir: URL?, historyDir: URL? = nil) {
+    /// `archiveDir` non-nil also TRUE-deletes these tabs' archived sessions.
+    public func forgetTabs(_ tabIds: [String], scrollbackDir: URL?, historyDir: URL? = nil,
+                           archiveDir: URL? = nil) {
         guard !tabIds.isEmpty else { return }
         writer.async { [self] in
             let marks = Array(repeating: "?", count: tabIds.count).joined(separator: ",")
             let binds = tabIds.map { Bind.text($0) }
+            if let archiveDir {
+                deleteArchivedRows(whereSQL: "tab_id IN (\(marks))", binds: binds,
+                                   archiveDir: archiveDir)
+            }
             var paneIds: [String] = []
             query("SELECT id FROM panes WHERE tab_id IN (\(marks))", binds) { stmt in
                 if let paneId = column(stmt, 0) { paneIds.append(paneId) }
@@ -598,13 +1035,16 @@ public final class StateStore {
     /// (its deinit closes the SQLite connection); the caller then constructs a
     /// fresh StateStore and re-captures the live layout so capture continues
     /// cleanly.
-    public static func purgeAll(dbURL: URL, scrollbackDir: URL, historyDir: URL? = nil) {
+    /// `archiveDir` (founder-amended FR-56): Forget Everything empties the
+    /// ARCHIVE too — every frozen session dir under it goes.
+    public static func purgeAll(dbURL: URL, scrollbackDir: URL, historyDir: URL? = nil,
+                                archiveDir: URL? = nil) {
         let fm = FileManager.default
         var doomed = [dbURL.path, dbURL.path + "-wal", dbURL.path + "-shm",
                       dbURL.path + ".corrupt"]
         for n in 1...generationCount { doomed.append(generationURL(dbURL, n).path) }
         for path in doomed { try? fm.removeItem(atPath: path) }
-        for dir in [scrollbackDir, historyDir].compactMap({ $0 }) {
+        for dir in [scrollbackDir, historyDir, archiveDir].compactMap({ $0 }) {
             if let files = try? fm.contentsOfDirectory(at: dir,
                                                        includingPropertiesForKeys: nil) {
                 for file in files { try? fm.removeItem(at: file) }
@@ -613,11 +1053,16 @@ public final class StateStore {
     }
 
     /// FR-57 hygiene: deletes scrollback files (and, when `historyDir` is
-    /// given, per-pane .hist files) whose pane no longer has a row in the
-    /// panes table (closed panes' files used to accumulate forever).
+    /// given, per-pane .hist files plus their freeze-before-trim sidecars)
+    /// whose pane no longer has a row in the panes table (closed panes' files
+    /// used to accumulate forever), and (when `archiveDir` is given) archive
+    /// session dirs whose rowid has no sessions row — a crash between a
+    /// per-card Forget's COMMIT and its dir removal, or a torn archive move,
+    /// must never strand frozen bytes.
     /// No-ops on a degraded store — an empty pane set there is ignorance, not
     /// evidence, and must never trigger a mass delete.
-    public func purgeOrphanScrollback(dir: URL, historyDir: URL? = nil) {
+    public func purgeOrphanScrollback(dir: URL, historyDir: URL? = nil,
+                                      archiveDir: URL? = nil) {
         writer.async { [self] in
             guard db != nil else { return }
             var live = Set<String>()
@@ -647,6 +1092,28 @@ public final class StateStore {
                     let paneId = file.deletingPathExtension().lastPathComponent
                     if !liveHist.contains(paneId) {
                         try? fm.removeItem(at: file)
+                    }
+                }
+                // <pane>.hist.trimmed sidecars orphan with their .hist.
+                for file in files where file.pathExtension == "trimmed" {
+                    let paneId = file.deletingPathExtension()  // strips .trimmed
+                        .deletingPathExtension()               // strips .hist
+                        .lastPathComponent
+                    if !liveHist.contains(paneId) {
+                        try? fm.removeItem(at: file)
+                    }
+                }
+            }
+            if let archiveDir {
+                var archivedIds = Set<String>()
+                query("SELECT id FROM sessions", []) { stmt in
+                    archivedIds.insert(String(sqlite3_column_int64(stmt, 0)))
+                }
+                if let dirs = try? fm.contentsOfDirectory(at: archiveDir,
+                                                          includingPropertiesForKeys: nil) {
+                    for sessionDir in dirs
+                    where !archivedIds.contains(sessionDir.lastPathComponent) {
+                        try? fm.removeItem(at: sessionDir)
                     }
                 }
             }

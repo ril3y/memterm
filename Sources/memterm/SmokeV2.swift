@@ -11,9 +11,11 @@ import MemtermCore
 //
 // Keep-list preserved verbatim: identity sets over controllers AND panes,
 // kill(pid,0) on the original shell pids, byte-identical frame checks across
-// FR-59 switches, FR-56 forget-on-user-close, parked-not-restored, the real
-// zsh integration history check, restoredDividerCount, and run 1's
-// exit()-as-crash-simulation (named: SMOKE-SAVE crash-sim=true).
+// FR-59 switches, FR-56 archive-on-user-close (SEMANTICS AMENDED 2026-09-02:
+// the leg asserts archived-not-restored instead of gone-forever — see
+// save-close-forget), parked-not-restored, the real zsh integration history
+// check, restoredDividerCount, and run 1's exit()-as-crash-simulation
+// (named: SMOKE-SAVE crash-sim=true).
 
 extension MemtermAppDelegate {
 
@@ -189,18 +191,49 @@ extension MemtermAppDelegate {
                 guard parked == 1 else { throw ProbeFailure("B not parked") }
             }))
 
-        // FR-56 leg: deliberately close the single-pane tab — a user gesture,
-        // so it must be forgotten; run 2 asserts it is NOT restored.
+        // FR-56 leg — SEMANTICS UPDATED with the founder-amended FR-56
+        // (approved 2026-09-02), the ONE place the meaning legitimately
+        // changes: a user close now ARCHIVES instead of deleting. This leg
+        // asserts archived-not-restored — the closed tab gets a sessions row
+        // with its frozen files MOVED into the archive and its live rows
+        // cleaned; run 2 still asserts it is NOT restored (that half of the
+        // promise is unchanged), plus that the archive row survived the
+        // crash-sim relaunch.
         smoke.add(ProbeStep(
             name: "save-close-forget",
             assert: { [self] in
-                guard let doomed = controllers.first(where: {
+                guard let engine = memory, let doomed = controllers.first(where: {
                     $0.workspaceId == activeWorkspaceId && $0.allPanes().count == 1
                 }) else {
                     throw ProbeFailure("no single-pane tab to close")
                 }
-                print("SMOKE-CLOSED tab=\(doomed.tabId)")
-                doomed.close()  // active-workspace user close: forgets
+                let doomedTabId = doomed.tabId
+                let doomedPaneIds = doomed.allPanes().map { $0.paneId }
+                print("SMOKE-CLOSED tab=\(doomedTabId)")
+                doomed.close()  // active-workspace user close: archives
+                engine.store.barrier()
+                // Archive row exists, honest reason, correct tab.
+                let archived = engine.store.archivedSessions(limit: 10)
+                guard let row = archived.first(where: { $0.tabId == doomedTabId }) else {
+                    throw ProbeFailure("close did not archive: no sessions row for \(doomedTabId) (have \(archived.map(\.tabId)))")
+                }
+                guard row.closeReason == SessionCloseReason.userClose.rawValue else {
+                    throw ProbeFailure("archived close_reason=\(row.closeReason), want user-close")
+                }
+                // Frozen files moved into <archive>/<rowid>/.
+                let sessionDir = StateStore.archiveSessionDir(engine.archiveDir, id: row.id)
+                guard FileManager.default.fileExists(
+                    atPath: sessionDir.appendingPathComponent("scrollback.txt").path) else {
+                    throw ProbeFailure("archived session \(row.id) has no frozen scrollback.txt")
+                }
+                // Live tables clean: the pane's row and file are gone.
+                for paneId in doomedPaneIds {
+                    guard !FileManager.default.fileExists(
+                        atPath: engine.scrollbackURL(for: paneId).path) else {
+                        throw ProbeFailure("live scrollback file survived the archive move")
+                    }
+                }
+                print("SMOKE-ARCHIVED session=\(row.id) reason=\(row.closeReason) files=ok")
             }))
         smoke.add(ProbeStep(
             name: "save-final-flush",
@@ -246,11 +279,29 @@ extension MemtermAppDelegate {
                 if controllers.contains(where: { $0.workspaceId == b.id }) {
                     throw ProbeFailure("parked workspace B was restored")
                 }
-                // FR-56: the deliberately-closed tab from run 1 must NOT be
-                // restored, while the split tab (2 panes) is.
+                // FR-56 (amended 2026-09-02): the deliberately-closed tab
+                // from run 1 must NOT be restored (unchanged), while the
+                // split tab (2 panes) is — but it is now ARCHIVED, not gone
+                // forever: its sessions row and frozen files must have
+                // survived the crash-sim relaunch (including the launch-time
+                // orphan sweep and retention pass).
                 guard controllers.count == 1, panes.count == 2 else {
                     throw ProbeFailure("close-forget: expected 1 tab / 2 panes restored, got \(controllers.count) tab(s) / \(panes.count) pane(s)")
                 }
+                guard let engine = memory else { throw ProbeFailure("no engine") }
+                engine.store.barrier()  // launch sweep + retention have run
+                let archived = engine.store.archivedSessions(limit: 10)
+                guard let row = archived.first(where: {
+                    $0.closeReason == SessionCloseReason.userClose.rawValue
+                }) else {
+                    throw ProbeFailure("archived session from run 1 did not survive the relaunch (have \(archived.count))")
+                }
+                let sessionDir = StateStore.archiveSessionDir(engine.archiveDir, id: row.id)
+                guard FileManager.default.fileExists(
+                    atPath: sessionDir.appendingPathComponent("scrollback.txt").path) else {
+                    throw ProbeFailure("archived session \(row.id) lost its frozen scrollback across the relaunch")
+                }
+                print("SMOKE-ARCHIVE-SURVIVED session=\(row.id) closed_at=\(row.closedAt)")
                 let parked = list.filter(\.isParked).count
                 print("SMOKE-WS workspaces=\(list.count) parked=\(parked) active_tabs=\(controllers.count)")
             }))

@@ -298,6 +298,27 @@ final class ShellIntegrationZshTests: XCTestCase {
         // 1000 kept + the 'exit' just typed.
         XCTAssertEqual(lines.count, 1001, "trim did not run")
         XCTAssertTrue(lines.first!.contains("cmd-1500"), "wrong lines kept: \(lines.first!)")
+        // v3 freeze-before-trim (amended FR-56): the 1500 head lines ROLLED
+        // into the sidecar instead of being discarded — real zsh, real roll.
+        let sidecar = URL(fileURLWithPath: histFile().path + ".trimmed")
+        let rolled = try String(contentsOf: sidecar, encoding: .utf8)
+            .split(separator: "\n")
+        XCTAssertEqual(rolled.count, 1500, "trimmed lines must roll, not vanish")
+        XCTAssertTrue(rolled.first!.contains("cmd-0"), "sidecar wrong head: \(rolled.first!)")
+        XCTAssertTrue(rolled.last!.contains("cmd-1499"), "sidecar wrong tail: \(rolled.last!)")
+        let perms = try XCTUnwrap(try FileManager.default.attributesOfItem(
+            atPath: sidecar.path)[.posixPermissions] as? Int)
+        XCTAssertEqual(perms & 0o777, 0o600, "sidecar must be 0600 (NFR-10)")
+        // A SECOND oversize start appends to the same sidecar (>>|), never
+        // truncates what an earlier roll saved.
+        var again = ""
+        for i in 2500..<5100 { again += ": 1700000000:0;cmd-\(i)\n" }
+        try again.write(to: histFile(), atomically: true, encoding: .utf8)
+        try runZsh(input: "exit\n")
+        let rolled2 = try String(contentsOf: sidecar, encoding: .utf8)
+            .split(separator: "\n")
+        XCTAssertEqual(rolled2.count, 1500 + 1600, "second roll must append")
+        XCTAssertTrue(rolled2.first!.contains("cmd-0"))
     }
 
     // MARK: (f) startup overhead < 50 ms

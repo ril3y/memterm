@@ -769,10 +769,13 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         let dbURL = MemoryEngine.baseDir.appendingPathComponent("state.db")
         let scrollbackDir = memory!.scrollbackDir
         let historyDir = memory!.historyDir
+        let archiveDir = memory!.archiveDir
         memory?.shutdown()  // timers off, writer queue drained
         memory = nil        // releases the engine → StateStore deinit closes the db
+        // Founder-amended FR-56: Forget Everything is TRUE deletion of the
+        // ARCHIVE too — an empty archive, not an emptied-live-tables one.
         StateStore.purgeAll(dbURL: dbURL, scrollbackDir: scrollbackDir,
-                            historyDir: historyDir)
+                            historyDir: historyDir, archiveDir: archiveDir)
 
         let fresh = MemoryEngine(app: self, config: config)
         memory = fresh
@@ -788,6 +791,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         fresh.start()
         fresh.flushSync()   // the open layout is memory again, from this moment
         rebuildWorkspaceMenu()
+        extensionRuntime?.emit(.archiveChanged)  // the archive is empty now
     }
 
     /// ⌘R: types the captured resume command into the pty WITHOUT a newline —

@@ -53,6 +53,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
 
     // Memory
     private let scrollbackField = NSTextField()
+    private let retentionField = NSTextField()
     private let diskUsageLabel = NSTextField(labelWithString: "Calculating…")
 
     /// True while the theme keys are deliberately unset ("Use Default
@@ -185,6 +186,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         scrollbackFormatter.allowsFloats = false
         scrollbackField.formatter = scrollbackFormatter
         wire(scrollbackField)
+        let retentionFormatter = NumberFormatter()
+        retentionFormatter.minimum = 0
+        retentionFormatter.maximum = 36_500
+        retentionFormatter.allowsFloats = false
+        retentionField.formatter = retentionFormatter
+        wire(retentionField)
         shellField.placeholderString = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         wire(shellField)
 
@@ -300,16 +307,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         forget.bezelStyle = .rounded
         forget.hasDestructiveAction = true
 
+        let retentionRow = NSStackView(views: [retentionField,
+                                               label("days (0 = forever)")])
+        retentionRow.orientation = .horizontal
+
         let memory = makeTab("Memory", rows: [
             [label("Scrollback:"), scrollbackField],
             [NSGridCell.emptyContentView, caption("Lines kept and restored. Applies to new panes.")],
+            [label("Archive kept:"), retentionRow],
+            [NSGridCell.emptyContentView, caption("Closed tabs move to the timeline archive instead of being deleted; entries older than this are removed at launch.")],
             [label("On disk:"), usageRow],
-            [NSGridCell.emptyContentView, caption("Layouts, scrollback history, and session records — all local, never uploaded.")],
+            [NSGridCell.emptyContentView, caption("Layouts, scrollback history, session records, and the archive — all local, never uploaded.")],
             [NSGridCell.emptyContentView, NSBox.separator()],
             [NSGridCell.emptyContentView, forget],
-            [NSGridCell.emptyContentView, caption("Deletes all memory including scrollback files on disk. Open terminals stay open.")],
+            [NSGridCell.emptyContentView, caption("Deletes all memory — the closed-tab archive included — and every file on disk. Open terminals stay open.")],
         ])
         scrollbackField.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        retentionField.widthAnchor.constraint(equalToConstant: 60).isActive = true
 
         tabView.addTabViewItem(general)
         tabView.addTabViewItem(appearance)
@@ -456,6 +470,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
 
         // Memory
         scrollbackField.integerValue = config.scrollbackLines
+        retentionField.integerValue = config.archiveRetentionDays
     }
 
     /// Preset names + (a non-builtin import label when present) + Custom.
@@ -569,6 +584,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
 
         // Memory
         if scrollbackField.integerValue >= 100 { config.scrollbackLines = scrollbackField.integerValue }
+        if retentionField.integerValue >= 0 { config.archiveRetentionDays = retentionField.integerValue }
 
         app.applyConfigLive(config)
     }
@@ -648,25 +664,32 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         refreshDiskUsage()
     }
 
-    /// FR-45: the on-disk location, surfaced with its size. Computed with a
+    /// FR-45: the on-disk location, surfaced with its size — and (amended
+    /// FR-56) the archive's share of it, alongside. Computed with a
     /// background walk (honors MEMTERM_STATE_DIR), never on the input path.
     private func refreshDiskUsage() {
         let dir = MemoryEngine.baseDir
+        let archivePrefix = dir.appendingPathComponent("archive").path
         diskUsageLabel.stringValue = "Calculating…"
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var total: Int64 = 0
+            var archive: Int64 = 0
             let keys: Set<URLResourceKey> = [.totalFileAllocatedSizeKey, .fileSizeKey]
             if let walker = FileManager.default.enumerator(at: dir,
                                                            includingPropertiesForKeys: Array(keys)) {
                 for case let url as URL in walker {
                     let values = try? url.resourceValues(forKeys: keys)
-                    total += Int64(values?.totalFileAllocatedSize ?? values?.fileSize ?? 0)
+                    let bytes = Int64(values?.totalFileAllocatedSize ?? values?.fileSize ?? 0)
+                    total += bytes
+                    if url.path.hasPrefix(archivePrefix) { archive += bytes }
                 }
             }
             let size = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+            let archiveSize = ByteCountFormatter.string(fromByteCount: archive,
+                                                        countStyle: .file)
             let path = (dir.path as NSString).abbreviatingWithTildeInPath
             DispatchQueue.main.async {
-                self?.diskUsageLabel.stringValue = "\(size) · \(path)"
+                self?.diskUsageLabel.stringValue = "\(size) (archive \(archiveSize)) · \(path)"
                 self?.diskUsageLabel.toolTip = dir.path  // full path on hover
             }
         }

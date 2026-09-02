@@ -147,15 +147,21 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         }
     }
 
-    /// Kills the tab's panes and (only for a user gesture) forgets its
-    /// journal rows + scrollback bytes. Every close path funnels here with
-    /// explicit intent — quit is "put it down", close is "throw it away",
-    /// crash runs nothing at all.
+    /// Set just before close() when the ROOT pane's shell died on its own
+    /// (processTerminated) so teardown archives with the honest close_reason.
+    private var teardownCloseReason: SessionCloseReason?
+
+    /// Kills the tab's panes and (only for a user gesture) ARCHIVES its
+    /// journal rows + scrollback bytes into the timeline (founder-amended
+    /// FR-56: closing files a memory instead of burning it — the tab still
+    /// never restores). Every close path funnels here with explicit intent —
+    /// quit is "put it down", close is "archive it", crash runs nothing at
+    /// all; the EXPLICIT Forget gestures remain true deletion elsewhere.
     func teardown(userInitiated: Bool) {
         activityRefreshWork?.cancel()
         activityRefreshWork = nil
-        let paneIds = allPanes().map { $0.paneId }
-        for pane in allPanes() {
+        let panes = allPanes()
+        for pane in panes {
             pane.processDelegate = nil
             app.claudeClaims.release(paneId: pane.paneId)
             (pane as? SerialPaneView)?.shutdown()
@@ -163,10 +169,12 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         }
         app.controllerClosed(self)
         if userInitiated {
-            // Immediate row purge + scrollback file delete: the closed tab
-            // must never restore, even if the app dies before the next
-            // debounced topology save runs.
-            app.memory?.forgetTab(tabId: tabId, paneIds: paneIds)
+            // Immediate archive (row + file moves) and live-row cleanup: the
+            // closed tab must never restore, even if the app dies before the
+            // next debounced topology save runs — and its bytes must already
+            // be safe in the archive.
+            app.memory?.archiveTab(tabId: tabId, panes: panes,
+                                   reason: teardownCloseReason ?? .userClose)
         }
         app.memory?.scheduleTopologySave()
         // FR-59 corollary: never leave the app windowless while other
@@ -810,7 +818,7 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         close(pane: pane)
     }
 
-    func close(pane: PaneView) {
+    func close(pane: PaneView, reason: SessionCloseReason = .userClose) {
         pane.processDelegate = nil
         app.claudeClaims.release(paneId: pane.paneId)
         (pane as? SerialPaneView)?.shutdown()  // serial fd, no process to kill
@@ -819,18 +827,22 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         guard let split = pane.superview as? NSSplitView else {
             // Root (only) pane: close the tab (FR-56 discrimination is the
             // explicit userInitiated parameter now; the inference matches the
-            // old windowWillClose exactly).
+            // old windowWillClose exactly). The reason rides along so a shell
+            // exiting archives as shell-exited, not user-close.
+            teardownCloseReason = reason
             close()
             return
         }
-        // FR-56: a user-initiated pane close forgets that pane NOW — journal
-        // rows and scrollback bytes. Quit/park teardown never reaches here
-        // (teardown detaches processDelegate before terminating), but the
-        // flags guard it anyway. FR-59: a pane in a HIDDEN workspace can
-        // only get here via processTerminated (its shell died on its own) —
-        // no user gesture is possible there, so it never forgets.
+        // FR-56 (amended): a user-initiated pane close ARCHIVES that pane NOW
+        // — journal row into sessions, scrollback + .hist moved into the
+        // timeline archive. Quit/park teardown never reaches here (teardown
+        // detaches processDelegate before terminating), but the flags guard
+        // it anyway. FR-59: a pane in a HIDDEN workspace can only get here
+        // via processTerminated (its shell died on its own) — no user
+        // gesture is possible there, so it never archives (its rows keep and
+        // the pane restores, exactly as before this train).
         if inferUserInitiatedClose() {
-            app.memory?.forgetPane(pane.paneId)
+            app.memory?.archivePane(pane, reason: reason)
         }
         split.removeArrangedSubview(pane)
         pane.removeFromSuperview()
@@ -1027,7 +1039,9 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
 
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         guard let pane = source as? PaneView else { return }
-        close(pane: pane)
+        // FR-56 (amended): a shell dying on its own archives too — the
+        // close_reason column tells it apart from a user gesture.
+        close(pane: pane, reason: .shellExited)
     }
 }
 
