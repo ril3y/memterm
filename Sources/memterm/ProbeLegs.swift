@@ -1,5 +1,7 @@
 import AppKit
+import MemtermClaudeBrowser
 import MemtermCore
+import MemtermExtensionKit
 import SwiftTerm
 
 // MEMTERM_UI_PROBE harness v2 (TESTING.md §2). Every leg from the asyncAfter
@@ -181,6 +183,70 @@ extension MemtermAppDelegate {
                     guard journalTabs == liveTabs, liveTabs == host.tabStrip.probeTabIds().count else {
                         throw ProbeFailure("presented tabs disagree with the journal on an untouched launch")
                     }
+                }))
+            // Stage 3: READ-ONLY check of the claude scanner against the
+            // REAL ~/.claude (founder rule: reading is allowed for real-data
+            // verification; nothing may be modified). Runs in the observe
+            // quarantine — the run that creates and forces nothing.
+            probe.add(ProbeStep(
+                name: "observe-claude-real",
+                assert: { [self] in
+                    let projectsDir = Adapters.defaultClaudeProjectsDir
+                    guard FileManager.default.fileExists(atPath: projectsDir.path) else {
+                        probe.skipLine(step: "observe-claude-real",
+                                       reason: "no ~/.claude/projects on this machine")
+                        return
+                    }
+                    // List through the KIT surface (the browser's own path).
+                    guard let host = extensionRuntime?.host else {
+                        throw ProbeFailure("no extension host runtime")
+                    }
+                    let projects = host.claude.projects()
+                    guard !projects.isEmpty else {
+                        throw ProbeFailure("real ~/.claude/projects listed zero projects")
+                    }
+                    let totalSessions = projects.reduce(0) { $0 + $1.sessionCount }
+                    guard totalSessions > 0 else {
+                        throw ProbeFailure("real ~/.claude holds no sessions")
+                    }
+                    // mtime half: proved on the LEAST recently active project
+                    // — a live foreign claude (this very agent, likely) is
+                    // writing the newest project's jsonl right now, so its
+                    // mtimes move without us; the oldest project's cannot.
+                    func mtimes(under dir: URL) -> [String: Date] {
+                        var map: [String: Date] = [:]
+                        let attrs = try? FileManager.default.attributesOfItem(atPath: dir.path)
+                        map[dir.path] = attrs?[.modificationDate] as? Date
+                        let files = (try? FileManager.default.contentsOfDirectory(
+                            at: dir, includingPropertiesForKeys: nil)) ?? []
+                        for file in files {
+                            let a = try? FileManager.default.attributesOfItem(atPath: file.path)
+                            map[file.path] = a?[.modificationDate] as? Date
+                        }
+                        return map
+                    }
+                    guard let coldest = projects.last(where: { $0.sessionCount > 0 }) else {
+                        throw ProbeFailure("no project with sessions to scan")
+                    }
+                    let coldDir = projectsDir.appendingPathComponent(coldest.slug)
+                    let before = mtimes(under: coldDir)
+                    // Full-detail scans: the coldest project (mtime-gated)
+                    // AND the newest (real live-session coverage; not gated).
+                    let coldSessions = host.claude.sessions(coldest)
+                    let hotSessions = host.claude.sessions(projects[0])
+                    for session in coldSessions + hotSessions {
+                        guard Adapters.isValidClaudeSessionId(session.id.raw) else {
+                            throw ProbeFailure("scan surfaced an invalid session id \(session.id.raw)")
+                        }
+                    }
+                    guard !coldSessions.isEmpty else {
+                        throw ProbeFailure("coldest project scan returned no sessions despite count \(coldest.sessionCount)")
+                    }
+                    let after = mtimes(under: coldDir)
+                    guard before == after else {
+                        throw ProbeFailure("mtimes changed under \(coldDir.lastPathComponent) — a read-only scan wrote something")
+                    }
+                    print("UIPROBE-OBSERVE-CLAUDE projects=\(projects.count) total_sessions=\(totalSessions) cold_scanned=\(coldSessions.count) hot_scanned=\(hotSessions.count) mtimes_unchanged=true")
                 }))
             return  // observe registers no gesture steps, by construction
         }
@@ -869,6 +935,7 @@ extension MemtermAppDelegate {
         addSerialSteps(probe)
         addWorkspaceCloseSteps(probe, probeWorkspaceId: { probeWorkspaceId })
         addTabGestureSteps(probe)
+        addClaudeBrowserSteps(probe)
 
         // Composited pixel pass (visible runs only): the window-server truth
         // cacheDisplay cannot see (§2.3's documented caveat).
@@ -2747,6 +2814,222 @@ extension MemtermAppDelegate {
             onFailure: {
                 let pane = restoredSerialController?.allPanes().first as? SerialPaneView
                 print("UIPROBE-SERIAL reconnect_absent=false still_closed=\(pane?.isConnected == false)")
+            }))
+    }
+
+    // MARK: - Claude browser extension legs (stage 3: the first kit consumer)
+    //
+    // Fixture ~/.claude world via the MEMTERM_CLAUDE_DIR core seam (under the
+    // isolated MEMTERM_STATE_DIR — the founder's real ~/.claude is never
+    // involved in these legs; the read-only real-data check lives in observe
+    // mode as observe-claude-real). Every mutation+assertion pair runs inside
+    // ONE synchronous assert block: MemoryEngine's 2 s poll re-derives
+    // pane.lastClaudeSessionId from kernel truth and must never interleave
+    // with a staged fixture value.
+
+    private func addClaudeBrowserSteps(_ probe: ProbeRunner) {
+        let attnId = "aaaa1111-attn-probe"   // live (our pid), jsonl quiet 120 s → needs input
+        let workId = "bbbb2222-work-probe"   // live (pid 1), jsonl fresh → working
+        let doneId = "cccc3333-done-probe"   // no registry entry → done
+        let fixtureRoot = MemoryEngine.baseDir
+            .appendingPathComponent("claude-probe-fixture", isDirectory: true)
+
+        func browserBits() throws -> (ExtensionHostRuntime, ClaudeBrowserExtension) {
+            guard let runtime = extensionRuntime,
+                  let ext = runtime.compiledInExtension(
+                      id: ClaudeBrowserExtension.extensionId) as? ClaudeBrowserExtension
+            else { throw ProbeFailure("claude-browser extension not compiled in") }
+            return (runtime, ext)
+        }
+
+        probe.addStateful(ProbeStep(
+            name: "claude-fixtures",
+            assert: {
+                let fm = FileManager.default
+                let projDirA = fixtureRoot.appendingPathComponent("projects/-tmp-probeA")
+                let projDirB = fixtureRoot.appendingPathComponent("projects/-tmp-probeB")
+                let sessionsDir = fixtureRoot.appendingPathComponent("sessions")
+                for dir in [projDirA, projDirB, sessionsDir] {
+                    try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                }
+                func writeJsonl(_ dir: URL, id: String, cwd: String, prompt: String,
+                                mtime: Date?) throws {
+                    let url = dir.appendingPathComponent("\(id).jsonl")
+                    let lines = "{\"type\":\"system\",\"cwd\":\"\(cwd)\",\"version\":\"9.9.9\"}\n"
+                        + "{\"type\":\"last-prompt\",\"lastPrompt\":\"\(prompt)\"}"
+                    try lines.write(to: url, atomically: true, encoding: .utf8)
+                    if let mtime {
+                        try fm.setAttributes([.modificationDate: mtime], ofItemAtPath: url.path)
+                    }
+                }
+                try writeJsonl(projDirA, id: attnId, cwd: "/tmp/probeA",
+                               prompt: "probe: needs input",
+                               mtime: Date(timeIntervalSinceNow: -120))
+                try writeJsonl(projDirA, id: workId, cwd: "/tmp/probeA",
+                               prompt: "probe: working", mtime: nil)
+                try writeJsonl(projDirB, id: doneId, cwd: "/tmp/probeB",
+                               prompt: "probe: finished",
+                               mtime: Date(timeIntervalSinceNow: -60))
+                func writeRegistry(pid: Int32, sessionId: String) throws {
+                    let record = "{\"pid\":\(pid),\"sessionId\":\"\(sessionId)\",\"cwd\":\"/tmp/probeA\",\"version\":\"9.9.9\"}"
+                    try record.write(to: sessionsDir.appendingPathComponent("\(pid).json"),
+                                     atomically: true, encoding: .utf8)
+                }
+                try writeRegistry(pid: ProcessInfo.processInfo.processIdentifier,
+                                  sessionId: attnId)
+                try writeRegistry(pid: 1, sessionId: workId)  // launchd: always alive
+                setenv("MEMTERM_CLAUDE_DIR", fixtureRoot.path, 1)
+                let scans = Adapters.claudeProjectScans()
+                guard scans.map(\.slug) == ["-tmp-probeA", "-tmp-probeB"] else {
+                    throw ProbeFailure("fixture scan mismatch: \(scans.map(\.slug))")
+                }
+                print("UIPROBE-CLAUDEFIXTURE root=\(fixtureRoot.path) projects=\(scans.count)")
+            }))
+
+        // Panel opens (⌘⇧C's Window-menu item exists), lists the fixture
+        // sessions grouped by REAL cwd, newest first; search narrows; the
+        // empty state names the looked-in path; the content renders pixels.
+        probe.addStateful(ProbeStep(
+            name: "claude-browser-panel", timeout: 10,
+            assert: {
+                let (runtime, ext) = try browserBits()
+                guard let menuItem = NSApp.windowsMenu?.items
+                    .first(where: { $0.title == "Claude Sessions" }),
+                      menuItem.keyEquivalent == "c",
+                      menuItem.keyEquivalentModifierMask == [.command, .shift] else {
+                    throw ProbeFailure("Claude Sessions (⌘⇧C) missing from the Window menu")
+                }
+                runtime.showPanel(id: ClaudeBrowserExtension.panelId)
+                guard let window = runtime.panelWindow(id: ClaudeBrowserExtension.panelId),
+                      window.isVisible, let panel = ext.probePanel else {
+                    throw ProbeFailure("claude sessions panel did not open")
+                }
+                ext.refreshNow()
+                window.layoutIfNeeded()
+                let rows = panel.probeVisibleRows()
+                let expected = ["project:/tmp/probeA",
+                                "session:\(workId)", "session:\(attnId)",
+                                "project:/tmp/probeB", "session:\(doneId)"]
+                guard rows == expected else {
+                    throw ProbeFailure("panel rows mismatch: \(rows) expected \(expected)")
+                }
+                panel.probeSetSearch("probeB")
+                guard panel.probeVisibleRows() ==
+                    ["project:/tmp/probeB", "session:\(doneId)"] else {
+                    throw ProbeFailure("search 'probeB' did not narrow to project B: \(panel.probeVisibleRows())")
+                }
+                panel.probeSetSearch("zzz-no-such-session")
+                let empty = panel.probeEmptyState()
+                guard empty.visible, empty.path.contains("claude-probe-fixture") else {
+                    throw ProbeFailure("empty state absent or missing the looked-in path: \(empty)")
+                }
+                panel.probeSetSearch("")
+                guard panel.probeVisibleRows() == expected,
+                      panel.probeEmptyState().visible == false else {
+                    throw ProbeFailure("clearing the search did not restore the full list")
+                }
+                // Rendered half (§2.3): the panel content actually paints.
+                guard let bmp = probeBitmap(panel.view) else {
+                    throw ProbeFailure("panel view yielded no bitmap")
+                }
+                try assertRendered(bmp, region: panel.view.bounds, what: "claude panel")
+                probeCompositedShot(window, name: "claude-browser-panel")
+                print("UIPROBE-CLAUDEPANEL rows=\(rows.count) search_ok=true empty_state_ok=true rendered_ok=true")
+            }))
+
+        // Resume flow: openTab + stageResume — the consent-gated offer line
+        // appears feed()-only in the NEW tab with the exact --resume id;
+        // FR-36 claims dedupe downgrades a second stage of the same UUID to
+        // an honest `claude --continue`; an invalid id can never stage.
+        probe.addStateful(ProbeStep(
+            name: "claude-browser-resume", timeout: 10,
+            assert: { [self] in
+                let (runtime, ext) = try browserBits()
+                guard let panel = ext.probePanel else {
+                    throw ProbeFailure("panel not built (resume leg)")
+                }
+                let before = Set(controllers.map(\.tabId))
+                guard panel.probeSelectSession(id: doneId) else {
+                    throw ProbeFailure("could not select fixture session \(doneId)")
+                }
+                guard panel.probeResumeSelected() else {
+                    throw ProbeFailure("resume action failed to stage")
+                }
+                guard let fresh = controllers.first(where: { !before.contains($0.tabId) }),
+                      let pane = fresh.currentPane() else {
+                    throw ProbeFailure("resume did not open a new tab with a pane")
+                }
+                let expectedCommand = "claude --resume \(doneId)"
+                guard pane.pendingResumeCommand == expectedCommand else {
+                    throw ProbeFailure("pendingResumeCommand=\(pane.pendingResumeCommand ?? "nil") expected \(expectedCommand)")
+                }
+                // feed()-only: the offer line is IN the buffer, the command
+                // armed behind ⌘R (FR-29) — the pty received nothing.
+                let text = pane.scrollbackText(maxLines: 200)
+                guard text.contains("press ⌘R to type: \(expectedCommand)") else {
+                    throw ProbeFailure("consent-gated offer line missing from the new tab's buffer")
+                }
+                // FR-36: the UUID is claimed by the fresh pane now — staging
+                // it again on another tab downgrades honestly.
+                guard let other = controllers.first(where: { c in
+                    c.tabId != fresh.tabId && c.currentPane() != nil
+                        && !(c.currentPane() is SerialPaneView)
+                }), let otherPane = other.currentPane() else {
+                    throw ProbeFailure("no second tab for the claims-dedupe half")
+                }
+                let savedPending = otherPane.pendingResumeCommand
+                guard runtime.host.workspace.stageResume(
+                    ClaudeSessionID(raw: doneId), TabRef(tabId: other.tabId)) else {
+                    throw ProbeFailure("second stageResume refused instead of downgrading")
+                }
+                guard otherPane.pendingResumeCommand == "claude --continue" else {
+                    throw ProbeFailure("claims dedupe did not downgrade to --continue: \(otherPane.pendingResumeCommand ?? "nil")")
+                }
+                // Validity/denylist gate intact: garbage can never stage.
+                guard !runtime.host.workspace.stageResume(
+                    ClaudeSessionID(raw: "bad;$(rm -rf ~)"), TabRef(tabId: other.tabId)) else {
+                    throw ProbeFailure("stageResume accepted an invalid session id")
+                }
+                otherPane.pendingResumeCommand = savedPending
+                print("UIPROBE-CLAUDERESUME new_tab=\(fresh.tabId.prefix(8)) offer_feed_only=true resume_id_ok=true dedupe_downgrade=true invalid_refused=true")
+            }))
+
+        // Badges: working / needs-input / done from the core-side parser,
+        // through the kit's tabSessions + setBadge into the EXISTING
+        // activity-indicator slot (spinner / unseen dot / clear).
+        probe.addStateful(ProbeStep(
+            name: "claude-browser-badges", timeout: 10,
+            assert: { [self] in
+                let (_, ext) = try browserBits()
+                guard let controller = controllers.first(where: { c in
+                    c.currentPane() != nil && !(c.currentPane() is SerialPaneView)
+                }), let pane = controller.currentPane() else {
+                    throw ProbeFailure("no shell pane for the badge leg")
+                }
+                let savedCwd = pane.lastKnownCwd
+                defer {
+                    pane.lastClaudeSessionId = nil
+                    pane.lastKnownCwd = savedCwd
+                    ext.refreshNow()
+                }
+                pane.lastKnownCwd = "/tmp/probeA"  // slug-joins to -tmp-probeA
+                pane.lastClaudeSessionId = attnId
+                ext.refreshNow()
+                let attn = controller.extensionBadgeForProbe()
+                pane.lastClaudeSessionId = workId
+                ext.refreshNow()
+                let work = controller.extensionBadgeForProbe()
+                pane.lastKnownCwd = "/tmp/probeB"
+                pane.lastClaudeSessionId = doneId
+                ext.refreshNow()
+                let done = controller.extensionBadgeForProbe()
+                pane.lastClaudeSessionId = nil
+                ext.refreshNow()
+                let cleared = controller.extensionBadgeForProbe()
+                print("UIPROBE-CLAUDEBADGE attn=\(attn) work=\(work) done=\(done) cleared=\(cleared)")
+                guard attn == .unseen, work == .active, done == .idle, cleared == .idle else {
+                    throw ProbeFailure("badge states wrong: attn=\(attn) work=\(work) done=\(done) cleared=\(cleared) (want unseen/active/idle/idle)")
+                }
             }))
     }
 

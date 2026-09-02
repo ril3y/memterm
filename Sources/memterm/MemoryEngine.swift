@@ -201,6 +201,7 @@ final class MemoryEngine {
               let argv = ProcessInspector.argv(of: pid), !argv.isEmpty,
               ProcessInspector.startTime(of: pid) == procStart else {
             store.clearSnapshot(pane.paneId)
+            pane.lastClaudeSessionId = nil
             return
         }
         let exe = argv[0]
@@ -208,10 +209,15 @@ final class MemoryEngine {
             store.upsertSnapshot(pane.paneId, exe: exe, argv: argv, pid: pid,
                                  procStart: procStart,
                                  adapter: hit.adapter, adapterState: hit.state)
+            // Stage 3 (claude-browser badges): keep the pane's live claude
+            // binding current for ExtensionHostRuntime.claudeTabSessions().
+            pane.lastClaudeSessionId = hit.adapter == ClaudeAdapter.name
+                ? hit.state["sessionId"] : nil
         } else {
             store.upsertSnapshot(pane.paneId, exe: exe, argv: argv, pid: pid,
                                  procStart: procStart,
                                  adapter: "", adapterState: [:])
+            pane.lastClaudeSessionId = nil
         }
     }
 

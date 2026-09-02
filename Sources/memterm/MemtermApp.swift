@@ -173,6 +173,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         let runtime = ExtensionHostRuntime(app: self)
         extensionRuntime = runtime
         runtime.activateCompiledIn()
+        // Registered extension panels join the Window menu (⌘⇧C for the
+        // Claude Sessions browser — verified unclaimed in MainMenu).
+        if let windowMenu = NSApp.windowsMenu {
+            runtime.installPanelMenuItems(into: windowMenu)
+        }
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(workspaceWillPowerOff(_:)),

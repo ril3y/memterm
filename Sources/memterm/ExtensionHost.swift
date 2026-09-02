@@ -1,5 +1,6 @@
 import AppKit
 import CoreServices
+import MemtermClaudeBrowser
 import MemtermCore
 import MemtermExtensionKit
 
@@ -27,10 +28,16 @@ final class ExtensionHostRuntime: NSObject {
     private unowned let app: MemtermAppDelegate
     private(set) var host: MemtermHost!
 
-    /// Compiled-in extensions (decision doc: instantiated at launch, behind a
-    /// config flag once the first real extension target lands). EMPTY in kit
-    /// v0 — MemtermClaudeBrowser and MemtermTimeline are the next stages.
-    private var activeExtensions: [any MemtermExtension] = []
+    /// Compiled-in extensions (decision doc: instantiated at launch). Stage
+    /// 3: the Claude Sessions browser is the first real entry; MemtermTimeline
+    /// follows with the archive train.
+    private var activeExtensions: [any MemtermExtension] = [ClaudeBrowserExtension()]
+
+    /// Probe seam: the compiled-in instance for an id (probes drive the
+    /// browser's refresh synchronously instead of racing FSEvents).
+    func compiledInExtension(id: String) -> (any MemtermExtension)? {
+        activeExtensions.first { type(of: $0).extensionId == id }
+    }
 
     // -- UI registries (launch-time; see kit docs) --
     struct PanelRegistration {
@@ -73,6 +80,14 @@ final class ExtensionHostRuntime: NSObject {
                 projects: { Self.mapProjects(Adapters.claudeProjectScans()) },
                 sessions: { project in
                     Self.mapSessions(Adapters.claudeSessionScans(projectSlug: project.slug))
+                },
+                tabSessions: { [weak self] in self?.claudeTabSessions() ?? [] },
+                revealSession: { [weak self] id, slug in
+                    self?.revealClaudeSession(id, projectSlug: slug)
+                },
+                rootDisplayPath: {
+                    (Adapters.defaultClaudeProjectsDir.path as NSString)
+                        .abbreviatingWithTildeInPath
                 }),
             workspace: WorkspaceHost(
                 openTab: { [weak self] cwd, workspaceId in
@@ -133,6 +148,42 @@ final class ExtensionHostRuntime: NSObject {
                               cwd: $0.cwd,
                               claudeVersion: $0.claudeVersion)
         }
+    }
+
+    // MARK: - Claude tab bindings + reveal (stage 3)
+
+    /// Tabs whose panes' foreground process classified as claude with a
+    /// resolved session id (MemoryEngine.pollPane keeps the per-pane result
+    /// current). The slug comes from the pane's kernel-truth cwd via the ONE
+    /// slug-encoding site — cwd → slug, never inverted.
+    private func claudeTabSessions() -> [ClaudeTabSession] {
+        var bindings: [ClaudeTabSession] = []
+        for controller in app.controllers {
+            for pane in controller.allPanes() {
+                guard let sessionId = pane.lastClaudeSessionId,
+                      Adapters.isValidClaudeSessionId(sessionId) else { continue }
+                bindings.append(ClaudeTabSession(
+                    tab: TabRef(tabId: controller.tabId),
+                    id: ClaudeSessionID(raw: sessionId),
+                    projectSlug: pane.lastKnownCwd.map(Adapters.claudeProjectSlug(forCwd:))))
+            }
+        }
+        return bindings
+    }
+
+    /// Finder reveal of a session jsonl. The APP resolves the path (the
+    /// extension never holds one); the id is re-validated and the slug must
+    /// be a plain directory name — no traversal ever reaches the join.
+    private func revealClaudeSession(_ id: ClaudeSessionID, projectSlug: String) {
+        guard Adapters.isValidClaudeSessionId(id.raw),
+              !projectSlug.isEmpty,
+              !projectSlug.contains("/"), projectSlug != "..", projectSlug != "."
+        else { return }
+        let url = Adapters.defaultClaudeProjectsDir
+            .appendingPathComponent(projectSlug, isDirectory: true)
+            .appendingPathComponent("\(id.raw).jsonl")
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     // MARK: - Workspace actions
@@ -202,26 +253,92 @@ final class ExtensionHostRuntime: NSObject {
 
     /// Shows (creating lazily) a registered extension panel: titled,
     /// closable, resizable, frame-remembered per panel id, never floating.
+    /// Quiet automated runs (TESTING.md §2.5) position it offscreen like
+    /// every other probe window instead of centering on screen.
     func showPanel(id: String) {
         if let window = panelWindows[id] {
             window.makeKeyAndOrderFront(nil)
             return
         }
         guard let registration = panels[id] else { return }
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 520),
-                            styleMask: [.titled, .closable, .resizable],
-                            backing: .buffered, defer: false)
+        let rect = NSRect(x: 0, y: 0, width: 460, height: 540)
+        let style: NSWindow.StyleMask = [.titled, .closable, .resizable]
+        let panel = ProbeSupport.quiet
+            ? QuietExtensionPanel(contentRect: rect, styleMask: style,
+                                  backing: .buffered, defer: false)
+            : NSPanel(contentRect: rect, styleMask: style,
+                      backing: .buffered, defer: false)
         panel.title = registration.title
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = false
         panel.contentViewController = registration.make()
-        panel.setFrameAutosaveName("memterm-ext-panel-\(id)")
         panelWindows[id] = panel
-        panel.center()
+        if ProbeSupport.quiet {
+            panel.setFrameOrigin(NSPoint(x: -4000 - panel.frame.width, y: -4000))
+        } else {
+            // Frame memory is for real use only — automated runs (visible
+            // pass included) must not write probe frames into the user's
+            // defaults.
+            if !ProbeSupport.isUIProbe && !ProbeSupport.isSmoke {
+                panel.setFrameAutosaveName("memterm-ext-panel-\(id)")
+            }
+            panel.center()
+        }
         panel.makeKeyAndOrderFront(nil)
     }
 
     var registeredPanelIds: [String] { Array(panels.keys) }
+
+    func panelWindow(id: String) -> NSPanel? { panelWindows[id] }
+
+    // MARK: - Panel menu (registered panels join the Window menu, shortcuts
+    // parsed from the kit's "cmd+shift+c" advisory form)
+
+    /// Appends one Window-menu item per registered panel. Called once, after
+    /// activateCompiledIn() — registration is launch-time (kit contract).
+    func installPanelMenuItems(into menu: NSMenu) {
+        guard !panels.isEmpty else { return }
+        menu.addItem(.separator())
+        for id in panels.keys.sorted() {
+            guard let registration = panels[id] else { continue }
+            let item = NSMenuItem(title: registration.title,
+                                  action: #selector(showPanelMenuItem(_:)),
+                                  keyEquivalent: "")
+            if let (key, modifiers) = Self.parseShortcut(registration.shortcut) {
+                item.keyEquivalent = key
+                item.keyEquivalentModifierMask = modifiers
+            }
+            item.target = self
+            item.representedObject = id
+            menu.addItem(item)
+        }
+    }
+
+    /// "cmd+shift+c" → ("c", [.command, .shift]). Unknown tokens void the
+    /// shortcut (menu item stays, unkeyed) — advisory means never crashing.
+    static func parseShortcut(_ shortcut: String?) -> (String, NSEvent.ModifierFlags)? {
+        guard let shortcut, !shortcut.isEmpty else { return nil }
+        var modifiers: NSEvent.ModifierFlags = []
+        var key: String?
+        for token in shortcut.lowercased().split(separator: "+").map(String.init) {
+            switch token {
+            case "cmd", "command": modifiers.insert(.command)
+            case "shift": modifiers.insert(.shift)
+            case "opt", "option", "alt": modifiers.insert(.option)
+            case "ctrl", "control": modifiers.insert(.control)
+            default:
+                guard token.count == 1, key == nil else { return nil }
+                key = token
+            }
+        }
+        guard let key, !modifiers.isEmpty else { return nil }
+        return (key, modifiers)
+    }
+
+    @objc private func showPanelMenuItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        showPanel(id: id)
+    }
 
     /// Appends registered extension items to a tab context menu (the strip's
     /// makeTabContextMenu calls this; empty registry appends nothing).
@@ -283,6 +400,14 @@ extension ExtensionHostRuntime: NSMenuItemValidation {
         guard item.action == #selector(runTabMenuItem(_:)),
               tabMenuItems.indices.contains(item.tag) else { return true }
         return tabMenuItems[item.tag].isEnabled()
+    }
+}
+
+/// Quiet-run twin of ProbeQuietWindow for extension panels: AppKit's frame
+/// constraining would drag the offscreen panel back onto a screen.
+final class QuietExtensionPanel: NSPanel {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
     }
 }
 

@@ -234,8 +234,22 @@ public enum Adapters {
 
     public static let watcherNames: Set<String> = ["tail", "less", "more", "man", "htop", "top", "watch"]
 
+    /// Test seam (stage 3): MEMTERM_CLAUDE_DIR points the ONE ~/.claude
+    /// parsing site at a fixture tree (<dir>/projects, <dir>/sessions) so
+    /// probes exercise the kit's claude.* surface hermetically. Read per
+    /// call — a probe leg may set it mid-process — and never set outside
+    /// automated runs; the real app resolves ~/.claude as ever.
+    public static var claudeDirOverride: URL? {
+        guard let dir = ProcessInfo.processInfo.environment["MEMTERM_CLAUDE_DIR"],
+              !dir.isEmpty else { return nil }
+        return URL(fileURLWithPath: dir, isDirectory: true)
+    }
+
     public static var defaultClaudeProjectsDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let override = claudeDirOverride {
+            return override.appendingPathComponent("projects")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/projects")
     }
 
@@ -384,7 +398,10 @@ public enum Adapters {
     }
 
     public static var defaultClaudeSessionsDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let override = claudeDirOverride {
+            return override.appendingPathComponent("sessions")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/sessions")
     }
 

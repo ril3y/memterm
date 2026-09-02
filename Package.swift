@@ -34,13 +34,22 @@ let package = Package(
             name: "MemtermExtensionKit",
             path: "Sources/MemtermExtensionKit"
         ),
+        // First kit consumer (stage 3): the Claude Sessions browser. Its
+        // dependency list — the kit and NOTHING else — IS the import
+        // firewall; scripts/check-extension-firewall.sh asserts it stays so.
+        .target(
+            name: "MemtermClaudeBrowser",
+            dependencies: ["MemtermExtensionKit"],
+            path: "Sources/MemtermClaudeBrowser"
+        ),
         .executableTarget(
             name: "memterm",
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
                 "CProcShim",
                 "MemtermCore",
-                "MemtermExtensionKit"
+                "MemtermExtensionKit",
+                "MemtermClaudeBrowser"
             ],
             path: "Sources/memterm"
         ),
@@ -63,6 +72,14 @@ let package = Package(
             name: "MemtermExtensionKitTests",
             dependencies: ["MemtermExtensionKit"],
             path: "Tests/MemtermExtensionKitTests"
+        ),
+        // Claude-browser extension tests: pure model logic (grouping,
+        // filtering, badge planning) + the extension's host-call traffic
+        // against a recording mock — headless, no app involved.
+        .testTarget(
+            name: "MemtermClaudeBrowserTests",
+            dependencies: ["MemtermClaudeBrowser", "MemtermExtensionKit"],
+            path: "Tests/MemtermClaudeBrowserTests"
         )
     ]
 )

@@ -224,6 +224,33 @@ final class ClaudeSessionScanTests: XCTestCase {
         XCTAssertEqual(result.lastPrompt, "tail prompt")
     }
 
+    // MARK: - MEMTERM_CLAUDE_DIR test seam (stage 3: probes point the ONE
+    // parsing site at a fixture tree; the kit surface passes through)
+
+    func testClaudeDirOverrideRedirectsBothDefaultDirs() throws {
+        setenv("MEMTERM_CLAUDE_DIR", root.path, 1)
+        defer { unsetenv("MEMTERM_CLAUDE_DIR") }
+        XCTAssertEqual(Adapters.defaultClaudeProjectsDir.path, projectsDir.path)
+        XCTAssertEqual(Adapters.defaultClaudeSessionsDir.path, sessionsDir.path)
+        // The default-argument scan surfaces (what the app's Host wiring
+        // calls) now read the fixture world.
+        try writeSession(slug: "seam-proj", id: "dddd-4444", lines: ["{}"])
+        let scans = Adapters.claudeProjectScans()
+        XCTAssertEqual(scans.map(\.slug), ["seam-proj"])
+        XCTAssertEqual(Adapters.claudeSessionScans(projectSlug: "seam-proj").map(\.id),
+                       ["dddd-4444"])
+    }
+
+    func testClaudeDirOverrideEmptyOrUnsetFallsBackToHome() {
+        unsetenv("MEMTERM_CLAUDE_DIR")
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        XCTAssertTrue(Adapters.defaultClaudeProjectsDir.path.hasPrefix(home))
+        setenv("MEMTERM_CLAUDE_DIR", "", 1)
+        defer { unsetenv("MEMTERM_CLAUDE_DIR") }
+        XCTAssertTrue(Adapters.defaultClaudeSessionsDir.path.hasPrefix(home),
+                      "empty override is no override")
+    }
+
     // MARK: - Read-only smoke against the REAL ~/.claude (founder rule:
     // reading is allowed for real-data verification; NOTHING here writes)
 

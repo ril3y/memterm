@@ -21,6 +21,11 @@ class PaneView: LocalProcessTerminalView {
     var cwdSource = "spawn"
     /// The captured command ⌘R types into the pty (never executed — FR-29).
     var pendingResumeCommand: String?
+    /// Stage 3 (claude-browser badges): the session id of the claude this
+    /// pane's foreground process classified as, kept current by
+    /// MemoryEngine.pollPane (nil whenever the fg process is not claude).
+    /// Read by ExtensionHostRuntime.claudeTabSessions().
+    var lastClaudeSessionId: String?
     /// FR-59 guard rail: how many "── restored ──" dividers were ever fed into
     /// this pane. The resurrect path increments it; a workspace switch must
     /// not (switching is hide/show, never restore) — the smoke gate asserts

@@ -43,6 +43,19 @@ final class HostContractTests: XCTestCase {
                                               lastActivity: Date(), isLive: true,
                                               needsAttention: false, lastPrompt: nil,
                                               cwd: nil, claudeVersion: nil)]
+                },
+                tabSessions: { [unowned self] in
+                    calls.append("claude.tabSessions")
+                    return [ClaudeTabSession(tab: TabRef(tabId: "t1"),
+                                             id: ClaudeSessionID(raw: "u"),
+                                             projectSlug: "s")]
+                },
+                revealSession: { [unowned self] id, slug in
+                    calls.append("claude.revealSession \(id.raw) in=\(slug)")
+                },
+                rootDisplayPath: { [unowned self] in
+                    calls.append("claude.rootDisplayPath")
+                    return "~/.claude/projects"
                 }),
             workspace: WorkspaceHost(
                 openTab: { [unowned self] cwd, ws in
@@ -90,6 +103,9 @@ final class HostContractTests: XCTestCase {
             host.archive.requestForget(SessionID(raw: "arch2"))
             let projects = host.claude.projects()
             _ = host.claude.sessions(projects[0])
+            _ = host.claude.tabSessions()
+            host.claude.revealSession(ClaudeSessionID(raw: "uuid-r"), "s")
+            _ = host.claude.rootDisplayPath()
             let tab = host.workspace.openTab(URL(fileURLWithPath: "/tmp"),
                                              WorkspaceID(raw: "ws1"))!
             _ = host.workspace.reopenGhost(SessionID(raw: "arch3"), nil)
@@ -108,7 +124,7 @@ final class HostContractTests: XCTestCase {
         func deactivate() { deactivated = true }
     }
 
-    func testAllFourteenCallsRouteThroughTheHost() {
+    func testAllSeventeenCallsRouteThroughTheHost() {
         let recorder = Recorder()
         let ext = ProbeExtension()
         ext.activate(host: recorder.host)
@@ -119,6 +135,9 @@ final class HostContractTests: XCTestCase {
             "archive.requestForget arch2",
             "claude.projects",
             "claude.sessions s",
+            "claude.tabSessions",
+            "claude.revealSession uuid-r in=s",
+            "claude.rootDisplayPath",
             "workspace.openTab /tmp ws1",
             "workspace.reopenGhost arch3",
             "workspace.stageResume uuid-1 on=t1",
@@ -127,7 +146,7 @@ final class HostContractTests: XCTestCase {
             "ui.addTabContextMenuItem Probe Item",
             "ui.settingsSection Probe rows=1",
             "events.subscribe claudeSessionsChanged",
-        ], "the 14-call surface, each routed exactly once")
+        ], "the 17-call surface (kit v0.1: +tabSessions/revealSession/rootDisplayPath), each routed exactly once")
         ext.deactivate()
         XCTAssertTrue(ext.deactivated)
     }

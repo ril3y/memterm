@@ -38,7 +38,9 @@ public protocol MemtermExtension: AnyObject {
     func deactivate()
 }
 
-// MARK: - Host (the ~14 calls)
+// MARK: - Host (the ~14-call surface; v0.1 adds claude.tabSessions /
+// revealSession / rootDisplayPath for the browser + badge bet — still zero
+// capability beyond propose-and-display)
 
 /// Everything an extension can ask the app to do. A plain struct of typed
 /// call surfaces the app fills with its own implementations — there is no
@@ -193,17 +195,50 @@ public struct ClaudeSessionInfo: Equatable {
     }
 }
 
+/// A live pane↔session binding: some memterm tab currently hosts a running
+/// claude whose session id core resolved (kit v0.1, the needs-attention-on-
+/// live-tabs bet). The tab handle stays opaque; `projectSlug` (from the
+/// pane's kernel-truth cwd) lets a consumer scope its session lookups.
+public struct ClaudeTabSession: Hashable {
+    public let tab: TabRef
+    public let id: ClaudeSessionID
+    public let projectSlug: String?
+
+    public init(tab: TabRef, id: ClaudeSessionID, projectSlug: String?) {
+        self.tab = tab
+        self.id = id
+        self.projectSlug = projectSlug
+    }
+}
+
 public struct ClaudeHost {
     /// All known projects, most recently active first.
     public let projects: () -> [ClaudeProject]
     /// A project's sessions, most recently active first, with liveness and
     /// needs-attention state resolved core-side.
     public let sessions: (ClaudeProject) -> [ClaudeSessionInfo]
+    /// Tabs currently hosting a classified claude session (kernel-truth
+    /// foreground-process classification, core-side). The badge feed's
+    /// join key.
+    public let tabSessions: () -> [ClaudeTabSession]
+    /// Asks the APP to reveal a session's jsonl in Finder (id + its project
+    /// slug). Core re-validates and resolves the path itself — the extension
+    /// never holds a filesystem path (the ONE-parsing-site rule).
+    public let revealSession: (ClaudeSessionID, _ projectSlug: String) -> Void
+    /// Display-only string of the directory core scans ("~/.claude/projects"
+    /// or the test-seam override) — for empty states. Never parse it.
+    public let rootDisplayPath: () -> String
 
     public init(projects: @escaping () -> [ClaudeProject],
-                sessions: @escaping (ClaudeProject) -> [ClaudeSessionInfo]) {
+                sessions: @escaping (ClaudeProject) -> [ClaudeSessionInfo],
+                tabSessions: @escaping () -> [ClaudeTabSession],
+                revealSession: @escaping (ClaudeSessionID, String) -> Void,
+                rootDisplayPath: @escaping () -> String) {
         self.projects = projects
         self.sessions = sessions
+        self.tabSessions = tabSessions
+        self.revealSession = revealSession
+        self.rootDisplayPath = rootDisplayPath
     }
 }
 
@@ -294,8 +329,9 @@ public struct SettingsSection {
 public struct UIHost {
     /// Registers a managed panel window (created lazily by the app: titled,
     /// closable, frame-remembered; lifecycle, key-window, and theme duties
-    /// are the APP's). `shortcut` is advisory in v0 (unwired). Register
-    /// during activate() — registration is launch-time.
+    /// are the APP's). `shortcut` ("cmd+shift+c" form) is surfaced by the
+    /// app as a Window-menu item — the app may refuse a claimed equivalent.
+    /// Register during activate() — registration is launch-time.
     public let registerPanel: (_ id: String, _ title: String, _ shortcut: String?,
                                _ make: @escaping () -> NSViewController) -> Void
 

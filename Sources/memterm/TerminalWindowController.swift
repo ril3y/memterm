@@ -532,6 +532,10 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         host?.tabChanged(self)
     }
 
+    /// Probe seam: the raw extension badge, un-merged (pty activity would
+    /// mask it in activityStateForProbe on a tab that just produced output).
+    func extensionBadgeForProbe() -> TabActivityState { extensionBadge }
+
     private func scheduleActivityRefresh(after delay: TimeInterval) {
         guard activityRefreshWork == nil else { return }
         let work = DispatchWorkItem { [weak self] in
