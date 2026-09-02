@@ -1,3 +1,3 @@
 window=980x640 tabs=1 focused=0 first_responder=pane dividers=2
-pane0=0,0,490,584
-pane1=491,0,489,584
+pane0=9,9,481,566
+pane1=491,9,480,566

@@ -79,4 +79,121 @@ final class ScrollbackTextTests: XCTestCase {
                        "\(uuid).txt")
         XCTAssertEqual(ScrollbackText.safePaneId(uuid), uuid)
     }
+
+    // MARK: Restore-divider collapse (council #9: no more marker piles)
+
+    private func divider(_ stamp: String, earlier: Int = 0) -> String {
+        ScrollbackText.restoredDividerLine(stamp: stamp, earlierSessions: earlier)
+    }
+
+    func testDividerLineRoundTripsThroughParse() {
+        let plain = divider("Sep 2 10:15 AM")
+        XCTAssertEqual(plain, "── restored — Sep 2 10:15 AM ──")
+        XCTAssertEqual(ScrollbackText.parseRestoredDivider(plain)?.stamp, "Sep 2 10:15 AM")
+        XCTAssertEqual(ScrollbackText.parseRestoredDivider(plain)?.earlierSessions, 0)
+
+        let collapsed = divider("Sep 2 10:15 AM", earlier: 3)
+        XCTAssertEqual(collapsed, "── restored — Sep 2 10:15 AM · 3 earlier sessions ──")
+        let parsed = ScrollbackText.parseRestoredDivider(collapsed)
+        XCTAssertEqual(parsed?.stamp, "Sep 2 10:15 AM")
+        XCTAssertEqual(parsed?.earlierSessions, 3)
+
+        let one = divider("Sep 2 10:15 AM", earlier: 1)
+        XCTAssertEqual(one, "── restored — Sep 2 10:15 AM · 1 earlier session ──")
+        XCTAssertEqual(ScrollbackText.parseRestoredDivider(one)?.earlierSessions, 1)
+    }
+
+    func testParseRejectsNonDividerLines() {
+        for line in ["", "hello", "── reconnected — Sep 2 ──", "restored — x ──",
+                     "── restored —  ──", "memterm: was running claude"] {
+            XCTAssertNil(ScrollbackText.parseRestoredDivider(line), "parsed: \(line)")
+        }
+    }
+
+    func testCollapseLeavesGhostsWithoutPilesUntouched() {
+        let ghost = "content\n\(divider("Sep 1 9:00 AM"))\nmore content"
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers(ghost), ghost)
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers("plain\ntext"), "plain\ntext")
+    }
+
+    func testCollapseStackedDividers() {
+        let ghost = [
+            "session one output",
+            divider("Sep 1 9:00 AM"),
+            divider("Sep 1 9:05 AM"),
+            divider("Sep 2 8:00 AM"),
+            "typed after the pile",
+        ].joined(separator: "\n")
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers(ghost), [
+            "session one output",
+            divider("Sep 2 8:00 AM", earlier: 2),
+            "typed after the pile",
+        ].joined(separator: "\n"))
+    }
+
+    func testCollapseDropsOnlyMemtermNoiseBetweenGenerations() {
+        let ghost = [
+            divider("Sep 1 9:00 AM"),
+            "memterm: was running claude — press ⌘R to type: claude --resume",
+            "",
+            divider("Sep 1 9:05 AM"),
+            "$ real prompt output",   // content breaks the run — preserved
+            divider("Sep 2 8:00 AM"),
+        ].joined(separator: "\n")
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers(ghost), [
+            divider("Sep 1 9:05 AM", earlier: 1),
+            "$ real prompt output",
+            divider("Sep 2 8:00 AM"),
+        ].joined(separator: "\n"))
+    }
+
+    func testCollapseKeepsNoiseThatIsFollowedByContent() {
+        let ghost = [
+            divider("Sep 1 9:00 AM"),
+            divider("Sep 1 9:05 AM"),
+            "memterm: was running claude — press ⌘R",
+            "$ ls",
+        ].joined(separator: "\n")
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers(ghost), [
+            divider("Sep 1 9:05 AM", earlier: 1),
+            "memterm: was running claude — press ⌘R",
+            "$ ls",
+        ].joined(separator: "\n"))
+    }
+
+    func testCollapseAccumulatesAlreadyCollapsedGenerations() {
+        // The pile never regrows: a collapsed line merging with newer
+        // dividers carries its count forward.
+        let ghost = [
+            divider("Sep 1 9:05 AM", earlier: 3),
+            divider("Sep 2 8:00 AM"),
+            divider("Sep 2 8:10 AM"),
+        ].joined(separator: "\n")
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers(ghost),
+                       divider("Sep 2 8:10 AM", earlier: 5))
+    }
+
+    func testCollapseIsIdempotent() {
+        let ghost = [
+            "output",
+            divider("Sep 1 9:00 AM"),
+            divider("Sep 2 8:00 AM"),
+            "tail",
+        ].joined(separator: "\n")
+        let once = ScrollbackText.collapseRestoredDividers(ghost)
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers(once), once)
+    }
+
+    func testCollapseTrailingPileAtGhostEnd() {
+        let ghost = [
+            "last real output",
+            divider("Sep 1 9:00 AM"),
+            "",
+            divider("Sep 2 8:00 AM"),
+        ].joined(separator: "\n")
+        XCTAssertEqual(ScrollbackText.collapseRestoredDividers(ghost), [
+            "last real output",
+            divider("Sep 2 8:00 AM", earlier: 1),
+        ].joined(separator: "\n"))
+    }
 }

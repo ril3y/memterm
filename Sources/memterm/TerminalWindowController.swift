@@ -84,19 +84,27 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         // select).
         paneRoot.frame = NSRect(x: 0, y: 0, width: 980, height: 584)
         paneRoot.autoresizesSubviews = true
+        // Council #3: terminal content (live + ghost) gets breathing room
+        // from the window edges — the whole tree sits inset inside paneRoot
+        // (autoresizing keeps the margins fixed through resizes), the margin
+        // shows the window's theme background, and split dividers inside the
+        // tree stay flush and correct.
+        let contentFrame = paneRoot.bounds.insetBy(dx: SplitLayout.contentInset,
+                                                   dy: SplitLayout.contentInset)
         let root: NSView
         if let restoredTab {
-            root = buildNode(restoredTab.tree, frame: paneRoot.bounds,
+            root = buildNode(restoredTab.tree, frame: contentFrame,
                              panes: restoredTab.panes)
         } else if let initialSerial {
-            root = makeSerialPane(frame: paneRoot.bounds, setup: initialSerial,
+            root = makeSerialPane(frame: contentFrame, setup: initialSerial,
                                   connectNow: true)
         } else {
             // A vanished inherited cwd falls back like a restore would —
             // never a broken pane (FR-25 spirit).
             let cwd = initialCwd.map { CwdFallback.resolve($0).path }
-            root = makePane(frame: paneRoot.bounds, cwd: cwd)
+            root = makePane(frame: contentFrame, cwd: cwd)
         }
+        root.frame = contentFrame
         root.autoresizingMask = [.width, .height]
         paneRoot.addSubview(root)
         if let restoredTab, !restoredTab.title.isEmpty {
@@ -559,13 +567,18 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
 
     /// Ghost scrollback + restored divider, shared by shell and serial
     /// restores. feed() only — nothing here ever reaches a pty or a device.
+    /// Council #9: stacked divider generations inside the ghost (relaunch
+    /// piles) are collapsed to one honest line before feeding — the pure
+    /// logic (and its searchability contract) lives in ScrollbackText.
     private func feedRestoredPreamble(into pane: PaneView, paneId: String) {
         if let ghost = app.memory?.loadScrollback(for: paneId), !ghost.isEmpty {
-            let crlf = ScrollbackText.ghostFeedText(ghost)
+            let collapsed = ScrollbackText.collapseRestoredDividers(ghost)
+            let crlf = ScrollbackText.ghostFeedText(collapsed)
             pane.feed(text: "\u{1b}[2m" + crlf + "\u{1b}[0m\r\n")
         }
         let stamp = Self.restoreDateFormatter.string(from: Date())
-        pane.feed(text: "\u{1b}[36m── restored — \(stamp) ──\u{1b}[0m\r\n")
+        let divider = ScrollbackText.restoredDividerLine(stamp: stamp)
+        pane.feed(text: "\u{1b}[36m\(divider)\u{1b}[0m\r\n")
         pane.restoredDividerCount += 1
     }
 

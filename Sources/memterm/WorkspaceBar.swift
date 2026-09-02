@@ -302,15 +302,21 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     @objc private func closeTapped(_ sender: Any?) {
         let id = workspaceId
         if isParked {
-            // Forget deletes memory — one confirmation, then gone.
+            // Forget deletes memory — one confirmation, then gone. A window
+            // sheet with destructive styling (council #1), never a screen-
+            // centered runModal.
+            guard let window else { return }
             let alert = NSAlert()
             alert.messageText = "Forget “\(name)”?"
             alert.informativeText = "Deletes this workspace's memory — layouts, scrollback, session records."
-            alert.addButton(withTitle: "Forget")
+            let forget = alert.addButton(withTitle: "Forget")
+            forget.hasDestructiveAction = true
             alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-            DispatchQueue.main.async { [weak app = self.app] in
-                app?.forgetWorkspace(id)
+            alert.beginSheetModal(for: window) { [weak app = self.app] response in
+                guard response == .alertFirstButtonReturn else { return }
+                DispatchQueue.main.async { [weak app] in
+                    app?.forgetWorkspace(id)
+                }
             }
         } else {
             // Park = close but keep memory (FR-51); reversible from the chip.
@@ -353,9 +359,14 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
                              .font: NSFont.systemFont(ofSize: 9)]))
         }
         label.attributedStringValue = title
-        layer?.backgroundColor = isActive
-            ? NSColor.labelColor.withAlphaComponent(0.12).cgColor
-            : NSColor.clear.cgColor
+        // Resolve the dynamic pill color against THIS window's appearance —
+        // the chrome follows the theme (council #2), which may disagree with
+        // the app-wide appearance that .cgColor would otherwise snapshot.
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = isActive
+                ? NSColor.labelColor.withAlphaComponent(0.12).cgColor
+                : NSColor.clear.cgColor
+        }
         // The active workspace's chip never indicates (the user is looking at
         // it) — belt and braces on top of the center's own guard.
         applyActivity(isActive ? .idle : activity)

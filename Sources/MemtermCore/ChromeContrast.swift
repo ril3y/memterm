@@ -28,6 +28,16 @@ public enum ChromeContrast {
         return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
     }
 
+    /// Council #2 ("two apps stacked"): the chrome rows ground themselves on
+    /// the THEME background, so the window's appearance — which decides every
+    /// semantic AppKit color the chips/tabs/labels use — must be keyed from
+    /// the same place. Light theme ground → light chrome; dark (or no) theme
+    /// → dark chrome (memterm's default palette is dark).
+    public static func prefersLightChrome(themeBackground: ConfigRGB?) -> Bool {
+        guard let bg = themeBackground else { return false }
+        return relativeLuminance(bg) > 0.5
+    }
+
     /// `a` composited over `b` at `alpha` (simple source-over, per channel).
     public static func composite(_ a: ConfigRGB, over b: ConfigRGB,
                                  alpha: Double) -> ConfigRGB {

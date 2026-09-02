@@ -45,6 +45,23 @@ final class ChromeContrastTests: XCTestCase {
             "the buggy model unexpectedly passes — the regression test lost its teeth")
     }
 
+    /// Council #2 ("two apps stacked"): the chrome appearance is keyed from
+    /// the THEME ground, never hardcoded — light theme backgrounds demand
+    /// light chrome, dark (and the no-theme default, which is dark) demand
+    /// dark chrome.
+    func testChromeAppearanceFollowsThemeGround() {
+        XCTAssertTrue(ChromeContrast.prefersLightChrome(
+            themeBackground: ConfigRGB(hex: "#ffffff")!))
+        XCTAssertTrue(ChromeContrast.prefersLightChrome(
+            themeBackground: ConfigRGB(hex: "#fdf6e3")!))  // solarized light
+        XCTAssertFalse(ChromeContrast.prefersLightChrome(
+            themeBackground: ConfigRGB(hex: "#1d1f21")!))  // memterm dark
+        XCTAssertFalse(ChromeContrast.prefersLightChrome(
+            themeBackground: ConfigRGB(hex: "#002b36")!))  // solarized dark
+        XCTAssertFalse(ChromeContrast.prefersLightChrome(themeBackground: nil),
+                       "no theme = the dark default palette = dark chrome")
+    }
+
     func testCompositeEndpoints() {
         let white = ConfigRGB(red: 255, green: 255, blue: 255)
         XCTAssertEqual(ChromeContrast.composite(row, over: white, alpha: 1.0), row)

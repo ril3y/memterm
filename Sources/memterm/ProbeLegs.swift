@@ -824,6 +824,8 @@ extension MemtermAppDelegate {
                 }))
         }
 
+        addChromeCoherenceSteps(probe)
+        addWorkspaceSheetSteps(probe)
         addClosePaneSteps(probe, mode: mode)
         addScrollUXSteps(probe)
         addSerialSteps(probe)
@@ -862,6 +864,238 @@ extension MemtermAppDelegate {
     }
 
     // MARK: - Close-pane (BUG 3 regression when mode == restored)
+
+    // -----------------------------------------------------------------
+    // Council #2 + #3 (2026-09-02 polish sprint): chrome-vs-theme coherence
+    // and the terminal-content inset, both gated on presented reality.
+    // -----------------------------------------------------------------
+    private func addChromeCoherenceSteps(_ probe: ProbeRunner) {
+        // Chrome follows the theme: the window appearance is keyed from the
+        // theme ground (ChromeContrast.prefersLightChrome — L2-tested), the
+        // RENDERED strip ground lives in the same light/dark world as the
+        // theme background, and the selected tab's label text is legible on
+        // it. verify.sh runs this across the config matrix (light / dark /
+        // founder-like), which is what makes "two apps stacked" a red gate.
+        probe.add(ProbeStep(
+            name: "chrome-theme-coherence",
+            assert: { [self] in
+                guard let host = keyHost(), let window = host.window,
+                      let strip = host.tabStrip else {
+                    throw ProbeFailure("no host/strip (chrome-coherence leg)")
+                }
+                let themeBg = config.themeBackgroundColor ?? .black
+                let expectLight = ChromeContrast.prefersLightChrome(
+                    themeBackground: config.themeBackground)
+                let appearance = window.effectiveAppearance
+                    .bestMatch(from: [.aqua, .darkAqua])
+                guard (appearance == .aqua) == expectLight else {
+                    throw ProbeFailure("window appearance \(String(describing: appearance)) disagrees with theme ground (light=\(expectLight))")
+                }
+                strip.layoutSubtreeIfNeeded()
+                guard let bmp = probeBitmap(strip) else {
+                    throw ProbeFailure("tab strip produced no bitmap")
+                }
+                // Rendered ground: an empty strip region (clear of tabs, the
+                // + button, and the gear that docks at the far right when the
+                // workspace bar is hidden).
+                let ground = NSRect(x: strip.bounds.maxX - 90, y: 6,
+                                    width: 50, height: strip.bounds.height - 10)
+                guard let groundColor = probeDominantColor(bmp, region: ground) else {
+                    throw ProbeFailure("no strip ground samples")
+                }
+                let groundLum = probeLuminance(groundColor)
+                let themeLum = probeLuminance(themeBg)
+                let sameWorld = (groundLum > 0.5) == (themeLum > 0.5)
+                // Label text half: the selected tab's label region renders
+                // visibly against that ground.
+                guard let selectedId = host.selectedTab?.tabId,
+                      let labelFrame = strip.probeLabelFrame(of: selectedId) else {
+                    throw ProbeFailure("no selected tab label frame")
+                }
+                try assertChipVisible(chipFrame: labelFrame, in: bmp,
+                                      what: "selected tab label")
+                print("UIPROBE-CHROME theme_lum=\(String(format: "%.2f", themeLum)) ground_lum=\(String(format: "%.2f", groundLum)) appearance=\(expectLight ? "aqua" : "darkAqua") same_world=\(sameWorld)")
+                guard sameWorld else {
+                    throw ProbeFailure("chrome ground (lum \(groundLum)) and theme ground (lum \(themeLum)) live in different worlds — the 'two apps stacked' bug")
+                }
+                if let shot = probeScreenshot(strip, name: "chrome-theme-\(expectLight ? "light" : "dark")") {
+                    print("UIPROBE-CHROME screenshot=\(shot)")
+                }
+            }))
+
+        // Council #3: the tab's pane tree sits inset from the window edges —
+        // live and ghost content get breathing room; splits divide the inset
+        // region so dividers stay correct. Stateful: the restored world must
+        // present the same margins (its tree is built by buildNode).
+        probe.addStateful(ProbeStep(
+            name: "content-inset",
+            assert: { [self] in
+                guard let host = keyHost(), let tab = host.selectedTab,
+                      let root = tab.paneRoot.subviews.first else {
+                    throw ProbeFailure("no pane tree (content-inset leg)")
+                }
+                host.window?.contentView?.layoutSubtreeIfNeeded()
+                let expected = tab.paneRoot.bounds.insetBy(
+                    dx: SplitLayout.contentInset, dy: SplitLayout.contentInset)
+                let f = root.frame
+                let offBy = max(abs(f.minX - expected.minX), abs(f.minY - expected.minY),
+                                abs(f.maxX - expected.maxX), abs(f.maxY - expected.maxY))
+                print("UIPROBE-INSET root=\(Int(f.minX)),\(Int(f.minY)),\(Int(f.width))x\(Int(f.height)) container=\(Int(tab.paneRoot.bounds.width))x\(Int(tab.paneRoot.bounds.height)) off_by=\(String(format: "%.1f", offBy))")
+                guard offBy <= 1.5 else {
+                    throw ProbeFailure("pane tree not inset \(Int(SplitLayout.contentInset))pt from the container (off by \(offBy))")
+                }
+            }))
+    }
+
+    // -----------------------------------------------------------------
+    // Council #1: the workspace dialogs are window SHEETS with a live,
+    // focused, select-all'd name field — Esc cancels, Enter commits —
+    // and the destructive choice is styled and titled honestly.
+    // -----------------------------------------------------------------
+    private func addWorkspaceSheetSteps(_ probe: ProbeRunner) {
+        var wsCountBefore = 0
+        var activeBefore = ""
+        var createdId: String?
+        var deleteScratchId: String?
+
+        // New Workspace opens as a sheet on the key window; the name field
+        // is focused with its text selected THE MOMENT the sheet opens (the
+        // founder's pet-peeve: runModal's dead unfocused field).
+        probe.addStateful(ProbeStep(
+            name: "workspace-sheet-field-focus",
+            action: { [self] in
+                wsCountBefore = memory?.store.listWorkspaces().count ?? 0
+                activeBefore = activeWorkspaceId
+                newWorkspaceAction(nil)
+            },
+            condition: { [self] in keyHost()?.window?.attachedSheet != nil },
+            assert: { [self] in
+                guard let sheet = keyHost()?.window?.attachedSheet,
+                      let sheetRoot = sheet.contentView,
+                      let field = probeFindField(sheetRoot) else {
+                    throw ProbeFailure("New Workspace did not open as a sheet with a field")
+                }
+                guard probeFindButton(sheetRoot, title: "Create") != nil else {
+                    throw ProbeFailure("commit button is not the verb 'Create'")
+                }
+                let editor = sheet.firstResponder as? NSTextView
+                let focused = editor != nil && editor === field.currentEditor()
+                let selectedAll = editor?.selectedRange == NSRange(
+                    location: 0, length: (field.stringValue as NSString).length)
+                print("UIPROBE-WSSHEET opened=true focused=\(focused) selected_all=\(selectedAll) initial=\(field.stringValue)")
+                guard focused else {
+                    throw ProbeFailure("name field not focused on open (firstResponder=\(String(describing: sheet.firstResponder)))")
+                }
+                guard selectedAll else {
+                    throw ProbeFailure("name field text not select-all'd on open")
+                }
+            }))
+
+        // Esc cancels: one real key event through the sheet's own dispatch.
+        probe.addStateful(ProbeStep(
+            name: "workspace-sheet-esc-cancels",
+            action: { [self] in
+                guard let sheet = keyHost()?.window?.attachedSheet else { return }
+                probeSendKey(sheet, keyCode: 53, characters: "\u{1b}")
+            },
+            condition: { [self] in keyHost()?.window?.attachedSheet == nil },
+            assert: { [self] in
+                let count = memory?.store.listWorkspaces().count ?? -1
+                print("UIPROBE-WSSHEET esc_cancelled=true workspaces=\(count) before=\(wsCountBefore)")
+                guard count == wsCountBefore else {
+                    throw ProbeFailure("Esc-cancelled sheet still changed the workspace list")
+                }
+            }))
+
+        // Enter commits: reopen, type a name, press Return — the workspace
+        // exists and is switched to (the New Workspace contract).
+        probe.addStateful(ProbeStep(
+            name: "workspace-sheet-enter-commits",
+            action: { [self] in newWorkspaceAction(nil) },
+            condition: { [self] in keyHost()?.window?.attachedSheet != nil },
+            assert: { [self] in
+                guard let sheet = keyHost()?.window?.attachedSheet,
+                      let sheetRoot = sheet.contentView,
+                      let field = probeFindField(sheetRoot) else {
+                    throw ProbeFailure("reopened New Workspace sheet lacks its field")
+                }
+                field.stringValue = "Probe-Sheet-WS"
+                guard probePressReturn(in: sheet, expectedTitle: "Create") else {
+                    throw ProbeFailure("Enter is not mapped to the sheet's Create button")
+                }
+            }))
+        probe.addStateful(ProbeStep(
+            name: "workspace-sheet-committed",
+            condition: { [self] in
+                guard keyHost()?.window?.attachedSheet == nil,
+                      let store = memory?.store else { return false }
+                return store.listWorkspaces().contains { $0.name == "Probe-Sheet-WS" }
+            },
+            assert: { [self] in
+                guard let store = memory?.store,
+                      let created = store.listWorkspaces().first(where: { $0.name == "Probe-Sheet-WS" }) else {
+                    throw ProbeFailure("Enter did not create the workspace")
+                }
+                createdId = created.id
+                let switched = activeWorkspaceId == created.id
+                print("UIPROBE-WSSHEET enter_committed=true switched=\(switched)")
+                guard switched else {
+                    throw ProbeFailure("New Workspace commit did not switch to the new workspace")
+                }
+                // World restored: back to the pre-leg workspace, fixture
+                // forgotten through the FR-50/57 path.
+                switchToWorkspace(activeBefore)
+                if let createdId { forgetWorkspace(createdId) }
+            },
+            onFailure: { [self] in
+                print("UIPROBE-WSSHEET enter_committed=false names=\(memory?.store.listWorkspaces().map(\.name) ?? [])")
+            }))
+
+        // Delete Workspace: a sheet whose title asks the actual question
+        // (park vs forget), with destructive styling on Forget; Esc leaves
+        // the workspace untouched.
+        probe.addStateful(ProbeStep(
+            name: "workspace-delete-sheet",
+            action: { [self] in
+                deleteScratchId = createWorkspace(named: "DeleteProbe")
+                if let deleteScratchId { confirmDeleteWorkspace(deleteScratchId) }
+            },
+            condition: { [self] in keyHost()?.window?.attachedSheet != nil },
+            assert: { [self] in
+                guard let sheet = keyHost()?.window?.attachedSheet,
+                      let sheetRoot = sheet.contentView else {
+                    throw ProbeFailure("Delete Workspace did not open as a sheet")
+                }
+                guard let forget = probeFindButton(sheetRoot, title: "Forget"),
+                      probeFindButton(sheetRoot, title: "Park") != nil,
+                      probeFindButton(sheetRoot, title: "Cancel") != nil else {
+                    throw ProbeFailure("delete sheet lacks Park/Forget/Cancel")
+                }
+                let honest = probeFindTextInViews(sheetRoot, containing: "Park or forget")
+                print("UIPROBE-WSDELETE sheet=true destructive_forget=\(forget.hasDestructiveAction) honest_title=\(honest)")
+                guard forget.hasDestructiveAction else {
+                    throw ProbeFailure("Forget lacks destructive styling")
+                }
+                guard honest else {
+                    throw ProbeFailure("delete sheet title does not name the park-vs-forget choice")
+                }
+                probeSendKey(sheet, keyCode: 53, characters: "\u{1b}")
+            }))
+        probe.addStateful(ProbeStep(
+            name: "workspace-delete-esc-keeps",
+            condition: { [self] in keyHost()?.window?.attachedSheet == nil },
+            assert: { [self] in
+                guard let store = memory?.store, let scratch = deleteScratchId else {
+                    throw ProbeFailure("delete-sheet leg lost its fixture")
+                }
+                let kept = store.listWorkspaces().contains { $0.id == scratch }
+                print("UIPROBE-WSDELETE esc_kept=\(kept)")
+                guard kept else {
+                    throw ProbeFailure("Esc on the delete sheet still removed the workspace")
+                }
+                forgetWorkspace(scratch)  // world restored
+            }))
+    }
 
     private func addClosePaneSteps(_ probe: ProbeRunner, mode: String) {
         var closeProbePane: PaneView?
@@ -1346,7 +1580,17 @@ extension MemtermAppDelegate {
                 // the ~1s idle delay.
                 pane?.scroll(toPosition: 1.0)
             },
-            condition: { pane?.scrollerOverlay?.probeVisible == false },
+            condition: {
+                // Wait for the VIEW to fade, not just the visibility model:
+                // the model expires a beat before the scheduled fade work
+                // runs, and a poll landing in that window met the old
+                // condition while hitTest (keyed on isHidden/alpha) still
+                // returned the band — a phase-of-poll flake, caught live
+                // 2026-09-02 when new legs shifted the poll cadence.
+                guard let overlay = pane?.scrollerOverlay else { return false }
+                return !overlay.probeVisible
+                    && (overlay.isHidden || overlay.alphaValue <= 0.1)
+            },
             assert: {
                 guard let pane, let overlay = pane.scrollerOverlay else {
                     throw ProbeFailure("fade leg: overlay lost")
@@ -2075,4 +2319,32 @@ extension MemtermAppDelegate {
                 }
             }))
     }
+}
+
+// MARK: - Sheet-inspection helpers (council #1 legs)
+
+/// First editable text field in a view tree (an NSAlert accessory field).
+func probeFindField(_ view: NSView) -> NSTextField? {
+    if let field = view as? NSTextField, field.isEditable { return field }
+    for sub in view.subviews {
+        if let found = probeFindField(sub) { return found }
+    }
+    return nil
+}
+
+/// Button with an exact title in a view tree.
+func probeFindButton(_ view: NSView, title: String) -> NSButton? {
+    if let button = view as? NSButton, button.title == title { return button }
+    for sub in view.subviews {
+        if let found = probeFindButton(sub, title: title) { return found }
+    }
+    return nil
+}
+
+/// Whether any (non-editable) text in the view tree contains `fragment` —
+/// how the delete sheet's honest title is asserted without reaching into
+/// NSAlert internals.
+func probeFindTextInViews(_ view: NSView, containing fragment: String) -> Bool {
+    if let field = view as? NSTextField, field.stringValue.contains(fragment) { return true }
+    return view.subviews.contains { probeFindTextInViews($0, containing: fragment) }
 }

@@ -57,4 +57,95 @@ public enum ScrollbackText {
     public static func ghostFeedText(_ serialized: String) -> String {
         serialized.replacingOccurrences(of: "\n", with: "\r\n")
     }
+
+    // MARK: - Restore dividers (council #9: collapse stacked generations)
+
+    private static let dividerPrefix = "── restored — "
+    private static let dividerSuffix = " ──"
+
+    /// The single source of the restore-divider line shape. The restore path
+    /// feeds this (in color); the capture round-trips it as plain text, and
+    /// `collapseRestoredDividers` parses exactly this shape back.
+    public static func restoredDividerLine(stamp: String, earlierSessions: Int = 0) -> String {
+        guard earlierSessions > 0 else { return dividerPrefix + stamp + dividerSuffix }
+        let unit = earlierSessions == 1 ? "earlier session" : "earlier sessions"
+        return "\(dividerPrefix)\(stamp) · \(earlierSessions) \(unit)\(dividerSuffix)"
+    }
+
+    /// Parses a (plain-text) restore divider line — either the plain form
+    /// `── restored — <stamp> ──` or the collapsed form
+    /// `── restored — <stamp> · N earlier sessions ──`. Nil for anything else.
+    public static func parseRestoredDivider(_ line: String) -> (stamp: String, earlierSessions: Int)? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix(dividerPrefix), trimmed.hasSuffix(dividerSuffix),
+              trimmed.count > dividerPrefix.count + dividerSuffix.count else { return nil }
+        let inner = String(trimmed.dropFirst(dividerPrefix.count).dropLast(dividerSuffix.count))
+        guard !inner.isEmpty else { return nil }
+        // Collapsed form: "<stamp> · N earlier session(s)".
+        if let sep = inner.range(of: " · ", options: .backwards) {
+            let tail = String(inner[sep.upperBound...])
+            let parts = tail.split(separator: " ")
+            if parts.count == 3, let n = Int(parts[0]), n > 0, parts[1] == "earlier",
+               parts[2] == "session" || parts[2] == "sessions" {
+                let stamp = String(inner[..<sep.lowerBound])
+                return stamp.isEmpty ? nil : (stamp, n)
+            }
+        }
+        return (inner, 0)
+    }
+
+    /// A line the collapse may drop when it sits BETWEEN two restore dividers:
+    /// blank lines and memterm's own restore chrome (`memterm: …` offer /
+    /// notice lines from a dead generation). Never user output.
+    private static func isRestoreNoise(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty || trimmed.hasPrefix("memterm: ")
+    }
+
+    /// Council finding #9: after several relaunches a pane's ghost opens on a
+    /// pile of `── restored — … ──` markers. This collapses every run of
+    /// consecutive divider generations (dividers separated only by blank
+    /// lines / memterm's own stale offer lines) into ONE line —
+    /// `── restored — <latest> · N earlier sessions ──` — accumulating counts
+    /// from already-collapsed lines so the pile never regrows. User content
+    /// always breaks a run and is preserved verbatim: the ghost stays
+    /// searchable. Single dividers (real sessions between them) are untouched.
+    public static func collapseRestoredDividers(_ serialized: String) -> String {
+        guard serialized.contains(dividerPrefix) else { return serialized }
+        var out: [String] = []
+        // The active run of divider generations, plus noise lines held in
+        // limbo (dropped only if another divider extends the run; emitted
+        // untouched when real content follows instead).
+        var run: [(line: String, stamp: String, earlier: Int)] = []
+        var limbo: [String] = []
+
+        func flushRun() {
+            guard !run.isEmpty else { return }
+            if run.count == 1 {
+                out.append(run[0].line)
+            } else {
+                let earlier = run.reduce(0) { $0 + $1.earlier } + run.count - 1
+                out.append(restoredDividerLine(stamp: run[run.count - 1].stamp,
+                                               earlierSessions: earlier))
+            }
+            run = []
+        }
+
+        for line in serialized.components(separatedBy: "\n") {
+            if let divider = parseRestoredDivider(line) {
+                limbo = []  // noise between merged generations is dropped
+                run.append((line, divider.stamp, divider.earlierSessions))
+            } else if !run.isEmpty, isRestoreNoise(line) {
+                limbo.append(line)
+            } else {
+                flushRun()
+                out.append(contentsOf: limbo)
+                limbo = []
+                out.append(line)
+            }
+        }
+        flushRun()
+        out.append(contentsOf: limbo)
+        return out.joined(separator: "\n")
+    }
 }

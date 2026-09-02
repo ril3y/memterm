@@ -410,6 +410,15 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         window.isOpaque = opaque
         window.backgroundColor = opaque
             ? bg : bg.withAlphaComponent(config.effectiveOpacity)
+        // Council #2 ("two apps stacked"): the chrome derives its WORLD from
+        // the theme ground, not from the system appearance — a light terminal
+        // theme gets light chrome (dark labels, light materials) and vice
+        // versa, keyed from the same ChromeContrast math the L2 seam pins
+        // down. Every semantic color in the chips/tabs/gear resolves against
+        // this window appearance, so both rows read as ONE app with the pane.
+        let lightChrome = ChromeContrast.prefersLightChrome(
+            themeBackground: config.themeBackground)
+        window.appearance = NSAppearance(named: lightChrome ? .aqua : .darkAqua)
         blurView.isHidden = opaque || !config.windowBlur
         // The chrome rows never go translucent (founder bug 2026-09-01: at
         // window_opacity 0.37 the workspace chips washed out to invisible —

@@ -264,6 +264,14 @@ final class TabStripView: NSVisualEffectView {
         items.first { $0.tab?.tabId == tabId }?.probeLabelColor
     }
 
+    /// A tab label's frame in strip coordinates (council #2 coherence gate:
+    /// the label text region is sampled on the rendered strip bitmap).
+    func probeLabelFrame(of tabId: String) -> NSRect? {
+        guard let item = items.first(where: { $0.tab?.tabId == tabId }),
+              item.probeLabelFrame.width >= 1 else { return nil }
+        return item.convert(item.probeLabelFrame, to: self)
+    }
+
     func probeTabIds() -> [String] {
         items.compactMap { $0.tab?.tabId }
     }
@@ -378,6 +386,7 @@ final class TabItemView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 
     var probeLabelColor: NSColor? { label.textColor }
+    var probeLabelFrame: NSRect { label.frame }
 
     func configure(selected: Bool) {
         self.selected = selected
@@ -395,6 +404,12 @@ final class TabItemView: NSView {
     /// tinted at reduced alpha; nil color falls back to system materials.
     func repaint() {
         guard let tab else { return }
+        // Chrome follows the theme (council #2): dynamic colors resolve
+        // against this window's theme-derived appearance, not the app's.
+        effectiveAppearance.performAsCurrentDrawingAppearance { repaintResolved(tab) }
+    }
+
+    private func repaintResolved(_ tab: TerminalWindowController) {
         let tint = tab.tabColor.map { MemtermAppDelegate.nsColor(hex: $0) }
         if let tint {
             let srgb = tint.usingColorSpace(.sRGB) ?? tint

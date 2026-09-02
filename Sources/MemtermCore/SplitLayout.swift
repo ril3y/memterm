@@ -13,6 +13,13 @@ public enum SplitLayout {
     /// it. Matches the probe's assertPaneGeometry floor.
     public static let minPaneSide: CGFloat = 50
 
+    /// Council #3: breathing room between terminal content (live + ghost) and
+    /// the window edge. Applied once around the tab's whole pane tree (the
+    /// container inset), so split dividers stay flush and correct; the margin
+    /// shows the theme background. SwiftTerm's macOS TerminalView exposes no
+    /// content-inset API (checked: only iOS carries one), hence the container.
+    public static let contentInset: CGFloat = 9
+
     /// Lays out `tree` into `container`, returning each pane's rect.
     /// - `vertical: true` splits side-by-side (divides width, first child on
     ///   the left) — the app's "split right"; `false` stacks (divides height,

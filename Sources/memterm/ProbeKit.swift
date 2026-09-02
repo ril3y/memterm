@@ -424,6 +424,86 @@ func contrastRatio(_ a: NSColor, _ b: NSColor) -> CGFloat {
     return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
 }
 
+/// Council #2 (chrome-vs-theme coherence): the region's most common sampled
+/// color — the rendered GROUND of a chrome row, decorations excluded by
+/// majority vote. Nil when the region yields no samples.
+func probeDominantColor(_ bmp: NSBitmapImageRep, region: CGRect) -> NSColor? {
+    let colors = sampleColors(bmp, region: region)
+    guard !colors.isEmpty else { return nil }
+    var histogram: [Int: (count: Int, color: NSColor)] = [:]
+    for color in colors {
+        guard let c = color.usingColorSpace(.sRGB) else { continue }
+        let key = (Int(c.redComponent * 15) << 8) | (Int(c.greenComponent * 15) << 4)
+            | Int(c.blueComponent * 15)
+        let entry = histogram[key]
+        histogram[key] = ((entry?.count ?? 0) + 1, entry?.color ?? c)
+    }
+    return histogram.values.max { $0.count < $1.count }?.color
+}
+
+/// WCAG relative luminance of a color (0 dark … 1 light) — the "which world
+/// is this ground in" half of the chrome-vs-theme coherence gate.
+func probeLuminance(_ color: NSColor) -> CGFloat {
+    guard let c = color.usingColorSpace(.sRGB) else { return 0 }
+    func channel(_ v: CGFloat) -> CGFloat {
+        v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * channel(c.redComponent) + 0.7152 * channel(c.greenComponent)
+        + 0.0722 * channel(c.blueComponent)
+}
+
+/// One synthetic keyboard event addressed to `window`.
+func probeKeyEvent(_ window: NSWindow, keyCode: UInt16,
+                   characters: String) -> NSEvent? {
+    NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber, context: nil,
+        characters: characters, charactersIgnoringModifiers: characters,
+        isARepeat: false, keyCode: keyCode)
+}
+
+/// Sends one real key event through the window's own dispatch (sendEvent →
+/// responder chain / key-equivalent routing) — the gesture-fidelity way to
+/// press Esc in a sheet. Esc = (53, "\u{1b}"), Return = (36, "\r").
+func probeSendKey(_ window: NSWindow, keyCode: UInt16, characters: String) {
+    guard let event = probeKeyEvent(window, keyCode: keyCode,
+                                    characters: characters) else { return }
+    window.sendEvent(event)
+}
+
+/// Presses Return in a dialog: asserts the Enter mapping structurally — the
+/// window HAS a default button (its `defaultButtonCell`, or a button wired
+/// to keyEquivalent "\r"; on this AppKit an alert's Return routing lives in
+/// the defaultButtonCell, the button's own keyEquivalent stays empty —
+/// verified live) — and drives that button's real click. Synthetic Return
+/// keyDowns cannot take the native route in a quiet probe run: the focused
+/// field editor consumes a raw sendEvent and the key-equivalent pass
+/// refuses in a never-key window (both verified live).
+/// `expectedTitle` pins WHICH button Enter commits through (the verb).
+@discardableResult
+func probePressReturn(in window: NSWindow, expectedTitle: String? = nil) -> Bool {
+    if let cell = window.defaultButtonCell {
+        if let expectedTitle, cell.title != expectedTitle { return false }
+        cell.performClick(nil)
+        return true
+    }
+    func findDefaultButton(_ view: NSView) -> NSButton? {
+        if let button = view as? NSButton, button.keyEquivalent == "\r" {
+            return button
+        }
+        for sub in view.subviews {
+            if let found = findDefaultButton(sub) { return found }
+        }
+        return nil
+    }
+    guard let root = window.contentView,
+          let button = findDefaultButton(root),
+          expectedTitle == nil || button.title == expectedTitle else { return false }
+    button.performClick(nil)
+    return true
+}
+
 /// Bug-2 regression, rendered half: the chip's REGION of the composited
 /// chrome bitmap must contain visibly contrasting pixels (glyphs vs chip
 /// ground) — a washed-out/invisible chip samples near-uniform and fails.

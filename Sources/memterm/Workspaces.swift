@@ -354,11 +354,11 @@ extension MemtermAppDelegate {
 
     @objc func newWorkspaceAction(_ sender: Any?) {
         let count = memory?.store.listWorkspaces().count ?? 0
-        guard let name = promptForText(title: "New Workspace",
-                                       message: "Name the new workspace:",
-                                       initial: "Workspace \(count + 1)") else { return }
-        if let id = createWorkspace(named: name) {
-            switchToWorkspace(id)
+        promptForText(title: "New Workspace",
+                      message: "Name the new workspace:",
+                      initial: "Workspace \(count + 1)", verb: "Create") { [weak self] name in
+            guard let self, let id = self.createWorkspace(named: name) else { return }
+            self.switchToWorkspace(id)
         }
     }
 
@@ -366,11 +366,13 @@ extension MemtermAppDelegate {
         guard let store = memory?.store,
               let workspace = store.listWorkspaces().first(where: { $0.id == activeWorkspaceId })
         else { return }
-        guard let name = promptForText(title: "Rename Workspace",
-                                       message: "New name for “\(workspace.name)”:",
-                                       initial: workspace.name) else { return }
-        store.renameWorkspace(workspace.id, name: name)
-        rebuildWorkspaceMenu()
+        promptForText(title: "Rename Workspace",
+                      message: "New name for “\(workspace.name)”:",
+                      initial: workspace.name, verb: "Rename") { [weak self] name in
+            guard let self else { return }
+            self.memory?.store.renameWorkspace(workspace.id, name: name)
+            self.rebuildWorkspaceMenu()
+        }
     }
 
     @objc func recolorWorkspaceItem(_ sender: NSMenuItem) {
@@ -388,24 +390,32 @@ extension MemtermAppDelegate {
         confirmDeleteWorkspace(activeWorkspaceId)
     }
 
+    /// Council #1: a window sheet (never a screen-centered runModal), with a
+    /// title that agrees with its buttons — the choice IS park vs forget, so
+    /// the title asks exactly that — and destructive styling on Forget.
     func confirmDeleteWorkspace(_ id: String) {
         guard let store = memory?.store,
-              let workspace = store.listWorkspaces().first(where: { $0.id == id })
+              let workspace = store.listWorkspaces().first(where: { $0.id == id }),
+              let window = keyHost()?.window
         else { return }
         let alert = NSAlert()
-        alert.messageText = "Delete workspace “\(workspace.name)”?"
+        alert.messageText = "Park or forget “\(workspace.name)”?"
         alert.informativeText = """
             Park keeps its tabs, layout, and scrollback in the journal so it can \
             be reopened later. Forget removes them permanently, including the \
             scrollback files on disk.
             """
         alert.addButton(withTitle: "Park")
-        alert.addButton(withTitle: "Forget")
+        let forget = alert.addButton(withTitle: "Forget")
+        forget.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
-        switch alert.runModal() {
-        case .alertFirstButtonReturn: parkWorkspace(workspace.id)
-        case .alertSecondButtonReturn: forgetWorkspace(workspace.id)
-        default: break
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            switch response {
+            case .alertFirstButtonReturn: self.parkWorkspace(workspace.id)
+            case .alertSecondButtonReturn: self.forgetWorkspace(workspace.id)
+            default: break
+            }
         }
     }
 
@@ -577,11 +587,13 @@ extension MemtermAppDelegate {
         guard let request = sender.representedObject as? MoveTabRequest,
               let controller = request.controller else { return }
         let count = memory?.store.listWorkspaces().count ?? 0
-        guard let name = promptForText(title: "New Workspace from Tab",
-                                       message: "Name the new workspace:",
-                                       initial: "Workspace \(count + 1)"),
-              let id = createWorkspace(named: name) else { return }
-        moveTab(controller, toWorkspace: id)
+        promptForText(title: "New Workspace from Tab",
+                      message: "Name the new workspace:",
+                      initial: "Workspace \(count + 1)", verb: "Create") { [weak self, weak controller] name in
+            guard let self, let controller,
+                  let id = self.createWorkspace(named: name) else { return }
+            self.moveTab(controller, toWorkspace: id)
+        }
     }
 
     @objc func moveTabToWorkspaceItem(_ sender: NSMenuItem) {
@@ -688,21 +700,36 @@ extension MemtermAppDelegate {
         return image
     }
 
-    // MARK: - Name prompt (FR-50: NSAlert with accessory text field)
+    // MARK: - Name prompt (FR-50, council #1: window SHEET, field focused)
 
-    func promptForText(title: String, message: String, initial: String) -> String? {
+    /// The documented sheet pattern (promptRenameTab): beginSheetModal on the
+    /// key window, then makeFirstResponder(field) + selectAll AFTER beginSheet
+    /// — unlike runModal, which ignores initialFirstResponder for accessory
+    /// views and opens with a dead, unfocused field (the founder's pet-peeve;
+    /// verified keyWindow-nil live). `verb` names the commit button honestly
+    /// ("Create" / "Rename", never "OK"); Enter commits, Esc cancels — both
+    /// native NSAlert key equivalents. `then` runs only on commit with a
+    /// non-empty trimmed name.
+    func promptForText(title: String, message: String, initial: String,
+                       verb: String, then: @escaping (String) -> Void) {
+        guard let window = keyHost()?.window else { return }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: verb)
         alert.addButton(withTitle: "Cancel")
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         field.stringValue = initial
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
-        return name.isEmpty ? nil : name
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { return }
+            then(name)
+        }
+        alert.window.makeFirstResponder(field)
+        field.currentEditor()?.selectAll(nil)
     }
 }
 
