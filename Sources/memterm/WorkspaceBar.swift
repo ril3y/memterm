@@ -232,13 +232,13 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         layer?.cornerRadius = 5
         ring.translatesAutoresizingMaskIntoConstraints = false
         ring.wantsLayer = true
-        ring.layer?.cornerRadius = 6
+        ring.layer?.cornerRadius = 7
         ring.layer?.borderWidth = 1.5
         ring.isHidden = true
         addSubview(ring)
         dot.translatesAutoresizingMaskIntoConstraints = false
         dot.wantsLayer = true
-        dot.layer?.cornerRadius = 3.5
+        dot.layer?.cornerRadius = 4
         addSubview(dot)
         label.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingTail
@@ -257,12 +257,12 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         NSLayoutConstraint.activate([
             dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: 7),
-            dot.heightAnchor.constraint(equalToConstant: 7),
+            dot.widthAnchor.constraint(equalToConstant: 8),
+            dot.heightAnchor.constraint(equalToConstant: 8),
             ring.centerXAnchor.constraint(equalTo: dot.centerXAnchor),
             ring.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
-            ring.widthAnchor.constraint(equalToConstant: 12),
-            ring.heightAnchor.constraint(equalToConstant: 12),
+            ring.widthAnchor.constraint(equalToConstant: 14),
+            ring.heightAnchor.constraint(equalToConstant: 14),
             label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
             label.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -2),
             // Pin the TEXT BASELINE, not the frame center: frame-centering
@@ -364,13 +364,16 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         closeButton.toolTip = isParked ? "Forget \(name)…" : "Park \(name) (keeps its memory)"
     }
 
-    /// Dot pulse while output flows in this (hidden) workspace; a persistent
-    /// ring once it stops, cleared by switching to the workspace.
+    /// Founder 2026-09-02: the ring means "output you haven't seen" — which
+    /// is true BOTH while it flows (.active) and after it stops (.unseen), so
+    /// it stays on for both and never flickers with stream gaps; the dot
+    /// pulse rides on top only while output is actually flowing. Cleared by
+    /// switching to the workspace.
     private func applyActivity(_ state: TabActivityState) {
         activityState = state
         dot.layer?.backgroundColor = dotColor.cgColor
         ring.layer?.borderColor = dotColor.cgColor
-        ring.isHidden = state != .unseen
+        ring.isHidden = state == .idle
         if state == .active {
             if dot.layer?.animation(forKey: Self.pulseKey) == nil {
                 let pulse = CABasicAnimation(keyPath: "opacity")
