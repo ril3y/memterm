@@ -174,6 +174,7 @@ probe "observe" observe "$CFGDIR/default.toml" "$SEED2"
 probe "matrix-founder" fresh "$CFGDIR/founder.toml"
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
 check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-contrast-rendered reason=workspace_bar=false"
+check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"
 probe "matrix-light"   fresh "$CFGDIR/light.toml"
 probe "matrix-dark"    fresh "$CFGDIR/dark.toml"
 

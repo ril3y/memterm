@@ -350,6 +350,65 @@ func assertRendered(_ bmp: NSBitmapImageRep, region: CGRect,
     }
 }
 
+/// Founder polish (chip centering, 2026-09-01): the bounding box of a
+/// region's CONTENT pixels — those visibly different from the region's
+/// dominant background colors. Background = every quantized color bucket
+/// covering >= 20% of the region's pixels (the bar ground; the active chip's
+/// low-alpha pill fill either buckets there too or sits within
+/// `minDistance` of it); content = pixels far from ALL background buckets
+/// (glyphs, the color dot). Scans every device pixel — regions here are
+/// chip-sized. Returns the box in the same bottom-left-origin view points as
+/// `region`; nil when nothing qualifies.
+func probeContentBoundingBox(_ bmp: NSBitmapImageRep, region: CGRect,
+                             minDistance: CGFloat = 0.18) -> CGRect? {
+    let sx = CGFloat(bmp.pixelsWide) / max(bmp.size.width, 1)
+    let sy = CGFloat(bmp.pixelsHigh) / max(bmp.size.height, 1)
+    let x0 = max(0, Int(region.minX * sx)), x1 = min(bmp.pixelsWide, Int(ceil(region.maxX * sx)))
+    let y0 = max(0, Int((bmp.size.height - region.maxY) * sy))
+    let y1 = min(bmp.pixelsHigh, Int(ceil((bmp.size.height - region.minY) * sy)))
+    guard x1 > x0, y1 > y0 else { return nil }
+
+    struct Sample { let px: Int; let py: Int; let r: CGFloat; let g: CGFloat; let b: CGFloat }
+    var samples: [Sample] = []
+    samples.reserveCapacity((x1 - x0) * (y1 - y0))
+    var histogram: [Int: Int] = [:]
+    for py in y0..<y1 {
+        for px in x0..<x1 {
+            guard let c = bmp.colorAt(x: px, y: py)?.usingColorSpace(.sRGB) else { continue }
+            samples.append(Sample(px: px, py: py, r: c.redComponent,
+                                  g: c.greenComponent, b: c.blueComponent))
+            let key = (Int(c.redComponent * 15) << 8) | (Int(c.greenComponent * 15) << 4)
+                | Int(c.blueComponent * 15)
+            histogram[key, default: 0] += 1
+        }
+    }
+    guard !samples.isEmpty else { return nil }
+    let floor = max(1, samples.count / 5)  // >= 20% of pixels = background
+    let backgrounds: [(CGFloat, CGFloat, CGFloat)] = histogram
+        .filter { $0.value >= floor }
+        .map { key, _ in ((CGFloat((key >> 8) & 15) + 0.5) / 16,
+                          (CGFloat((key >> 4) & 15) + 0.5) / 16,
+                          (CGFloat(key & 15) + 0.5) / 16) }
+    guard !backgrounds.isEmpty else { return nil }
+
+    var minPX = Int.max, maxPX = Int.min, minPY = Int.max, maxPY = Int.min
+    for s in samples {
+        let isContent = backgrounds.allSatisfy { bg in
+            max(abs(s.r - bg.0), abs(s.g - bg.1), abs(s.b - bg.2)) > minDistance
+        }
+        guard isContent else { continue }
+        minPX = min(minPX, s.px); maxPX = max(maxPX, s.px)
+        minPY = min(minPY, s.py); maxPY = max(maxPY, s.py)
+    }
+    guard minPX <= maxPX else { return nil }
+    // Pixel bbox (top-left-origin device pixels) back to view points.
+    let minX = CGFloat(minPX) / sx
+    let maxX = CGFloat(maxPX + 1) / sx
+    let minY = bmp.size.height - CGFloat(maxPY + 1) / sy
+    let maxY = bmp.size.height - CGFloat(minPY) / sy
+    return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+}
+
 /// WCAG relative-luminance contrast between two colors (AppKit-side twin of
 /// MemtermCore.ChromeContrast, for sampled NSColors).
 func contrastRatio(_ a: NSColor, _ b: NSColor) -> CGFloat {

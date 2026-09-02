@@ -15,9 +15,12 @@ import MemtermCore
 // the active one visually distinct, parked ones dimmed with "(parked)",
 // plus a "+" to create one.
 //
-//   click a chip           = switch to it (reopens if parked)
-//   click the ACTIVE chip  = inline rename (label swaps for a text field —
-//   / double-click a chip    Enter/focus-loss commits, Esc cancels; no dialog)
+//   click a chip           = switch to it (reopens if parked); a single
+//                            click on the ACTIVE chip is a no-op (already
+//                            active — founder polish 2026-09-01: single-click
+//                            rename fired accidentally too often)
+//   double-click a chip    = inline rename (label swaps for a text field —
+//                            Enter/focus-loss commits, Esc cancels; no dialog)
 //   right-click a chip     = that workspace's menu (Rename, Color, Park/
 //                            Reopen, Delete…)
 //
@@ -81,9 +84,14 @@ final class WorkspaceBarView: NSVisualEffectView {
         // the gear button (the old .right accessory, now a chrome subview) —
         // chips must never crowd under it. Leading comes from the host
         // (traffic-light clearance when this is the top chrome row).
+        // centerY constant is POSITIVE-DOWN in AppKit autolayout: -0.5 lifts
+        // the chip row half a point so it centers in the 25pt band ABOVE the
+        // 1pt bottom hairline (the old +0.5 rode the pills 1pt low — founder
+        // screenshot 2026-09-01; the probe's chip-vertical-centering step
+        // gates this on rendered pixels now).
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leadingInset),
-            stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 0.5),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -0.5),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -44),
         ])
     }
@@ -152,6 +160,14 @@ final class WorkspaceBarView: NSVisualEffectView {
         chipsById[workspaceId]?.activityState
     }
 
+    /// Chip-centering gate support: a PARKED chip's dimmed size-9 "(parked)"
+    /// suffix legitimately extends below the shared text baseline (its
+    /// parentheses and descender), so the rendered-band centering assertion
+    /// measures the normal chips only.
+    func probeChipIsParked(_ workspaceId: String) -> Bool {
+        chipsById[workspaceId]?.isParked == true
+    }
+
     /// TESTING.md §2.3 (bug 2 regression): each chip's frame in bar
     /// coordinates, for rendered-bitmap contrast sampling.
     func probeChipFrames() -> [(id: String, frame: NSRect)] {
@@ -194,7 +210,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     private var editor: NSTextField?
     private var renameCancelled = false
     private(set) var isActive = false
-    private var isParked = false
+    private(set) var isParked = false
     private var name = ""
     private var dotColor = NSColor.systemGray
     private(set) var activityState: TabActivityState = .idle
@@ -242,7 +258,14 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             ring.heightAnchor.constraint(equalToConstant: 12),
             label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
             label.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -2),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // Pin the TEXT BASELINE, not the frame center: frame-centering
+            // rode the glyphs high (font-box descender space is empty for
+            // typical names, plus pixel rounding of the fractional frame) —
+            // founder screenshot 2026-09-01. 4.25pt below chip center
+            // (constants are positive-down) optically centers the size-11
+            // glyph band; the probe's chip-vertical-centering step gates the
+            // rendered result.
+            label.firstBaselineAnchor.constraint(equalTo: centerYAnchor, constant: 4.25),
             label.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -330,7 +353,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         // it) — belt and braces on top of the center's own guard.
         applyActivity(isActive ? .idle : activity)
         toolTip = isParked ? "\(name) — parked. Click to reopen."
-            : isActive ? "Click to rename" : "Switch to \(name)"
+            : isActive ? "Double-click to rename" : "Switch to \(name)"
         closeButton.toolTip = isParked ? "Forget \(name)…" : "Park \(name) (keeps its memory)"
     }
 
@@ -386,13 +409,16 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
 
     override func mouseDown(with event: NSEvent) {
         guard editor == nil else { super.mouseDown(with: event); return }
-        if event.clickCount >= 2 || isActive {
-            // Active chip's name click, or double-click on any chip: rename.
+        if event.clickCount >= 2 {
+            // Rename is DOUBLE-CLICK ONLY (founder polish 2026-09-01).
             // (A double-click on an inactive chip switches on click 1, so
             // click 2 arrives with the chip already active — same path.)
             beginRename()
             return
         }
+        // Single click on the active chip: no-op — it is already active, and
+        // a single click must never start a rename.
+        if isActive { return }
         // Deferred: switching orders out this chip's own window (the outgoing
         // workspace's, FR-59 hide/show) — never hide the window from inside
         // its own mouseDown.

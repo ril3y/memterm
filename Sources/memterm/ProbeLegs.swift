@@ -294,6 +294,83 @@ extension MemtermAppDelegate {
             }))
 
         // ---------------------------------------------------------------
+        // Step: chip-vertical-centering — founder screenshot (2026-09-01):
+        // chip content rode LOW in the pill. Gated on RENDERED PIXELS, not
+        // a constraint eyeball: sample each chip's region of the bar
+        // bitmap, compute the content bounding box (dot + label glyphs;
+        // the hover ✕ is alpha 0), and assert its vertical center sits on
+        // the chip's own center within tolerance. Frame half: each chip's
+        // 19pt pill is centered in the bar's optical band — the 25pt above
+        // the 1pt bottom hairline (the old stack offset rode 0.5pt LOW:
+        // AppKit centerY constants are positive-down).
+        // ---------------------------------------------------------------
+        probe.add(ProbeStep(
+            name: "chip-vertical-centering",
+            assert: { [self] in
+                guard config.workspaceBar else {
+                    probe.skipLine(step: "chip-vertical-centering",
+                                   reason: "workspace_bar=false")
+                    return
+                }
+                guard let host = keyHost(), let bar = host.workspaceBar else {
+                    throw ProbeFailure("no workspace bar")
+                }
+                bar.layoutSubtreeIfNeeded()
+                guard let bmp = probeBitmap(bar) else {
+                    throw ProbeFailure("workspace bar produced no bitmap")
+                }
+                let chips = bar.probeChipFrames()
+                guard !chips.isEmpty else { throw ProbeFailure("no chips rendered") }
+                // Optical mid of the bar: the band ABOVE the 1pt bottom
+                // separator hairline.
+                let opticalMidY = (bar.bounds.height + 1) / 2
+                var measured = 0
+                for (id, frame) in chips {
+                    let frameOff = frame.midY - opticalMidY
+                    guard abs(frameOff) <= 0.5 else {
+                        throw ProbeFailure("chip \(id.prefix(8)) pill off-center in the bar: midY=\(frame.midY) optical=\(opticalMidY)")
+                    }
+                    // Parked chips: the dimmed size-9 "(parked)" suffix's
+                    // parens/descender legitimately extend below the shared
+                    // baseline (restored worlds carry a parked B), so the
+                    // rendered-band assertion measures normal chips only —
+                    // their frame centering was asserted above.
+                    guard !bar.probeChipIsParked(id) else {
+                        print("UIPROBE-CHIP-CENTER id=\(id.prefix(8)) parked=true frame_off=\(String(format: "%.2f", frameOff)) content_band=skipped")
+                        continue
+                    }
+                    measured += 1
+                    guard let content = probeContentBoundingBox(bmp, region: frame) else {
+                        throw ProbeFailure("chip \(id.prefix(8)) region has no content pixels")
+                    }
+                    let contentOff = content.midY - frame.midY
+                    // Per-part diagnostics: the label's own glyph band and
+                    // the dot region, so a failure names WHICH part rides.
+                    if let labelFrame = bar.probeChipLabelFrames()
+                        .first(where: { $0.id == id })?.frame,
+                       let glyphs = probeContentBoundingBox(bmp, region: labelFrame) {
+                        let dotRegion = CGRect(x: frame.minX, y: frame.minY,
+                                               width: labelFrame.minX - frame.minX,
+                                               height: frame.height)
+                        let dot = probeContentBoundingBox(bmp, region: dotRegion)
+                        print("UIPROBE-CHIP-CENTER-PARTS id=\(id.prefix(8)) label_frame_mid=\(String(format: "%.2f", labelFrame.midY)) glyph_mid=\(String(format: "%.2f", glyphs.midY)) glyph_box=\(Int(glyphs.minY))..\(String(format: "%.1f", glyphs.maxY)) dot_mid=\(dot.map { String(format: "%.2f", $0.midY) } ?? "nil")")
+                    }
+                    print("UIPROBE-CHIP-CENTER id=\(id.prefix(8)) chip_mid=\(String(format: "%.2f", frame.midY)) content_mid=\(String(format: "%.2f", content.midY)) content_off=\(String(format: "%.2f", contentOff)) frame_off=\(String(format: "%.2f", frameOff))")
+                    // 0.75pt: strictly below the 1.0pt ride the founder's
+                    // screenshot showed (and the frame-centered label's
+                    // measured regression state), above pixel/AA noise.
+                    guard abs(contentOff) <= 0.75 else {
+                        probeScreenshot(bar, name: "chip-centering-fail")
+                        throw ProbeFailure("chip \(id.prefix(8)) content rides \(contentOff < 0 ? "low" : "high") by \(String(format: "%.2f", abs(contentOff)))pt (tolerance 0.75)")
+                    }
+                }
+                guard measured >= 1 else {
+                    throw ProbeFailure("no non-parked chip to measure — the centering gate would be vacuous")
+                }
+                print("UIPROBE-CHIPS centering_ok=true chips=\(chips.count) measured=\(measured)")
+            }))
+
+        // ---------------------------------------------------------------
         // Full-tab tint (founder's ask, twice): body layer color + label
         // contrast flip — kept verbatim.
         // ---------------------------------------------------------------

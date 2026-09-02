@@ -278,8 +278,15 @@ extension MemtermAppDelegate {
     @discardableResult
     func createWorkspace(named name: String) -> String? {
         guard let store = memory?.store else { return nil }
-        let presets = Self.workspaceColorPresets
-        let color = presets[store.listWorkspaces().count % presets.count].hex
+        // Founder polish (2026-09-01): a new workspace gets a RANDOM color,
+        // drawn from the presets no existing workspace is using — only when
+        // all six are taken does the draw fall back to the full list. The
+        // candidate math is the pure MemtermCore.WorkspaceColorPick seam
+        // (unit-tested); the random draw itself is free app-layer randomness.
+        let presets = Self.workspaceColorPresets.map(\.hex)
+        let used = store.listWorkspaces().map(\.color)
+        let color = WorkspaceColorPick.candidates(presets: presets, used: used)
+            .randomElement() ?? "#8e8e93"
         let id = store.createWorkspace(name: name, color: color)
         rebuildWorkspaceMenu()
         return id

@@ -30,20 +30,43 @@ final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTermi
     var window: NSWindow!
     var termView: ProbeTerminalView!
 
+    /// Founder polish (2026-09-01): the probe window SELF-IDENTIFIES — the
+    /// founder kept mistaking it for broken old code. Distinct title, small
+    /// fixed size parked bottom-right of the main screen, and a banner line
+    /// fed into the terminal naming the probe + build stamp.
+    static let windowTitle = "⚙ memterm perf probe — automated test"
+    static let windowSize = NSSize(width: 560, height: 320)
+
     init(mode: RunMode) {
         self.mode = mode
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let contentRect = NSRect(x: 0, y: 0, width: 980, height: 640)
+        // Measurement methodology is deliberately UNCHANGED by the 2026-09-01
+        // self-identification polish: the window stays ON-SCREEN with the
+        // .regular activation policy (runApp only drops to .accessory for
+        // quiet UI-probe/smoke runs) because --latency/--flood time real
+        // displayIfNeeded work — an occluded/offscreen/accessory window can
+        // have its drawing short-circuited by the window server, which would
+        // make the numbers meaningless. The *-BEGIN line records occlusion so
+        // every log stays interpretable (TESTING.md §2.7).
+        let contentRect = NSRect(origin: .zero, size: Self.windowSize)
         window = NSWindow(
             contentRect: contentRect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable],  // fixed size
             backing: .buffered,
             defer: false
         )
-        window.title = "memterm"
-        window.center()
+        window.title = Self.windowTitle
+        // Parked bottom-right so it reads as an automated fixture, not the
+        // founder's own terminal.
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            window.setFrameOrigin(NSPoint(x: visible.maxX - window.frame.width - 16,
+                                          y: visible.minY + 16))
+        } else {
+            window.center()
+        }
 
         termView = ProbeTerminalView(frame: contentRect)
         termView.autoresizingMask = [.width, .height]
@@ -52,6 +75,10 @@ final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTermi
         window.makeFirstResponder(termView)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        // First line IN the terminal: the window names itself and its build,
+        // before the shell's prompt appears.
+        termView.feed(text: "\u{1b}[1m\(Self.windowTitle)\u{1b}[0m — build \(BuildStamp.describe)\r\n")
 
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         let shellName = (shell as NSString).lastPathComponent
@@ -125,7 +152,8 @@ final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTermi
 
     private func report(draw: [Double], rtt: [Double]) {
         let d = draw.sorted(), r = rtt.sorted()
-        print("memterm M0 latency probe (CoreText renderer, 980x640 window)")
+        let size = "\(Int(Self.windowSize.width))x\(Int(Self.windowSize.height))"
+        print("memterm M0 latency probe (CoreText renderer, \(size) window)")
         print(String(format: "draw latency   n=%3d  p50=%6.2f ms  p95=%6.2f ms  max=%6.2f ms",
                      d.count, percentile(d, 0.5), percentile(d, 0.95), d.last ?? .nan))
         print(String(format: "pty echo rtt   n=%3d  p50=%6.2f ms  p95=%6.2f ms  max=%6.2f ms",
@@ -197,7 +225,9 @@ final class ProbeAppDelegate: NSObject, NSApplicationDelegate, LocalProcessTermi
 
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
     func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
-        window?.title = title.isEmpty ? "memterm" : title
+        // Deliberately ignored: the probe window's title is its identity
+        // ("⚙ memterm perf probe — automated test") — the shell's title
+        // escapes must not rebrand it back into a founder-looking terminal.
     }
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
     func processTerminated(source: TerminalView, exitCode: Int32?) {}
