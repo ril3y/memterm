@@ -451,8 +451,9 @@ extension TimelinePanelController: NSTableViewDataSource, NSTableViewDelegate {
 
         let chip = workspaceChip(card)
 
-        let age = NSTextField(labelWithString: card.closedAt.map {
-            Self.relativeAge.localizedString(for: $0, relativeTo: Date())
+        let age = NSTextField(labelWithString: card.closedAt.map { closed in
+            TimelineModel.recentAgeLabel(closedAt: closed, now: Date())
+                ?? Self.relativeAge.localizedString(for: closed, relativeTo: Date())
         } ?? "")
         age.font = NSFont.systemFont(ofSize: 11)
         age.textColor = .tertiaryLabelColor

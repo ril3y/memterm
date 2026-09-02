@@ -70,8 +70,15 @@ public struct MemtermHost {
 // (the decision doc's sequencing rule, honored). Closing a tab archives its
 // session — one card per closed pane, searchable over its command history
 // (FTS5 core-side), frozen scrollback readable on demand. Cards are
-// newest-closed first. The FR-21 private-pane privacy filter is applied
-// CORE-side before any result exists, always.
+// newest-closed first.
+//
+// FR-21 (private panes) STATUS — verified 2026-09-02: core has NO private-
+// pane concept yet (no incognito toggle, no secure-keyboard-entry detection),
+// so no pane can currently be private and nothing needs filtering. The
+// CONTRACT stands regardless: when FR-21 lands, its exclusion is applied
+// CORE-side before any result exists — a private pane never reaches the
+// journal, the archive, or any kit surface. Kit consumers must not build
+// their own filtering.
 
 /// Journal/archive session identity (schema v6: the sessions rowid, opaque
 /// here). Distinct from `ClaudeSessionID` — an archived memterm session is

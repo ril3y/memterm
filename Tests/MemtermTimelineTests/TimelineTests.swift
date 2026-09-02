@@ -128,6 +128,20 @@ final class TimelineModelTests: XCTestCase {
         XCTAssertNil(TimelineModel.durationLabel(openedAt: now, closedAt: nil))
     }
 
+    /// The "in 0s" screenshot bug: whole-second close stamps can sit a hair
+    /// AHEAD of the render clock; the fresh end must never read future tense.
+    func testRecentAgeLabelAbsorbsSkewAndFreshCloses() {
+        XCTAssertEqual(TimelineModel.recentAgeLabel(
+            closedAt: now.addingTimeInterval(0.5), now: now), "just now",
+            "sub-second future skew must render as just now, never 'in 0s'")
+        XCTAssertEqual(TimelineModel.recentAgeLabel(closedAt: now, now: now), "just now")
+        XCTAssertEqual(TimelineModel.recentAgeLabel(
+            closedAt: now.addingTimeInterval(-59), now: now), "just now")
+        XCTAssertNil(TimelineModel.recentAgeLabel(
+            closedAt: now.addingTimeInterval(-61), now: now),
+            "older cards defer to the relative formatter's past tense")
+    }
+
     func testCloseReasonLabelsStaySubtle() {
         XCTAssertEqual(TimelineModel.closeReasonLabel(.userClose), "closed")
         XCTAssertEqual(TimelineModel.closeReasonLabel(.shellExited), "exited")

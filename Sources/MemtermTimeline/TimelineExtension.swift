@@ -109,6 +109,16 @@ public enum TimelineModel {
         return restHours > 0 ? "\(days)d \(restHours)h" : "\(days)d"
     }
 
+    /// Card age, fresh end: "just now" for anything under a minute — which
+    /// also absorbs clock skew (closed_at stamps whole seconds, so a card
+    /// closed THIS second can sit a hair ahead of Date() and a bare relative
+    /// formatter renders future tense: probe-observed as "in 0s"). nil for
+    /// older cards — the caller's relative formatter takes over with an
+    /// honest past tense.
+    public static func recentAgeLabel(closedAt: Date, now: Date) -> String? {
+        closedAt.timeIntervalSince(now) > -60 ? "just now" : nil
+    }
+
     /// The close reason as the card whispers it (subtle, never alarming).
     public static func closeReasonLabel(_ reason: SessionCloseKind) -> String? {
         switch reason {

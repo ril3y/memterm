@@ -463,6 +463,66 @@ final class ArchiveTests: XCTestCase {
             atPath: ShellIntegration.histTrimSidecarURL(dir: historyDir, paneId: "p1").path))
     }
 
+    /// Torn archive move (adversarial gate, train part 2): performArchive
+    /// COMMITs the sessions row + live-row deletes FIRST and moves the frozen
+    /// files after — a kill -9 in between leaves the pane's scrollback/.hist
+    /// in the LIVE dirs with no pane row. The next launch's sweep must HEAL
+    /// that state (complete the move into <archive>/<rowid>/), never delete
+    /// the bytes the sessions row promises.
+    func testSweepHealsTornArchiveMoveInsteadOfDeleting() throws {
+        let store = StateStore(url: dbURL)
+        try populate(store)
+        try ": 1600000000:0;make torn-sidecar\n".write(
+            to: ShellIntegration.histTrimSidecarURL(dir: historyDir, paneId: "p3"),
+            atomically: true, encoding: .utf8)
+        store.archiveTabs(["t2"], closeReason: .userClose, scrollbackDir: scrollbackDir,
+                          historyDir: historyDir, archiveDir: archiveDir)
+        store.barrier()
+        let row = try XCTUnwrap(store.archivedSessions().first)
+        let dir = sessionDir(row.id)
+        let fm = FileManager.default
+
+        // Simulate the kill -9 window: files back in the live dirs, the
+        // archive session dir never created.
+        try fm.moveItem(at: dir.appendingPathComponent("scrollback.txt"),
+                        to: ScrollbackText.fileURL(dir: scrollbackDir, paneId: "p3"))
+        try fm.moveItem(at: dir.appendingPathComponent("history.hist"),
+                        to: ShellIntegration.histFileURL(dir: historyDir, paneId: "p3"))
+        try fm.moveItem(at: dir.appendingPathComponent("history-trimmed.hist"),
+                        to: ShellIntegration.histTrimSidecarURL(dir: historyDir, paneId: "p3"))
+        try fm.removeItem(at: dir)
+
+        // The launch-time sweep must complete the move, not delete the strays.
+        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir,
+                                    archiveDir: archiveDir)
+        store.barrier()
+
+        XCTAssertEqual(store.archivedScrollbackText(id: row.id, archiveDir: archiveDir),
+                       "scrollback p3",
+                       "healed archive must serve the frozen scrollback")
+        XCTAssertEqual(try String(contentsOf: dir.appendingPathComponent("history.hist"),
+                                  encoding: .utf8),
+                       ": 1700000000:0;echo live-p3\n")
+        XCTAssertEqual(try String(contentsOf: dir.appendingPathComponent("history-trimmed.hist"),
+                                  encoding: .utf8),
+                       ": 1600000000:0;make torn-sidecar\n")
+        XCTAssertFalse(liveScrollbackExists("p3"), "heal must MOVE, not copy")
+        XCTAssertFalse(fm.fileExists(
+            atPath: ShellIntegration.histFileURL(dir: historyDir, paneId: "p3").path))
+        // NFR-10 holds on the healed files too.
+        let dirPerms = try XCTUnwrap(
+            try fm.attributesOfItem(atPath: dir.path)[.posixPermissions] as? Int)
+        XCTAssertEqual(dirPerms & 0o777, 0o700)
+        let filePerms = try XCTUnwrap(try fm.attributesOfItem(
+            atPath: dir.appendingPathComponent("scrollback.txt").path)[.posixPermissions] as? Int)
+        XCTAssertEqual(filePerms & 0o777, 0o600)
+        // A healed session must not be double-collected by a second sweep.
+        store.purgeOrphanScrollback(dir: scrollbackDir, historyDir: historyDir,
+                                    archiveDir: archiveDir)
+        store.barrier()
+        XCTAssertNotNil(store.archivedScrollbackText(id: row.id, archiveDir: archiveDir))
+    }
+
     /// NFR-10 extends to the archive: 0700 session dirs, 0600 frozen files.
     func testArchivePermissions() throws {
         let store = StateStore(url: dbURL)

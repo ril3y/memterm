@@ -3154,6 +3154,21 @@ extension MemtermAppDelegate {
                 guard count == 0, leftovers.isEmpty else {
                     throw ProbeFailure("Forget Everything left archive rows=\(count) files=\(leftovers)")
                 }
+                // The emptied timeline explains itself (explanatory empty
+                // state), captured for the founder-taste record.
+                if let runtime = extensionRuntime,
+                   let ext = runtime.compiledInExtension(
+                       id: TimelineExtension.extensionId) as? TimelineExtension {
+                    runtime.showPanel(id: TimelineExtension.panelId)
+                    ext.refreshNow()
+                    let window = runtime.panelWindow(id: TimelineExtension.panelId)
+                    window?.layoutIfNeeded()
+                    guard let panel = ext.probePanel, panel.probeEmptyState().visible,
+                          panel.probeEmptyState().title == "Your timeline is empty" else {
+                        throw ProbeFailure("emptied timeline lacks its explanatory empty state")
+                    }
+                    probeCompositedShot(window, name: "timeline-empty")
+                }
             }))
     }
 
@@ -3277,11 +3292,16 @@ extension MemtermAppDelegate {
                       rows[1].hasPrefix("session:\(expected[0].id) ") else {
                     throw ProbeFailure("search rows wrong: \(rows)")
                 }
+                let window = runtime.panelWindow(id: TimelineExtension.panelId)
+                window?.layoutIfNeeded()
+                probeCompositedShot(window, name: "timeline-search-hit")
                 panel.probeSetSearch("zzz-no-such-command")
                 let empty = panel.probeEmptyState()
                 guard empty.visible, empty.title == "No matches" else {
                     throw ProbeFailure("no-matches empty state absent: \(empty)")
                 }
+                window?.layoutIfNeeded()
+                probeCompositedShot(window, name: "timeline-empty-no-matches")
                 panel.probeSetSearch("")
                 guard panel.probeEmptyState().visible == false,
                       panel.probeVisibleRows().count > 2 else {

@@ -1059,6 +1059,13 @@ public final class StateStore {
     /// session dirs whose rowid has no sessions row — a crash between a
     /// per-card Forget's COMMIT and its dir removal, or a torn archive move,
     /// must never strand frozen bytes.
+    /// Torn-move HEAL (adversarial gate, archive train part 2): performArchive
+    /// COMMITs first and moves files after, so a kill -9 in between leaves a
+    /// rowless-pane stray whose bytes a sessions row still PROMISES. Before
+    /// deleting any orphan, the sweep checks whether an archived session
+    /// claims that pane and its archive dir lacks the file — if so the stray
+    /// is MOVED into <archive>/<rowid>/ (0700/0600, completing the interrupted
+    /// move) instead of deleted.
     /// No-ops on a degraded store — an empty pane set there is ignorance, not
     /// evidence, and must never trigger a mass delete.
     public func purgeOrphanScrollback(dir: URL, historyDir: URL? = nil,
@@ -1076,11 +1083,39 @@ public final class StateStore {
                     liveHist.insert(ShellIntegration.histSafePaneId(id))
                 }
             }
+            // Archived claims, keyed in each file-name space; newest row wins
+            // a (pathological) collision. Only needed when the caller knows
+            // the archive — without it the old delete-only behavior stands.
+            var claimTxt: [String: Int64] = [:]
+            var claimHist: [String: Int64] = [:]
+            if archiveDir != nil {
+                query("SELECT id, pane_id FROM sessions ORDER BY id", []) { stmt in
+                    let rowid = sqlite3_column_int64(stmt, 0)
+                    guard rowid > 0, let paneId = column(stmt, 1) else { return }
+                    claimTxt[ScrollbackText.safePaneId(paneId)] = rowid
+                    claimHist[ShellIntegration.histSafePaneId(paneId)] = rowid
+                }
+            }
             let fm = FileManager.default
+            /// Completes a torn move: `stray` becomes <archive>/<rowid>/`name`
+            /// unless the frozen file already exists (then the stray is a
+            /// duplicate and dies). Returns true when the stray was handled.
+            func heal(_ stray: URL, claimed rowid: Int64?, as name: String) -> Bool {
+                guard let rowid, let archiveDir else { return false }
+                let sessionDir = Self.archiveSessionDir(archiveDir, id: rowid)
+                try? fm.createDirectory(at: sessionDir, withIntermediateDirectories: true,
+                                        attributes: [.posixPermissions: 0o700])
+                let frozen = sessionDir.appendingPathComponent(name)
+                guard !fm.fileExists(atPath: frozen.path) else { return false }
+                guard (try? fm.moveItem(at: stray, to: frozen)) != nil else { return false }
+                try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: frozen.path)
+                return true
+            }
             if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
                 for file in files where file.pathExtension == "txt" {
                     let paneId = file.deletingPathExtension().lastPathComponent
-                    if !live.contains(paneId) {
+                    if !live.contains(paneId),
+                       !heal(file, claimed: claimTxt[paneId], as: "scrollback.txt") {
                         try? fm.removeItem(at: file)
                     }
                 }
@@ -1090,7 +1125,8 @@ public final class StateStore {
                                                        includingPropertiesForKeys: nil) {
                 for file in files where file.pathExtension == "hist" {
                     let paneId = file.deletingPathExtension().lastPathComponent
-                    if !liveHist.contains(paneId) {
+                    if !liveHist.contains(paneId),
+                       !heal(file, claimed: claimHist[paneId], as: "history.hist") {
                         try? fm.removeItem(at: file)
                     }
                 }
@@ -1099,7 +1135,8 @@ public final class StateStore {
                     let paneId = file.deletingPathExtension()  // strips .trimmed
                         .deletingPathExtension()               // strips .hist
                         .lastPathComponent
-                    if !liveHist.contains(paneId) {
+                    if !liveHist.contains(paneId),
+                       !heal(file, claimed: claimHist[paneId], as: "history-trimmed.hist") {
                         try? fm.removeItem(at: file)
                     }
                 }
