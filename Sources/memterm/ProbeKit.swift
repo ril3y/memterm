@@ -290,6 +290,46 @@ func probeScreenshot(_ view: NSView?, name: String) -> String? {
     } catch { return nil }
 }
 
+/// Composited evidence shot (visible runs only): the window-server truth via
+/// `screencapture -l <CGWindowID>` — the same compositor pixels the founder
+/// sees, titlebar overlays and translucency included (content-view bitmaps
+/// lie about both). `includeSheet` widens to a region capture spanning the
+/// window plus its attached sheet (a sheet is its own window; -l would crop
+/// it out). Falls back to CGWindowListCreateImage when screencapture writes
+/// nothing. Evidence only — never asserted on, never run in quiet mode.
+@discardableResult
+func probeCompositedShot(_ window: NSWindow?, name: String,
+                         includeSheet: Bool = false) -> String? {
+    guard ProbeSupport.visible, let window else { return nil }
+    let url = ProbeSupport.outDir.appendingPathComponent("\(name).png")
+    try? FileManager.default.createDirectory(at: ProbeSupport.outDir,
+                                             withIntermediateDirectories: true)
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    if includeSheet, let sheet = window.attachedSheet,
+       let primary = NSScreen.screens.first {
+        let union = window.frame.union(sheet.frame).insetBy(dx: -2, dy: -2)
+        let topY = primary.frame.height - union.maxY  // global top-left origin
+        task.arguments = ["-x", "-o",
+                          "-R\(Int(union.minX)),\(Int(topY)),\(Int(union.width)),\(Int(union.height))",
+                          url.path]
+    } else {
+        task.arguments = ["-x", "-o", "-l", String(window.windowNumber), url.path]
+    }
+    try? task.run()
+    task.waitUntilExit()
+    if FileManager.default.fileExists(atPath: url.path) {
+        print("UIPROBE-CAPTURE name=\(name) path=\(url.path) source=screencapture")
+        return url.path
+    }
+    guard let cg = probeWindowImage(window),
+          let png = NSBitmapImageRep(cgImage: cg)
+              .representation(using: .png, properties: [:]) else { return nil }
+    try? png.write(to: url)
+    print("UIPROBE-CAPTURE name=\(name) path=\(url.path) source=cgwindowlist")
+    return url.path
+}
+
 /// Bug-1 class: a pane must PRESENT with real size — frame-in-window width
 /// and height at least `minSide`, inside a non-zero container.
 func assertPaneGeometry(_ pane: NSView, paneId: String,

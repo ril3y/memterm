@@ -143,6 +143,9 @@ extension MemtermAppDelegate {
                         }
                     }
                     print("UIPROBE-RESTORED tabs=\(controllers.count) panes=\(controllers.flatMap { $0.allPanes() }.count) geometry_ok=true rendered_ok=true")
+                    // Council #9 evidence: the restored ghost with its
+                    // (collapsed) divider, as composited on screen.
+                    probeCompositedShot(host.window, name: "council9-restored-ghost")
                 }
             }))
 
@@ -603,6 +606,16 @@ extension MemtermAppDelegate {
                     of: #"^([0-9]+%|Opaque)$"#, options: .regularExpression) != nil else {
                     throw ProbeFailure("transparency readout reads \"\(settings.probeOpacityReadout)\"")
                 }
+                if ProbeSupport.visible, let win = settings.window {
+                    // Council #5 evidence: the Memory section as composited
+                    // (the loop above leaves Memory selected).
+                    win.center()
+                    win.orderFront(nil)
+                    win.contentView?.layoutSubtreeIfNeeded()
+                    win.displayIfNeeded()
+                    probeCompositedShot(win, name: "council5-settings-memory")
+                    win.orderOut(nil)
+                }
             }))
 
         // ---------------------------------------------------------------
@@ -946,6 +959,8 @@ extension MemtermAppDelegate {
                 if let shot = probeScreenshot(strip, name: "chrome-theme-\(expectLight ? "light" : "dark")") {
                     print("UIPROBE-CHROME screenshot=\(shot)")
                 }
+                probeCompositedShot(window,
+                                    name: "council2-chrome-\(expectLight ? "light" : "dark")")
             }))
 
         // Council #3: the tab's pane tree sits inset from the window edges —
@@ -969,6 +984,7 @@ extension MemtermAppDelegate {
                 guard offBy <= 1.5 else {
                     throw ProbeFailure("pane tree not inset \(Int(SplitLayout.contentInset))pt from the container (off by \(offBy))")
                 }
+                probeCompositedShot(host.window, name: "council3-content-inset")
             }))
     }
 
@@ -1011,6 +1027,9 @@ extension MemtermAppDelegate {
                 let longTitle = "user@buildhost:/very/deep/project/tree/memterm/Sources/memterm"
                 selected.customTitle = longTitle
                 let lineBreak = strip.probeLabelLineBreak(of: selected.tabId)
+                strip.layoutSubtreeIfNeeded()
+                strip.displayIfNeeded()
+                probeCompositedShot(host.window, name: "council4-tab-truncation")
                 selected.customTitle = nil
                 print("UIPROBE-TABWIDTH width=\(Int(frame.width)) cap=\(Int(TabStripLayout.maxTabWidth)) tabs=\(ids.count) middle_truncates=\(lineBreak == .byTruncatingMiddle)")
                 guard lineBreak == .byTruncatingMiddle else {
