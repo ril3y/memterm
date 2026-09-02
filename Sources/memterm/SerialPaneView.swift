@@ -41,10 +41,16 @@ final class SerialPaneView: PaneView {
 
     private(set) var setup: Setup
     private var connection: SerialConnection?
-    private(set) var isConnected = false
+    /// The connection lifecycle — one pure machine (MemtermCore) owns the
+    /// transition rules; every flag below derives from it. The load-bearing
+    /// distinction: a USER disconnect suppresses hotplug auto-reopen (a
+    /// deliberate release must never steal the port back mid-flash), while
+    /// a device-vanished loss keeps the tio-style auto-reopen armed.
+    private(set) var link = SerialLinkStateMachine()
+    var isConnected: Bool { link.isConnected }
     /// Live-session unplug: the device vanished under an open connection.
     /// Standing consent — hotplug return auto-reopens.
-    private(set) var awaitingDeviceReturn = false
+    var awaitingDeviceReturn: Bool { link.shouldAutoReopenOnHotplug }
     /// Restored pane (or failed open): reconnect needs the ⌘R gesture.
     var pendingReconnectOffer = false
     /// Hex lens (research: a live lens over the same stream, not a mode
@@ -105,8 +111,7 @@ final class SerialPaneView: PaneView {
         conn.onTraffic = { [weak self] rx, tx in self?.noteTraffic(rx: rx, tx: tx) }
         try conn.open(settings: setup.settings)
         connection = conn
-        isConnected = true
-        awaitingDeviceReturn = false
+        link.didConnect()
         pendingReconnectOffer = false
         paneTitle = SerialAdapter.paneTitle(path: setup.path, baud: setup.settings.baud)
         onSerialStateChanged?()
@@ -114,21 +119,68 @@ final class SerialPaneView: PaneView {
     }
 
     /// Closes the connection without any banner (pane close / app teardown).
+    /// FR-56 semantics live with the CALLER (closing the pane forgets); this
+    /// is just fd teardown.
     func shutdown() {
         connection?.onDisconnect = nil
         connection?.close()
         connection = nil
-        isConnected = false
+        link = SerialLinkStateMachine()
         footerFlushTimer?.invalidate()
         footerFlushTimer = nil
+    }
+
+    /// The deliberate USER release (footer dot toggle / context-menu
+    /// Disconnect): close the fd so esptool/avrdude can take the port, keep
+    /// pane, scrollback, and counters, and SUPPRESS hotplug auto-reopen —
+    /// the machine's userDisconnected state is what hotplugAttached checks,
+    /// so a mid-flash device blip can never steal the port back.
+    /// Disconnect ≠ close: nothing here touches the journal or the pane.
+    func performDisconnectGesture() {
+        guard isConnected else { return }
+        connection?.onDisconnect = nil
+        connection?.close()
+        connection = nil
+        link.userDisconnect()
+        feedDim("memterm: port released")
+        onSerialStateChanged?()
+        refreshFooter()
+    }
+
+    /// The explicit Connect gesture (footer dot toggle / context-menu
+    /// Connect): reopen with the CURRENT settings — the user may have edited
+    /// baud/flow while disconnected, and those pending settings are exactly
+    /// what the founder's wrong-baud scenario needs applied on reopen.
+    func performConnectGesture() {
+        guard !isConnected else { return }
+        // Prefer the identity-matched node when discovery knows the device —
+        // /dev may have renumbered while the port was released for flashing.
+        // Ptys and absent devices simply keep the recorded path.
+        if let port = match(in: SerialPortDiscovery.enumeratePorts()) {
+            setup.path = port.path
+        }
+        do {
+            try connect()
+            feedDim("memterm: connected @ \(setup.settings.compactString)")
+        } catch {
+            feedDim("memterm: could not open \(setup.path) (\(Self.describe(error)))")
+        }
+    }
+
+    /// The footer dot's toggle action: one click, the opposite state.
+    func toggleConnectionGesture() {
+        if isConnected {
+            performDisconnectGesture()
+        } else {
+            performConnectGesture()
+        }
     }
 
     /// EOF / vanished device on a LIVE session: banner + arm auto-reconnect.
     /// The buffer is never cleared — the gap is marked inline.
     private func handleDisconnect() {
         connection = nil
-        isConnected = false
-        awaitingDeviceReturn = true
+        link.deviceLost()
         feedDim("memterm: device disconnected — will reconnect when it returns")
         onSerialStateChanged?()
         refreshFooter()
@@ -154,9 +206,9 @@ final class SerialPaneView: PaneView {
             let stamp = Self.dividerDateFormatter.string(from: Date())
             feed(text: "\u{1b}[36m── reconnected — \(stamp) ──\u{1b}[0m\r\n")
         } catch {
-            // Still enumerating / transiently busy: stay armed for the next
-            // attach event rather than giving up silently.
-            awaitingDeviceReturn = true
+            // Still enumerating / transiently busy: the machine is still in
+            // reconnectingAfterLoss (a failed open never transitions), so we
+            // stay armed for the next attach event rather than giving up.
             feedDim("memterm: reconnect failed (\(Self.describe(error))) — still waiting")
         }
     }
@@ -368,6 +420,7 @@ final class SerialPaneView: PaneView {
         footer.translatesAutoresizingMaskIntoConstraints = false
         footer.onSelectBaud = { [weak self] baud in self?.applyBaud(baud) }
         footer.onCustomBaud = { [weak self] in self?.promptCustomBaud() }
+        footer.onToggleConnection = { [weak self] in self?.toggleConnectionGesture() }
         footer.onToggleDTR = { [weak self] in self?.toggleDTR() }
         footer.onToggleRTS = { [weak self] in self?.toggleRTS() }
         addSubview(footer)
@@ -387,8 +440,7 @@ final class SerialPaneView: PaneView {
     /// Repaints everything but the counters (those ride the throttle).
     func refreshFooter() {
         footerView?.update(
-            state: SerialFooterModel.linkState(isConnected: isConnected,
-                                               awaitingDeviceReturn: awaitingDeviceReturn),
+            state: SerialFooterModel.linkState(link),
             portName: SerialAdapter.shortName(forPath: setup.path),
             settings: setup.settings, hexOn: hexMode, lines: currentModemLines())
     }

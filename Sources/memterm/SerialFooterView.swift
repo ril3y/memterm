@@ -78,13 +78,18 @@ final class SerialFooterView: NSVisualEffectView {
     var onCustomBaud: (() -> Void)?
     var onToggleDTR: (() -> Void)?
     var onToggleRTS: (() -> Void)?
+    /// The state dot's click: Connect/Disconnect toggle (founder disconnect/
+    /// connect stage) — the pane decides which, from its link state.
+    var onToggleConnection: (() -> Void)?
 
     // Current painted state, readable by the probe (rendered-truth twin is
     // the bitmap assertion; these are the strip hit-test-style accessors).
     private(set) var currentLinkState: SerialFooterModel.LinkState = .disconnected
     private(set) var currentBaud = 0
 
-    private let dot = NSTextField(labelWithString: "●")
+    /// The state dot IS the Connect/Disconnect toggle button (tooltip states
+    /// the action). Internal so the probe can drive the REAL button action.
+    let dotButton = NSButton()
     private let portLabel = NSTextField(labelWithString: "")
     private let baudButton = NSButton()
     private let frameLabel = NSTextField(labelWithString: "")
@@ -100,8 +105,13 @@ final class SerialFooterView: NSVisualEffectView {
         blendingMode = .withinWindow
         state = .active
 
-        dot.font = .systemFont(ofSize: 9)
-        dot.setContentHuggingPriority(.required, for: .horizontal)
+        dotButton.isBordered = false
+        dotButton.setButtonType(.momentaryChange)
+        dotButton.refusesFirstResponder = true
+        dotButton.target = self
+        dotButton.action = #selector(dotClicked)
+        dotButton.setContentHuggingPriority(.required, for: .horizontal)
+        dotButton.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         for label in [portLabel, frameLabel] {
             label.font = .systemFont(ofSize: 10.5)
@@ -141,7 +151,7 @@ final class SerialFooterView: NSVisualEffectView {
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let stack = NSStackView(views: [dot, portLabel, baudButton, frameLabel,
+        let stack = NSStackView(views: [dotButton, portLabel, baudButton, frameLabel,
                                         spacer, hexBadge, dtrChip, rtsChip,
                                         txLabel, rxLabel])
         stack.orientation = .horizontal
@@ -171,18 +181,24 @@ final class SerialFooterView: NSVisualEffectView {
                 settings: SerialSettings, hexOn: Bool, lines: SerialModemLines?) {
         currentLinkState = state
         currentBaud = settings.baud
+        let dotColor: NSColor
         switch state {
-        case .connected:
-            dot.textColor = .systemGreen
-            dot.toolTip = "Connected"
-        case .reconnecting:
-            dot.textColor = .systemOrange
-            dot.toolTip = "Reconnecting…"
-        case .disconnected:
-            dot.textColor = .tertiaryLabelColor
-            dot.toolTip = "Not connected"
+        case .connected: dotColor = .systemGreen
+        case .reconnecting: dotColor = .systemOrange
+        case .disconnected: dotColor = .tertiaryLabelColor
+        case .userDisconnected: dotColor = .secondaryLabelColor
         }
+        // Glyph + tooltip are model truths ("●"/"○"; the tooltip states the
+        // ACTION — click to connect / click to disconnect).
+        dotButton.attributedTitle = NSAttributedString(
+            string: SerialFooterModel.dotGlyph(state),
+            attributes: [.font: NSFont.systemFont(ofSize: 9),
+                         .foregroundColor: dotColor])
+        dotButton.toolTip = SerialFooterModel.dotTooltip(state)
         portLabel.stringValue = portName
+        baudButton.toolTip = state == .connected
+            ? "Change baud rate (applies live)"
+            : "Change baud rate (applies on next connect)"
         // Council #11: blue is reserved for actual TOGGLE STATE (the filled
         // DTR/RTS chips). The baud is a click target, not a state — label
         // color, medium weight, tooltip carries the affordance.
@@ -214,6 +230,8 @@ final class SerialFooterView: NSVisualEffectView {
     var probeBaudTitle: String { baudButton.attributedTitle.string }
     var probeFrameText: String { frameLabel.stringValue }
     var probeHexBadgeVisible: Bool { !hexBadge.isHidden }
+    var probeDotTitle: String { dotButton.attributedTitle.string }
+    var probeDotTooltip: String { dotButton.toolTip ?? "" }
 
     // MARK: - Baud menu
 
@@ -264,4 +282,5 @@ final class SerialFooterView: NSVisualEffectView {
 
     @objc private func dtrClicked() { onToggleDTR?() }
     @objc private func rtsClicked() { onToggleRTS?() }
+    @objc private func dotClicked() { onToggleConnection?() }
 }

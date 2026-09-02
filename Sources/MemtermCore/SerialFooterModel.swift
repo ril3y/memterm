@@ -9,20 +9,49 @@ import Foundation
 public struct SerialFooterModel: Equatable {
 
     /// State dot: ● green connected / ● orange reconnecting (the liveness /
-    /// hotplug machinery's `awaitingDeviceReturn`) / ● gray disconnected
-    /// (restored pane or failed open, waiting on the ⌘R consent gesture).
+    /// hotplug machinery's device-vanished arm) / ● gray disconnected
+    /// (restored pane or failed open, waiting on the ⌘R consent gesture) /
+    /// ○ hollow user-disconnected (deliberate release — click to connect).
     public enum LinkState: Equatable {
         case connected
         case reconnecting
         case disconnected
+        case userDisconnected
     }
 
-    /// Maps the pane's existing connection flags — the footer invents no
-    /// state of its own.
+    /// Maps the pane's connection flags — the footer invents no state of its
+    /// own. (Pre-state-machine seam, kept for its callers/tests; the pane
+    /// now maps through `linkState(_:)` below.)
     public static func linkState(isConnected: Bool,
                                  awaitingDeviceReturn: Bool) -> LinkState {
         if isConnected { return .connected }
         return awaitingDeviceReturn ? .reconnecting : .disconnected
+    }
+
+    /// The state-machine mapping the pane uses: one machine state, one dot.
+    public static func linkState(_ machine: SerialLinkStateMachine) -> LinkState {
+        switch machine.state {
+        case .connected: return .connected
+        case .reconnectingAfterLoss: return .reconnecting
+        case .userDisconnected: return .userDisconnected
+        case .idle: return .disconnected
+        }
+    }
+
+    /// The dot is a Connect/Disconnect TOGGLE BUTTON now; hollow ○ marks the
+    /// deliberate release so it never reads as the orange auto-reconnect arm.
+    public static func dotGlyph(_ state: LinkState) -> String {
+        state == .userDisconnected ? "○" : "●"
+    }
+
+    /// Tooltip states the ACTION the click performs, not just the state.
+    public static func dotTooltip(_ state: LinkState) -> String {
+        switch state {
+        case .connected: return "Connected — click to disconnect"
+        case .reconnecting: return "Reconnecting when the device returns — click to connect now"
+        case .disconnected: return "Not connected — click to connect"
+        case .userDisconnected: return "disconnected — click to connect"
+        }
     }
 
     // MARK: - Counters + throttle

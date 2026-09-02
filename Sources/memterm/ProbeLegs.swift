@@ -1990,6 +1990,16 @@ extension MemtermAppDelegate {
     private func addSerialSteps(_ probe: ProbeRunner) {
         var serialMasterFD: Int32 = -1
         var serialPane: SerialPaneView?
+        var serialSlavePath = ""
+        var serialController: TerminalWindowController?
+        // Serial submenu item titles via the REAL context-menu construction
+        // (the Disconnect/Connect toggle title must flip with state).
+        func serialSubmenuTitles() -> [String] {
+            guard let pane = serialPane, let controller = serialController,
+                  let submenu = controller.contextMenu(for: pane).items
+                      .first(where: { $0.title == "Serial" })?.submenu else { return [] }
+            return submenu.items.map(\.title)
+        }
         probe.add(ProbeStep(
             name: "serial-open-rx", timeout: 10,
             action: { [self] in
@@ -2000,6 +2010,7 @@ extension MemtermAppDelegate {
                     probeFail("serial leg: pty pair")
                 }
                 serialMasterFD = master
+                serialSlavePath = slavePath
                 // Raw master: no kernel echo/translation between the ends.
                 var t = termios()
                 tcgetattr(master, &t)
@@ -2010,6 +2021,7 @@ extension MemtermAppDelegate {
                     path: slavePath, identity: "path:\(slavePath)", label: "probe-pty",
                     settings: SerialSettings(), txLineEnding: .crlf, localEcho: false)
                 let controller = openSerialTab(setup: setup)
+                serialController = controller
                 guard let pane = controller.allPanes().first as? SerialPaneView else {
                     probeFail("serial leg: no serial pane")
                 }
@@ -2346,6 +2358,7 @@ extension MemtermAppDelegate {
                 tcsetattr(master, TCSANOW, &t)
                 _ = fcntl(master, F_SETFL, O_NONBLOCK)
                 serialMasterFD = master
+                serialSlavePath = slavePath
                 pane.probeRebindPath(slavePath)
                 do { try pane.connect() } catch {
                     probeFail("reconnect leg: connect() failed (\(error))")
@@ -2379,6 +2392,191 @@ extension MemtermAppDelegate {
             },
             onFailure: {
                 print("UIPROBE-SERIAL reconnect_keeps_counters=false connected=\(serialPane?.isConnected == true) tx=\(serialPane?.footerModel.txBytes ?? -1) rx=\(serialPane?.footerModel.rxBytes ?? -1) before_tx=\(reconnectTxBefore) before_rx=\(reconnectRxBefore)")
+            }))
+        // ------------------------------------------------------------------
+        // Disconnect/connect stage (founder: "opened it at the wrong baud but
+        // no way to close it and reopen with the right baud" — and RELEASE
+        // the port so esptool/avrdude can flash, then reconnect, keeping
+        // pane + scrollback + counters).
+        //
+        // USER disconnect through the REAL footer dot button action. The
+        // money assertion: after the release the PROBE ITSELF open(2)s the
+        // pty path — success means the port is genuinely free for a flasher.
+        var disconnectTxBefore = -1
+        var disconnectRxBefore = -1
+        probe.add(ProbeStep(
+            name: "serial-user-disconnect-releases-port", timeout: 8,
+            action: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    probeFail("disconnect leg: pane/footer lost")
+                }
+                disconnectTxBefore = pane.footerModel.txBytes
+                disconnectRxBefore = pane.footerModel.rxBytes
+                guard pane.isConnected else { probeFail("disconnect leg: not connected") }
+                footer.dotButton.performClick(nil)  // the dot IS the toggle
+            },
+            condition: {
+                guard let pane = serialPane else { return false }
+                return !pane.isConnected
+                    && pane.footerView?.currentLinkState == .userDisconnected
+                    && pane.scrollbackText(maxLines: 200).contains("memterm: port released")
+            },
+            assert: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    throw ProbeFailure("disconnect leg: pane/footer lost")
+                }
+                // MONEY: the fd is really closed — the probe can open the
+                // node itself (what esptool/avrdude will do).
+                let freeFD = Darwin.open(serialSlavePath, O_RDWR | O_NOCTTY | O_NONBLOCK)
+                guard freeFD >= 0 else {
+                    throw ProbeFailure("user disconnect did not release \(serialSlavePath) (errno=\(errno))")
+                }
+                _ = Darwin.close(freeFD)
+                // No fd on the pane either (the termios seam answers nil).
+                guard pane.currentTermiosForProbe() == nil else {
+                    throw ProbeFailure("pane still holds a live fd after user disconnect")
+                }
+                // Dot flipped to the hollow connect affordance; tooltip
+                // states the ACTION, distinct from the orange reconnect arm.
+                guard footer.probeDotTitle == "○",
+                      footer.probeDotTooltip == "disconnected — click to connect" else {
+                    throw ProbeFailure("footer dot did not flip to ○/connect (title=\(footer.probeDotTitle) tip=\(footer.probeDotTooltip))")
+                }
+                // Disconnect ≠ close: counters and scrollback stay.
+                guard pane.footerModel.txBytes == disconnectTxBefore,
+                      pane.footerModel.rxBytes == disconnectRxBefore else {
+                    throw ProbeFailure("user disconnect touched the lifetime counters (tx \(disconnectTxBefore)->\(pane.footerModel.txBytes) rx \(disconnectRxBefore)->\(pane.footerModel.rxBytes))")
+                }
+                guard pane.scrollbackText(maxLines: 300).contains("ca fe f0 0d") else {
+                    throw ProbeFailure("user disconnect lost the scrollback")
+                }
+                // Context-menu toggle title flipped with state.
+                let titles = serialSubmenuTitles()
+                guard titles.contains("Connect"), !titles.contains("Disconnect") else {
+                    throw ProbeFailure("Serial submenu did not flip to Connect (items=\(titles))")
+                }
+                print("UIPROBE-SERIAL user_disconnect_released=true probe_reopened_path=true dot=\(footer.probeDotTitle) menu_connect=true")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL user_disconnect_released=false connected=\(serialPane?.isConnected == true) footer_state=\(String(describing: serialPane?.footerView?.currentLinkState)) tail=\(serialPane?.scrollbackText(maxLines: 100).suffix(200) ?? "")")
+            }))
+        // Hotplug suppression: a simulated device return through the EXACT
+        // hotplug entry point must NOT auto-reopen a user-released port
+        // (contrast with serial-unplug-banner/reconnect legs, where the
+        // device-VANISHED arm keeps the tio-style auto-reopen).
+        probe.add(ProbeStep(
+            name: "serial-user-disconnect-suppresses-hotplug", timeout: 8,
+            action: {
+                guard let pane = serialPane else { probeFail("suppress leg: pane lost") }
+                // Identity matches (path fallback) — the only gate that may
+                // refuse this reopen is the userDisconnected state itself.
+                pane.hotplugAttached([SerialPortInfo(path: pane.setup.path)])
+            },
+            condition: {
+                serialPane?.isConnected == false
+                    && serialPane?.footerView?.currentLinkState == .userDisconnected
+            },
+            assert: {
+                guard let pane = serialPane else { throw ProbeFailure("suppress leg: pane lost") }
+                guard pane.currentTermiosForProbe() == nil else {
+                    throw ProbeFailure("hotplug return reopened a user-released port")
+                }
+                print("UIPROBE-SERIAL user_disconnect_hotplug_suppressed=true still_released=true")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL user_disconnect_hotplug_suppressed=false connected=\(serialPane?.isConnected == true)")
+            }))
+        // Pending settings while disconnected: a footer baud click updates
+        // the NEXT-open settings (the wrong-baud fix path) and the footer
+        // summary reflects them — with no fd to apply anything to.
+        probe.add(ProbeStep(
+            name: "serial-disconnected-baud-pending", timeout: 8,
+            action: {
+                serialPane?.footerView?.probeSelectBaud(57600)
+            },
+            condition: {
+                serialPane?.setup.settings.baud == 57600
+                    && serialPane?.footerView?.probeBaudTitle == "57600"
+            },
+            assert: {
+                guard let pane = serialPane else { throw ProbeFailure("pending-baud leg: pane lost") }
+                guard !pane.isConnected, pane.currentTermiosForProbe() == nil else {
+                    throw ProbeFailure("a disconnected baud click opened the port")
+                }
+                guard pane.paneTitle.contains("@ 57600") else {
+                    throw ProbeFailure("pending baud not reflected in the title (\(pane.paneTitle))")
+                }
+                print("UIPROBE-SERIAL pending_baud_while_disconnected=true footer_baud=57600 still_released=true")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL pending_baud_while_disconnected=false settings=\(serialPane?.setup.settings.compactString ?? "-") footer=\(serialPane?.footerView?.probeBaudTitle ?? "-")")
+            }))
+        // Connect through the same dot toggle: reopens with the CURRENT
+        // (edited-while-disconnected) settings, banner names them, traffic
+        // and counters RESUME on the old totals.
+        var connectRxBefore = -1
+        probe.add(ProbeStep(
+            name: "serial-connect-restores-traffic", timeout: 10,
+            action: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    probeFail("connect leg: pane/footer lost")
+                }
+                connectRxBefore = pane.footerModel.rxBytes
+                footer.dotButton.performClick(nil)  // toggle: now Connect
+                guard pane.isConnected else {
+                    probeFail("connect gesture did not reopen \(pane.setup.path)")
+                }
+                // Loopback across the fresh open (hex lens still on): a
+                // 4-byte run written 4x, at least one renders intact.
+                let bytes: [UInt8] = [0xf0, 0x0d, 0xab, 0x1e, 0xf0, 0x0d, 0xab, 0x1e,
+                                      0xf0, 0x0d, 0xab, 0x1e, 0xf0, 0x0d, 0xab, 0x1e]
+                _ = bytes.withUnsafeBytes { write(serialMasterFD, $0.baseAddress, $0.count) }
+            },
+            condition: {
+                guard let pane = serialPane else { return false }
+                return pane.isConnected
+                    && pane.footerModel.rxBytes >= connectRxBefore + 16
+                    && pane.scrollbackText(maxLines: 300).contains("f0 0d ab 1e")
+            },
+            assert: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    throw ProbeFailure("connect leg: pane/footer lost")
+                }
+                // Banner names the CURRENT settings — proof the reopen used
+                // the pending 57600 edited while the port was released.
+                guard pane.scrollbackText(maxLines: 300).contains("memterm: connected @ 57600-8N1") else {
+                    throw ProbeFailure("connect banner missing/wrong settings")
+                }
+                guard var t = pane.currentTermiosForProbe(),
+                      cfgetispeed(&t) == 57600, cfgetospeed(&t) == 57600 else {
+                    throw ProbeFailure("reopen did not apply the pending 57600 to the fd")
+                }
+                // Counters RESUMED, not reset: TX untouched since before the
+                // release, RX accumulated past its pre-release total.
+                guard pane.footerModel.txBytes == disconnectTxBefore,
+                      pane.footerModel.rxBytes >= disconnectRxBefore + 16 else {
+                    throw ProbeFailure("connect reset the counters (tx=\(pane.footerModel.txBytes) want \(disconnectTxBefore); rx=\(pane.footerModel.rxBytes) want >= \(disconnectRxBefore + 16))")
+                }
+                // Dot + tooltip + menu title flipped back.
+                guard footer.currentLinkState == .connected,
+                      footer.probeDotTitle == "●",
+                      footer.probeDotTooltip == "Connected — click to disconnect" else {
+                    throw ProbeFailure("footer dot did not flip back to ●/disconnect (title=\(footer.probeDotTitle) tip=\(footer.probeDotTooltip))")
+                }
+                let titles = serialSubmenuTitles()
+                guard titles.contains("Disconnect"), !titles.contains("Connect") else {
+                    throw ProbeFailure("Serial submenu did not flip to Disconnect (items=\(titles))")
+                }
+                print("UIPROBE-SERIAL connect_restores_traffic=true reopened_baud=57600 rx_before=\(connectRxBefore) rx_after=\(pane.footerModel.rxBytes) dot=\(footer.probeDotTitle)")
+                // Round-trip home so later legs meet the fixture settings.
+                footer.probeSelectBaud(115200)
+                guard var back = pane.currentTermiosForProbe(),
+                      cfgetispeed(&back) == 115200 else {
+                    throw ProbeFailure("return to 115200 did not land on the fd")
+                }
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL connect_restores_traffic=false connected=\(serialPane?.isConnected == true) rx=\(serialPane?.footerModel.rxBytes ?? -1) before=\(connectRxBefore) tail=\(serialPane?.scrollbackText(maxLines: 100).suffix(300) ?? "")")
             }))
         // Restore-offer: drives the EXACT per-tab restore path with a
         // journaled serial snapshot for an absent device. NOTE (TESTING.md

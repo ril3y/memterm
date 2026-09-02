@@ -250,6 +250,14 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         menu.addItem(status)
         menu.addItem(.separator())
 
+        // Disconnect/Connect toggle (founder disconnect/connect stage): the
+        // title flips with state. Disconnect is the deliberate port RELEASE
+        // (flashing tools can take the device; hotplug auto-reopen is
+        // suppressed); Connect reopens with the CURRENT settings.
+        add(pane.isConnected ? "Disconnect" : "Connect",
+            #selector(ctxSerialToggleConnection(_:)))
+        menu.addItem(.separator())
+
         if pane.isConnected {
             let lines = pane.currentModemLines()
             add("Toggle DTR" + (lines.map { $0.dtr ? " (asserted)" : " (deasserted)" } ?? ""),
@@ -294,6 +302,10 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
 
     @objc private func ctxSerialReconnect(_ sender: NSMenuItem) {
         (sender.representedObject as? SerialPaneView)?.performReconnectGesture()
+    }
+
+    @objc private func ctxSerialToggleConnection(_ sender: NSMenuItem) {
+        (sender.representedObject as? SerialPaneView)?.toggleConnectionGesture()
     }
 
     @objc private func ctxSerialHexView(_ sender: NSMenuItem) {
