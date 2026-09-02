@@ -122,7 +122,7 @@ final class SerialLinkStateTests: XCTestCase {
         XCTAssertEqual(SerialFooterModel.dotTooltip(.connected),
                        "Connected — click to disconnect")
         XCTAssertEqual(SerialFooterModel.dotTooltip(.userDisconnected),
-                       "disconnected — click to connect")
+                       "Disconnected — click to connect")
         XCTAssertTrue(SerialFooterModel.dotTooltip(.reconnecting)
                         .contains("click to connect"))
         XCTAssertTrue(SerialFooterModel.dotTooltip(.disconnected)

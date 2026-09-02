@@ -50,7 +50,7 @@ public struct SerialFooterModel: Equatable {
         case .connected: return "Connected — click to disconnect"
         case .reconnecting: return "Reconnecting when the device returns — click to connect now"
         case .disconnected: return "Not connected — click to connect"
-        case .userDisconnected: return "disconnected — click to connect"
+        case .userDisconnected: return "Disconnected — click to connect"
         }
     }
 

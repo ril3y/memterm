@@ -2323,6 +2323,9 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("footer dot not reconnecting-orange after unplug (state=\(String(describing: serialPane?.footerView?.currentLinkState)))")
                 }
                 print("UIPROBE-SERIAL disconnect_banner=true still_connected=false footer_state=reconnecting")
+                // Composited footer evidence (visible pass only): the orange
+                // reconnecting dot as the founder sees it.
+                probeCompositedShot(serialPane?.window, name: "serial-footer-reconnecting")
             },
             onFailure: {
                 let text = serialPane?.scrollbackText(maxLines: 200) ?? ""
@@ -2439,7 +2442,7 @@ extension MemtermAppDelegate {
                 // Dot flipped to the hollow connect affordance; tooltip
                 // states the ACTION, distinct from the orange reconnect arm.
                 guard footer.probeDotTitle == "○",
-                      footer.probeDotTooltip == "disconnected — click to connect" else {
+                      footer.probeDotTooltip == "Disconnected — click to connect" else {
                     throw ProbeFailure("footer dot did not flip to ○/connect (title=\(footer.probeDotTitle) tip=\(footer.probeDotTooltip))")
                 }
                 // Disconnect ≠ close: counters and scrollback stay.
@@ -2456,6 +2459,9 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("Serial submenu did not flip to Connect (items=\(titles))")
                 }
                 print("UIPROBE-SERIAL user_disconnect_released=true probe_reopened_path=true dot=\(footer.probeDotTitle) menu_connect=true")
+                // Composited footer evidence: the hollow ○ deliberate-release
+                // state, distinct from the orange reconnecting arm.
+                probeCompositedShot(pane.window, name: "serial-footer-user-disconnected")
             },
             onFailure: {
                 print("UIPROBE-SERIAL user_disconnect_released=false connected=\(serialPane?.isConnected == true) footer_state=\(String(describing: serialPane?.footerView?.currentLinkState)) tail=\(serialPane?.scrollbackText(maxLines: 100).suffix(200) ?? "")")
@@ -2568,6 +2574,8 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("Serial submenu did not flip to Disconnect (items=\(titles))")
                 }
                 print("UIPROBE-SERIAL connect_restores_traffic=true reopened_baud=57600 rx_before=\(connectRxBefore) rx_after=\(pane.footerModel.rxBytes) dot=\(footer.probeDotTitle)")
+                // Composited footer evidence: the green connected dot.
+                probeCompositedShot(pane.window, name: "serial-footer-connected")
                 // Round-trip home so later legs meet the fixture settings.
                 footer.probeSelectBaud(115200)
                 guard var back = pane.currentTermiosForProbe(),
@@ -2577,6 +2585,93 @@ extension MemtermAppDelegate {
             },
             onFailure: {
                 print("UIPROBE-SERIAL connect_restores_traffic=false connected=\(serialPane?.isConnected == true) rx=\(serialPane?.footerModel.rxBytes ?? -1) before=\(connectRxBefore) tail=\(serialPane?.scrollbackText(maxLines: 100).suffix(300) ?? "")")
+            }))
+        // A user must be able to CANCEL the device-vanished auto-reopen arm
+        // (the machine's userDisconnect-from-reconnectingAfterLoss): when a
+        // flasher owns the device, its re-enumeration must not hand the port
+        // back behind the user's back. First re-arm: unplug the live session
+        // again (close the master → revoked slave → liveness disconnect).
+        var cancelTxBefore = -1
+        var cancelRxBefore = -1
+        probe.add(ProbeStep(
+            name: "serial-unplug-rearms", timeout: 8,
+            action: {
+                guard let pane = serialPane, pane.isConnected else {
+                    probeFail("rearm leg: pane not connected")
+                }
+                cancelTxBefore = pane.footerModel.txBytes
+                cancelRxBefore = pane.footerModel.rxBytes
+                _ = Darwin.close(serialMasterFD)
+            },
+            condition: {
+                serialPane?.isConnected == false
+                    && serialPane?.footerView?.currentLinkState == .reconnecting
+            },
+            assert: {
+                guard serialPane?.awaitingDeviceReturn == true else {
+                    throw ProbeFailure("second unplug did not arm auto-reopen")
+                }
+                // The context menu offers the cancel while the arm stands.
+                let titles = serialSubmenuTitles()
+                guard titles.contains("Stop Auto-Reconnect") else {
+                    throw ProbeFailure("Serial submenu missing Stop Auto-Reconnect while reconnecting (items=\(titles))")
+                }
+                print("UIPROBE-SERIAL unplug_rearms=true menu_offers_cancel=true")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL unplug_rearms=false connected=\(serialPane?.isConnected == true) footer_state=\(String(describing: serialPane?.footerView?.currentLinkState))")
+            }))
+        // Cancel through the REAL menu item's target/action dispatch (gesture
+        // fidelity): the arm drops to userDisconnected, and a simulated
+        // device return through the exact hotplug entry point must NOT
+        // reopen. Counters and scrollback untouched — cancel ≠ close.
+        probe.add(ProbeStep(
+            name: "serial-cancel-auto-reconnect", timeout: 8,
+            action: {
+                guard let pane = serialPane, let controller = serialController,
+                      let submenu = controller.contextMenu(for: pane).items
+                          .first(where: { $0.title == "Serial" })?.submenu,
+                      let item = submenu.items
+                          .first(where: { $0.title == "Stop Auto-Reconnect" }),
+                      let action = item.action else {
+                    probeFail("cancel leg: Stop Auto-Reconnect item missing")
+                }
+                NSApp.sendAction(action, to: item.target, from: item)
+            },
+            condition: {
+                guard let pane = serialPane else { return false }
+                return pane.footerView?.currentLinkState == .userDisconnected
+                    && pane.scrollbackText(maxLines: 200)
+                        .contains("memterm: auto-reconnect cancelled")
+            },
+            assert: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    throw ProbeFailure("cancel leg: pane/footer lost")
+                }
+                // The suppressed hotplug return: same entry point, no reopen.
+                pane.hotplugAttached([SerialPortInfo(path: pane.setup.path)])
+                guard !pane.isConnected, pane.currentTermiosForProbe() == nil else {
+                    throw ProbeFailure("hotplug return reopened after the cancel gesture")
+                }
+                guard footer.probeDotTitle == "○",
+                      footer.probeDotTooltip == "Disconnected — click to connect" else {
+                    throw ProbeFailure("cancel did not land the hollow-dot state (title=\(footer.probeDotTitle) tip=\(footer.probeDotTooltip))")
+                }
+                guard pane.footerModel.txBytes == cancelTxBefore,
+                      pane.footerModel.rxBytes == cancelRxBefore else {
+                    throw ProbeFailure("cancel touched the lifetime counters (tx \(cancelTxBefore)->\(pane.footerModel.txBytes) rx \(cancelRxBefore)->\(pane.footerModel.rxBytes))")
+                }
+                guard pane.scrollbackText(maxLines: 300).contains("f0 0d ab 1e") else {
+                    throw ProbeFailure("cancel lost the scrollback")
+                }
+                let titles = serialSubmenuTitles()
+                guard titles.contains("Connect"), !titles.contains("Stop Auto-Reconnect") else {
+                    throw ProbeFailure("Serial submenu did not settle on Connect after cancel (items=\(titles))")
+                }
+                print("UIPROBE-SERIAL cancel_auto_reconnect=true hotplug_suppressed=true dot=\(footer.probeDotTitle)")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL cancel_auto_reconnect=false connected=\(serialPane?.isConnected == true) footer_state=\(String(describing: serialPane?.footerView?.currentLinkState)) tail=\(serialPane?.scrollbackText(maxLines: 100).suffix(200) ?? "")")
             }))
         // Restore-offer: drives the EXACT per-tab restore path with a
         // journaled serial snapshot for an absent device. NOTE (TESTING.md

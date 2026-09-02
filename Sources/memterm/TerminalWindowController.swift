@@ -242,9 +242,10 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             menu.addItem(item)
         }
 
-        let status = NSMenuItem(title: pane.isConnected
-                                    ? "Connected — \(pane.setup.offer.displayName)"
-                                    : "Not connected — \(pane.setup.offer.displayName)",
+        let statusPrefix = pane.isConnected ? "Connected"
+            : pane.awaitingDeviceReturn ? "Reconnecting when the device returns"
+            : "Not connected"
+        let status = NSMenuItem(title: "\(statusPrefix) — \(pane.setup.offer.displayName)",
                                 action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
@@ -278,6 +279,13 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             menu.addItem(.separator())
             add("Send Hex…", #selector(ctxSerialSendHex(_:)))
         } else {
+            // While the device-vanished arm is standing, the user can cancel
+            // it: a flasher's re-enumeration must not hand the port back
+            // behind their back (performDisconnectGesture handles the
+            // reconnectingAfterLoss cancel — the machine's userDisconnect).
+            if pane.awaitingDeviceReturn {
+                add("Stop Auto-Reconnect", #selector(ctxSerialStopAutoReconnect(_:)))
+            }
             add("Reconnect (⌘R)", #selector(ctxSerialReconnect(_:)))
         }
         add("Hex View", #selector(ctxSerialHexView(_:)), checked: pane.hexMode)
@@ -306,6 +314,10 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
 
     @objc private func ctxSerialToggleConnection(_ sender: NSMenuItem) {
         (sender.representedObject as? SerialPaneView)?.toggleConnectionGesture()
+    }
+
+    @objc private func ctxSerialStopAutoReconnect(_ sender: NSMenuItem) {
+        (sender.representedObject as? SerialPaneView)?.performDisconnectGesture()
     }
 
     @objc private func ctxSerialHexView(_ sender: NSMenuItem) {

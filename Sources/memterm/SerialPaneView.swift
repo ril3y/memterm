@@ -135,14 +135,24 @@ final class SerialPaneView: PaneView {
     /// pane, scrollback, and counters, and SUPPRESS hotplug auto-reopen —
     /// the machine's userDisconnected state is what hotplugAttached checks,
     /// so a mid-flash device blip can never steal the port back.
+    /// From reconnectingAfterLoss (device vanished, auto-reopen armed) the
+    /// same gesture means "stop waiting": the fd is already gone, so this is
+    /// purely the machine's cancel — the returning device must not be
+    /// auto-grabbed while a flasher owns it.
     /// Disconnect ≠ close: nothing here touches the journal or the pane.
     func performDisconnectGesture() {
-        guard isConnected else { return }
-        connection?.onDisconnect = nil
-        connection?.close()
-        connection = nil
-        link.userDisconnect()
-        feedDim("memterm: port released")
+        if isConnected {
+            connection?.onDisconnect = nil
+            connection?.close()
+            connection = nil
+            link.userDisconnect()
+            feedDim("memterm: port released")
+        } else if awaitingDeviceReturn {
+            link.userDisconnect()
+            feedDim("memterm: auto-reconnect cancelled — click the dot or press ⌘R to connect")
+        } else {
+            return
+        }
         onSerialStateChanged?()
         refreshFooter()
     }
@@ -180,7 +190,13 @@ final class SerialPaneView: PaneView {
     /// The buffer is never cleared — the gap is marked inline.
     private func handleDisconnect() {
         connection = nil
+        let wasConnected = link.isConnected
         link.deviceLost()
+        // A loss report can race a deliberate release (drivers may deliver
+        // the detach after the user's close). The machine already refused to
+        // re-arm (userDisconnected stands); printing the "will reconnect"
+        // banner then would promise a reconnect that must never happen.
+        guard wasConnected else { return }
         feedDim("memterm: device disconnected — will reconnect when it returns")
         onSerialStateChanged?()
         refreshFooter()
