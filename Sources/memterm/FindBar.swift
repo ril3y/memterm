@@ -77,8 +77,14 @@ final class PaneFindBar: NSVisualEffectView, NSSearchFieldDelegate {
 
         configureButton(caseButton, symbol: "textformat", tooltip: "Match Case",
                         action: #selector(optionToggled))
-        configureButton(regexButton, symbol: "asterisk.circle", tooltip: "Regular Expression",
+        // Council #7: the regex toggle says what it IS — ".*" (the universal
+        // regex shorthand), not the asterisk-in-a-circle glyph that read as
+        // a mystery bullet. Tooltip matches.
+        configureButton(regexButton, symbol: nil, tooltip: "Regular Expression",
                         action: #selector(optionToggled))
+        regexButton.image = nil
+        regexButton.title = ".*"
+        regexButton.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
         for toggle in [caseButton, regexButton] {
             toggle.setButtonType(.pushOnPushOff)
             toggle.state = .off
@@ -89,6 +95,13 @@ final class PaneFindBar: NSVisualEffectView, NSSearchFieldDelegate {
                         action: #selector(nextTapped))
         configureButton(closeButton, symbol: "xmark", tooltip: "Close (Esc)",
                         action: #selector(closeTapped))
+        // Council #7: a CALM close — borderless glyph like every hover ✕ in
+        // the app, not a bezeled button competing with the nav arrows.
+        closeButton.isBordered = false
+        closeButton.image = NSImage(systemSymbolName: "xmark",
+                                    accessibilityDescription: "Close")?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
+        closeButton.contentTintColor = .secondaryLabelColor
 
         let stack = NSStackView(views: [searchField, countLabel, caseButton, regexButton,
                                         previousButton, nextButton, closeButton])
@@ -107,16 +120,24 @@ final class PaneFindBar: NSVisualEffectView, NSSearchFieldDelegate {
         ])
     }
 
-    private func configureButton(_ button: NSButton, symbol: String, tooltip: String,
+    private func configureButton(_ button: NSButton, symbol: String?, tooltip: String,
                                  action: Selector) {
         button.bezelStyle = .texturedRounded
         button.setButtonType(.momentaryPushIn)
         button.controlSize = .small
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
+        if let symbol {
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
+        }
         button.toolTip = tooltip
         button.target = self
         button.action = action
     }
+
+    // MEMTERM_UI_PROBE accessors (council #7 gate).
+    var probeMatchText: String { countLabel.stringValue }
+    var probeRegexTitle: String { regexButton.title }
+    var probeRegexTooltip: String { regexButton.toolTip ?? "" }
+    var probeCloseIsBorderless: Bool { !closeButton.isBordered }
 
     @objc private func previousTapped() { onPrevious?() }
     @objc private func nextTapped() { onNext?() }
@@ -174,6 +195,23 @@ extension PaneView {
     /// equivalents fire before the field editor sees the keystroke).
     func findNextMatch() { stepMatch(forward: true) }
     func findPreviousMatch() { stepMatch(forward: false) }
+
+    /// ⌘E (council #6): seed the find term from the selection WITHOUT
+    /// opening the bar — macOS find-pasteboard semantics. ⌘F/⌘G pick the
+    /// term up; if the bar is already visible the search re-runs live.
+    func useSelectionForFind() {
+        guard let term = FindSupport.prefillTerm(fromSelection: getSelection()) else { return }
+        let created = findBar == nil
+        let bar = findBar ?? installFindBar()
+        if created { bar.isHidden = true }
+        bar.searchText = term
+        if !bar.isHidden { findBarSearchChanged(term) }
+    }
+
+    /// Menu validation for ⌘E: a compact single-line selection exists.
+    var hasFindableSelection: Bool {
+        FindSupport.prefillTerm(fromSelection: getSelection()) != nil
+    }
 
     private func stepMatch(forward: Bool) {
         guard let bar = findBar, !bar.searchText.isEmpty else { return }

@@ -38,6 +38,33 @@ public enum ChromeContrast {
         return relativeLuminance(bg) > 0.5
     }
 
+    /// Council #8: split dividers must stay visible on EVERY theme ground —
+    /// the founder bug was near-invisible dividers in dark themes, where the
+    /// system separator color sits within noise of the terminal background.
+    /// The floor matches the probe's rendered chip floor: comfortably above
+    /// AA/pixel noise, below "drawing attention to itself".
+    public static let minimumDividerContrast = 1.6
+
+    /// A divider gray derived FROM the theme background with the contrast
+    /// floor guaranteed: the minimal blend of white (over a dark ground) or
+    /// black (over a light ground) that clears `minimumDividerContrast`.
+    /// nil theme = memterm's default near-black ground.
+    public static func dividerColor(themeBackground: ConfigRGB?) -> ConfigRGB {
+        let bg = themeBackground ?? ConfigRGB(red: 0, green: 0, blue: 0)
+        let toward = relativeLuminance(bg) > 0.5
+            ? ConfigRGB(red: 0, green: 0, blue: 0)
+            : ConfigRGB(red: 255, green: 255, blue: 255)
+        var candidate = bg
+        // Walk alpha up in fine steps until the floor holds (monotone in
+        // alpha, so the first pass is the minimal visible divider).
+        var alpha = 0.0
+        while contrastRatio(candidate, bg) < minimumDividerContrast, alpha < 1.0 {
+            alpha += 0.02
+            candidate = composite(toward, over: bg, alpha: alpha)
+        }
+        return candidate
+    }
+
     /// `a` composited over `b` at `alpha` (simple source-over, per channel).
     public static func composite(_ a: ConfigRGB, over b: ConfigRGB,
                                  alpha: Double) -> ConfigRGB {

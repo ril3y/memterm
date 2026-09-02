@@ -570,7 +570,10 @@ extension MemtermAppDelegate {
                 }
             }))
 
-        // Settings 2.0: the sectioned window must construct and load.
+        // Settings 2.0: the sectioned window must construct and load — and
+        // (council #5) size PER SECTION at a fixed 560pt width: the Memory
+        // path middle-truncates instead of stretching the window, and
+        // switching sections resizes instead of staying stretched.
         probe.add(ProbeStep(
             name: "settings-window-builds",
             assert: { [self] in
@@ -578,6 +581,27 @@ extension MemtermAppDelegate {
                 print("UIPROBE-SETTINGS built=\(settings.window != nil)")
                 guard settings.window != nil else {
                     throw ProbeFailure("settings window did not build")
+                }
+                var heights: [String: CGFloat] = [:]
+                for section in ["General", "Appearance", "Terminal", "Memory"] {
+                    settings.probeSelectSection(section)
+                    let size = settings.probeContentSize
+                    heights[section] = size.height
+                    guard abs(size.width - 560) <= 0.5 else {
+                        throw ProbeFailure("\(section) section stretched the window to \(size.width)pt wide")
+                    }
+                }
+                let distinct = Set(heights.values.map { Int($0.rounded()) })
+                print("UIPROBE-SETTINGS heights=\(heights.mapValues { Int($0) }) per_section=\(distinct.count > 1) path_truncates=\(settings.probeDiskUsageTruncatesMiddle) opacity_readout=\(settings.probeOpacityReadout)")
+                guard distinct.count > 1 else {
+                    throw ProbeFailure("window height identical across sections — not sizing per section")
+                }
+                guard settings.probeDiskUsageTruncatesMiddle else {
+                    throw ProbeFailure("state-dir path does not middle-truncate")
+                }
+                guard settings.probeOpacityReadout.range(
+                    of: #"^([0-9]+%|Opaque)$"#, options: .regularExpression) != nil else {
+                    throw ProbeFailure("transparency readout reads \"\(settings.probeOpacityReadout)\"")
                 }
             }))
 
@@ -825,6 +849,7 @@ extension MemtermAppDelegate {
         }
 
         addChromeCoherenceSteps(probe)
+        addCouncilStage2Steps(probe)
         addWorkspaceSheetSteps(probe)
         addClosePaneSteps(probe, mode: mode)
         addScrollUXSteps(probe)
@@ -943,6 +968,267 @@ extension MemtermAppDelegate {
                 print("UIPROBE-INSET root=\(Int(f.minX)),\(Int(f.minY)),\(Int(f.width))x\(Int(f.height)) container=\(Int(tab.paneRoot.bounds.width))x\(Int(tab.paneRoot.bounds.height)) off_by=\(String(format: "%.1f", offBy))")
                 guard offBy <= 1.5 else {
                     throw ProbeFailure("pane tree not inset \(Int(SplitLayout.contentInset))pt from the container (off by \(offBy))")
+                }
+            }))
+    }
+
+    // -----------------------------------------------------------------
+    // Council stage 2 (2026-09-02): the seven detail items, gated where
+    // each one's truth lives — layout math mirrored by the strip (#4),
+    // menu structure + validation (#6), the find bar's counter and calm
+    // affordances (#7), the theme-derived divider on rendered pixels
+    // (#8), and the chips-below-pills visual hierarchy (#10).
+    // -----------------------------------------------------------------
+    // swiftlint:disable:next function_body_length
+    private func addCouncilStage2Steps(_ probe: ProbeRunner) {
+
+        // #4: tabs use the strip width — the strip's presented widths obey
+        // TabStripLayout (360pt cap), and a long host:path title truncates
+        // in the MIDDLE, keeping the leaf visible.
+        probe.addStateful(ProbeStep(
+            name: "tab-width-and-truncation",
+            assert: { [self] in
+                guard let host = keyHost(), let strip = host.tabStrip,
+                      let selected = host.selectedTab else {
+                    throw ProbeFailure("no strip (tab-width leg)")
+                }
+                strip.layoutSubtreeIfNeeded()
+                let ids = strip.probeTabIds()
+                guard let firstId = ids.first,
+                      let frame = strip.probeItemFrame(of: firstId) else {
+                    throw ProbeFailure("no strip items (tab-width leg)")
+                }
+                guard frame.width <= CGFloat(TabStripLayout.maxTabWidth) + 0.5 else {
+                    throw ProbeFailure("tab width \(frame.width) exceeds the \(TabStripLayout.maxTabWidth)pt cap")
+                }
+                // With few tabs in a ~980pt window the tabs must actually USE
+                // the room — wider than the old 220 cap.
+                if ids.count <= 2, strip.bounds.width >= 800 {
+                    guard frame.width > 220 else {
+                        throw ProbeFailure("tab width \(frame.width) stuck at the old 220 cap with room to grow")
+                    }
+                }
+                let longTitle = "user@buildhost:/very/deep/project/tree/memterm/Sources/memterm"
+                selected.customTitle = longTitle
+                let lineBreak = strip.probeLabelLineBreak(of: selected.tabId)
+                selected.customTitle = nil
+                print("UIPROBE-TABWIDTH width=\(Int(frame.width)) cap=\(Int(TabStripLayout.maxTabWidth)) tabs=\(ids.count) middle_truncates=\(lineBreak == .byTruncatingMiddle)")
+                guard lineBreak == .byTruncatingMiddle else {
+                    throw ProbeFailure("long titles do not middle-truncate")
+                }
+            }))
+
+        // #6: menu hygiene — structure (Services, Help, Actual Size, Enter
+        // Full Screen, Use Selection for Find) and honest validation (⌘1–9
+        // against the tab count, Close Pane/Tab dynamic title).
+        probe.add(ProbeStep(
+            name: "menu-hygiene",
+            assert: { [self] in
+                guard let main = NSApp.mainMenu else { throw ProbeFailure("no main menu") }
+                func item(_ menuTitle: String, _ itemTitle: String) -> NSMenuItem? {
+                    main.items.first { $0.title == menuTitle }?.submenu?.items
+                        .first { $0.title == itemTitle }
+                }
+                guard NSApp.servicesMenu != nil,
+                      item("memterm", "Services")?.submenu === NSApp.servicesMenu else {
+                    throw ProbeFailure("Services submenu missing/unregistered")
+                }
+                guard let help = NSApp.helpMenu,
+                      help.items.contains(where: { $0.title == "memterm README" }),
+                      help.items.contains(where: { $0.title == "About memterm" }) else {
+                    throw ProbeFailure("Help menu (About + README) missing")
+                }
+                guard let actual = item("View", "Actual Size"),
+                      actual.keyEquivalent == "0",
+                      actual.action == #selector(resetFontSize(_:)) else {
+                    throw ProbeFailure("View ▸ Actual Size (⌘0) missing")
+                }
+                let viewItems = main.items.first { $0.title == "View" }?.submenu?.items ?? []
+                let fsItems = viewItems.filter {
+                    $0.action == #selector(NSWindow.toggleFullScreen(_:))
+                }
+                // AppKit adopts the item: it hides our ⌃⌘F declaration and
+                // manages the platform-current shortcut pair itself
+                // (live-verified: visible Globe-F + hidden variants). One
+                // VISIBLE item is the no-duplicate-affordances contract.
+                let visibleFS = fsItems.filter { !$0.isHidden }
+                guard !fsItems.isEmpty, visibleFS.count == 1 else {
+                    throw ProbeFailure("View ▸ Enter Full Screen: \(visibleFS.count) visible of \(fsItems.count) item(s) — want exactly one visible")
+                }
+                guard let find = item("Edit", "Find")?.submenu?.items
+                        .first(where: { $0.title == "Use Selection for Find" }),
+                      find.keyEquivalent == "e" else {
+                    throw ProbeFailure("Edit ▸ Find ▸ Use Selection for Find (⌘E) missing")
+                }
+                // Validation half — driven through the REAL validateMenuItem.
+                let tabCount = keyHost()?.tabs.count ?? 0
+                func tabItem(_ tag: Int) -> NSMenuItem {
+                    let it = NSMenuItem(title: "Tab \(tag)",
+                                        action: #selector(selectTab(_:)), keyEquivalent: "")
+                    it.tag = tag
+                    return it
+                }
+                let inRange = tabCount < 1 || validateMenuItem(tabItem(1))
+                // The first ⌘n beyond the tab count must validate OFF
+                // (only meaningful while a Tab-n item exists for it, n ≤ 8).
+                let outValid = tabCount + 1 <= 8
+                    ? validateMenuItem(tabItem(tabCount + 1)) : false
+                let lastTab = validateMenuItem(tabItem(9))
+                let closeItem = NSMenuItem(title: "Close Tab",
+                                           action: #selector(closePane(_:)), keyEquivalent: "")
+                _ = validateMenuItem(closeItem)
+                let expectedClose = (keyController()?.allPanes().count ?? 1) > 1
+                    ? "Close Pane" : "Close Tab"
+                print("UIPROBE-MENU tabs=\(tabCount) in_range=\(inRange) beyond_count_valid=\(outValid) last_tab=\(lastTab) close_title=\(closeItem.title) expected=\(expectedClose)")
+                guard inRange, !outValid, lastTab == (tabCount > 1),
+                      closeItem.title == expectedClose else {
+                    throw ProbeFailure("menu validation dishonest (tabs=\(tabCount) in=\(inRange) beyond=\(outValid) last=\(lastTab) close=\(closeItem.title))")
+                }
+            }))
+
+        // #7: the find bar counts honestly ("N of M"), closes calmly
+        // (borderless ✕), and the regex toggle says what it is (".*").
+        var findPane: PaneView?
+        probe.addStateful(ProbeStep(
+            name: "find-bar-count", timeout: 10,
+            action: { [self] in
+                guard let pane = keyController()?.currentPane() else {
+                    probeFail("no pane (find-bar leg)")
+                }
+                findPane = pane
+                pane.feed(text: "needle one needle two needle\r\n")
+                pane.openFindBar()
+                pane.findBar?.searchText = "needle"
+                pane.findBarSearchChanged("needle")
+            },
+            condition: {
+                // Re-run until the fed bytes are through the terminal parser.
+                guard let pane = findPane, let bar = pane.findBar else { return false }
+                if bar.probeMatchText.contains(" of ") { return true }
+                pane.findBarSearchChanged("needle")
+                return false
+            },
+            assert: { [self] in
+                guard let pane = findPane, let bar = pane.findBar else {
+                    throw ProbeFailure("find bar vanished")
+                }
+                let label = bar.probeMatchText
+                let shape = label.range(of: #"^[0-9]+ of [0-9]+\+?$"#,
+                                        options: .regularExpression) != nil
+                print("UIPROBE-FIND label=\"\(label)\" shape_ok=\(shape) regex_glyph=\"\(bar.probeRegexTitle)\" close_borderless=\(bar.probeCloseIsBorderless)")
+                guard shape else {
+                    throw ProbeFailure("match counter reads \"\(label)\", not \"N of M\"")
+                }
+                guard bar.probeRegexTitle == ".*",
+                      bar.probeRegexTooltip == "Regular Expression" else {
+                    throw ProbeFailure("regex toggle glyph/tooltip wrong (\(bar.probeRegexTitle) / \(bar.probeRegexTooltip))")
+                }
+                guard bar.probeCloseIsBorderless else {
+                    throw ProbeFailure("find-bar close is still a bezeled button")
+                }
+                pane.closeFindBar()
+                guard keyHost()?.window?.firstResponder === pane else {
+                    throw ProbeFailure("closing the find bar did not return focus to the pane")
+                }
+            }))
+
+        // #8: the split divider is VISIBLE on this config's theme ground —
+        // model half (the derived color clears the L2 floor) and rendered
+        // half (the divider's pixels contrast against the pane ground).
+        // verify.sh runs this across the matrix — the dark variant is the
+        // world the founder bug lived in.
+        var dividerPane: PaneView?
+        probe.addStateful(ProbeStep(
+            name: "divider-theme-contrast", timeout: 12,
+            action: { [self] in
+                guard let controller = keyController() else {
+                    probeFail("no controller (divider leg)")
+                }
+                let before = controller.allPanes()
+                controller.splitCurrentPane(vertical: true)
+                dividerPane = controller.allPanes().first { pane in
+                    !before.contains { $0 === pane }
+                }
+            },
+            condition: { dividerPane?.process?.running == true },
+            assert: { [self] in
+                guard let controller = keyController(),
+                      let split = controller.allSplitViews().first,
+                      split.arrangedSubviews.count == 2 else {
+                    throw ProbeFailure("no split (divider leg)")
+                }
+                let themeBg = config.themeBackgroundColor ?? .black
+                let modelRatio = contrastRatio(split.themeDividerColor, themeBg)
+                split.window?.contentView?.layoutSubtreeIfNeeded()
+                guard let bmp = probeBitmap(split) else {
+                    throw ProbeFailure("split produced no bitmap")
+                }
+                let a = split.arrangedSubviews[0].frame
+                let b = split.arrangedSubviews[1].frame
+                let dividerRect = CGRect(x: a.maxX, y: split.bounds.midY - 40,
+                                         width: max(1, b.minX - a.maxX), height: 80)
+                guard let rendered = probeDominantColor(bmp, region: dividerRect) else {
+                    throw ProbeFailure("no divider samples at \(dividerRect)")
+                }
+                let renderedRatio = contrastRatio(rendered, themeBg)
+                print("UIPROBE-DIVIDER model_ratio=\(String(format: "%.2f", modelRatio)) rendered_ratio=\(String(format: "%.2f", renderedRatio)) floor=\(ChromeContrast.minimumDividerContrast)")
+                guard modelRatio >= ChromeContrast.minimumDividerContrast - 0.01 else {
+                    throw ProbeFailure("divider color contrast \(modelRatio) below the L2 floor")
+                }
+                // Rendered floor is looser (AA + sampling), same idea as the
+                // chip gate's 1.6-vs-3.0 split.
+                guard renderedRatio >= 1.3 else {
+                    probeScreenshot(split, name: "divider-contrast-fail")
+                    throw ProbeFailure("rendered divider contrast \(renderedRatio) — invisible on this theme")
+                }
+                // Restore the world for the legs after us.
+                if let pane = dividerPane { controller.close(pane: pane) }
+                // The unwrap must hand the survivor back to frame layout
+                // (the replace() translates fix this leg caught).
+                guard controller.allPanes().allSatisfy({
+                    $0.superview is NSSplitView
+                        || $0.translatesAutoresizingMaskIntoConstraints
+                }) else {
+                    throw ProbeFailure("unwrapped pane left constraint-driven — the 378x0 collapse class")
+                }
+            }))
+
+        // #10: chips sit one visual level below the tab pills (smaller type,
+        // smaller pill), and the gear/+ trailing cluster is aligned.
+        probe.add(ProbeStep(
+            name: "chip-pill-hierarchy",
+            assert: { [self] in
+                guard let host = keyHost(), let strip = host.tabStrip,
+                      let selectedId = host.selectedTab?.tabId else {
+                    throw ProbeFailure("no strip (hierarchy leg)")
+                }
+                guard config.workspaceBar else {
+                    probe.skipLine(step: "chip-pill-hierarchy",
+                                   reason: "workspace_bar=false")
+                    return
+                }
+                guard let bar = host.workspaceBar,
+                      let chip = bar.probeChipView(activeWorkspaceId),
+                      let tabFont = strip.probeLabelFontSize(of: selectedId),
+                      let tabFrame = strip.probeItemFrame(of: selectedId) else {
+                    throw ProbeFailure("no chip/tab to compare")
+                }
+                let chipFont = chip.probeLabelFontSize
+                let smaller = chipFont < tabFont && chip.frame.height < tabFrame.height
+                var aligned = true
+                var gearMid = CGFloat(-1), plusMid = CGFloat(-1)
+                if let gear = host.gearFrameInWindow(),
+                   let plus = strip.probePlusFrameInWindow() {
+                    gearMid = gear.midX
+                    plusMid = plus.midX
+                    aligned = abs(gearMid - plusMid) <= 0.5
+                }
+                print("UIPROBE-HIERARCHY chip_font=\(chipFont) tab_font=\(tabFont) chip_h=\(chip.frame.height) tab_h=\(tabFrame.height) gear_mid=\(gearMid) plus_mid=\(plusMid) aligned=\(aligned)")
+                guard smaller else {
+                    throw ProbeFailure("chips do not read below the tab pills (chip \(chipFont)pt/\(chip.frame.height)pt vs tab \(tabFont)pt/\(tabFrame.height)pt)")
+                }
+                guard aligned else {
+                    throw ProbeFailure("gear/+ cluster misaligned: gear midX \(gearMid) vs plus midX \(plusMid)")
                 }
             }))
     }

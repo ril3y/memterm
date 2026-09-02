@@ -9,6 +9,19 @@ final class TabStripLayoutTests: XCTestCase {
         XCTAssertFalse(layout.needsScroll)
     }
 
+    // Council #4: tabs use the strip width — the cap sits at 360pt so long
+    // host:path titles get room without a lone tab spanning a huge window.
+    func testMaxWidthIsTheCouncilCap() {
+        XCTAssertEqual(TabStripLayout.maxTabWidth, 360)
+        // Two tabs in a wide strip both grow past the old 220 cap…
+        let two = TabStripLayout(available: 900, count: 2)
+        XCTAssertEqual(two.tabWidth, 360)
+        // …and share equally below it.
+        let squeezed = TabStripLayout(available: 500, count: 2)
+        XCTAssertEqual(squeezed.tabWidth, (500 - TabStripLayout.tabGap) / 2,
+                       accuracy: 0.001)
+    }
+
     func testTabsShareWidthEqually() {
         let layout = TabStripLayout(available: 600, count: 4)
         let gaps = 3 * TabStripLayout.tabGap

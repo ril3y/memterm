@@ -7,15 +7,18 @@ import Foundation
 
 public enum FindSupport {
 
-    /// Label for the find bar's match counter. The engine caps its match scan
-    /// at `limit`, so a saturated total renders as "1000+". `index` is 1-based;
-    /// 0 means matches exist but none is current (e.g. the buffer scrolled on
-    /// under live output since the last jump).
+    /// Label for the find bar's match counter — "N of M" (council #7: the
+    /// bare "N/M" read as a fraction, not a position). The engine caps its
+    /// match scan at `limit`, so a saturated total renders as "1000+".
+    /// `index` is 1-based; 0 means matches exist but none is current (e.g.
+    /// the buffer scrolled on under live output since the last jump).
     public static func matchCountLabel(index: Int, total: Int, limit: Int = 1000) -> String {
         guard total > 0 else { return "no matches" }
         let totalText = total >= limit ? "\(limit)+" : "\(total)"
-        guard index > 0 else { return totalText }
-        return "\(index)/\(totalText)"
+        guard index > 0 else {
+            return total == 1 ? "1 match" : "\(totalText) matches"
+        }
+        return "\(index) of \(totalText)"
     }
 
     /// The term ⌘F seeds the find field with from the current selection.

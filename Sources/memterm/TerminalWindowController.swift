@@ -539,7 +539,8 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         case .pane(let id):
             return makeRestoredPane(frame: frame, id: id, restore: panes[id])
         case .split(let vertical, let ratio, let first, let second):
-            let split = NSSplitView(frame: frame)
+            let split = ThemedSplitView(frame: frame)
+            split.themeDividerColor = ThemedSplitView.resolvedDividerColor(app.config)
             split.isVertical = vertical
             split.dividerStyle = .thin
             split.autoresizingMask = [.width, .height]
@@ -678,6 +679,19 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         return result
     }
 
+    /// Every split in this tab's tree (council #8: divider re-theming, and
+    /// the probe's divider-contrast leg).
+    func allSplitViews() -> [ThemedSplitView] {
+        var result: [ThemedSplitView] = []
+        func walk(_ view: NSView) {
+            if let split = view as? ThemedSplitView { result.append(split) }
+            if view is PaneView { return }
+            view.subviews.forEach(walk)
+        }
+        walk(paneRoot)
+        return result
+    }
+
     /// MEMTERM_UI_PROBE diagnostics: one-line-per-node dump of the pane tree
     /// (type, frame, hidden, window attachment) — the close-pane leg prints
     /// it so a "blanked tab" failure shows the surviving hierarchy.
@@ -732,7 +746,8 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         let inherited = pane.lastKnownCwd ?? pane.currentLocalDirectory
         let newPane = makePane(frame: oldFrame,
                                cwd: inherited.map { CwdFallback.resolve($0).path })
-        let split = NSSplitView(frame: oldFrame)
+        let split = ThemedSplitView(frame: oldFrame)
+        split.themeDividerColor = ThemedSplitView.resolvedDividerColor(app.config)
         split.isVertical = vertical  // vertical divider = panes side by side
         split.dividerStyle = .thin
         split.autoresizingMask = [.width, .height]
@@ -805,6 +820,14 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             old.removeFromSuperview()
             parentSplit.insertArrangedSubview(new, at: idx)
         } else {
+            // REAL BUG (probe-caught by the council-#8 divider leg, 2026-09-02):
+            // NSSplitView flips arranged subviews to constraint-based layout
+            // (translatesAutoresizingMaskIntoConstraints = false). A pane
+            // unwrapped back into the frame/autoresizing world must flip BACK,
+            // or any internal constraints it carries (the ⌘F find bar's) size
+            // the PANE at the next layout pass — probe-observed as a 962x566
+            // pane collapsing to 378x0 the moment a sheet opened.
+            new.translatesAutoresizingMaskIntoConstraints = true
             parent.replaceSubview(old, with: new)
         }
     }
@@ -850,6 +873,11 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
     /// WindowHostController.applyWindowChrome.) Explicit defaults are pushed
     /// when the theme is cleared so panes don't keep stale colors.
     func applyTheme(_ config: Config) {
+        // Council #8: dividers follow the theme live, same floor as at build.
+        let dividerColor = ThemedSplitView.resolvedDividerColor(config)
+        for split in allSplitViews() {
+            split.themeDividerColor = dividerColor
+        }
         let opaque = config.isWindowOpaque
         let opacity = config.effectiveOpacity
         let bg = config.themeBackgroundColor ?? .black
@@ -955,6 +983,30 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         guard let pane = source as? PaneView else { return }
         close(pane: pane)
+    }
+}
+
+/// Council #8: a split view whose divider color derives from the THEME with
+/// a contrast floor (ChromeContrast.dividerColor, L2-tested) — the system
+/// separator vanished into dark terminal backgrounds. The color is pushed at
+/// construction and again by applyTheme on every live theme change.
+final class ThemedSplitView: NSSplitView {
+    var themeDividerColor: NSColor = .separatorColor {
+        didSet { needsDisplay = true }
+    }
+
+    override var dividerColor: NSColor { themeDividerColor }
+
+    /// Deterministic divider paint: AppKit's .thin divider drawing skipped
+    /// our color on this macOS (probe-verified: divider pixels sampled
+    /// identical to the pane ground) — fill the divider rect explicitly.
+    override func drawDivider(in rect: NSRect) {
+        themeDividerColor.setFill()
+        rect.fill()
+    }
+
+    static func resolvedDividerColor(_ config: Config) -> NSColor {
+        ChromeContrast.dividerColor(themeBackground: config.themeBackground).nsColor
     }
 }
 

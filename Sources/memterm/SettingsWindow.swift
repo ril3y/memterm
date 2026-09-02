@@ -10,8 +10,10 @@ import UniformTypeIdentifiers
 // (Config.save), which stays the on-disk source of truth. Scrollback and
 // shell can only affect panes created after the change; the captions say so.
 
-final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate,
+                                      NSTabViewDelegate {
     private unowned let app: MemtermAppDelegate
+    private let tabView = NSTabView()
 
     // General
     private let sameCwdCheck = NSButton(checkboxWithTitle: "New tabs open in the current directory", target: nil, action: nil)
@@ -33,6 +35,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let selectionWell = NSColorWell()
     private var ansiWells: [NSColorWell] = (0..<16).map { _ in NSColorWell() }
     private let opacitySlider = NSSlider()
+    private let opacityLabel = NSTextField(labelWithString: "")
     private let blurCheck = NSButton(checkboxWithTitle: "Blur what's behind the window", target: nil, action: nil)
 
     // Terminal
@@ -74,6 +77,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.delegate = self
         buildForm()
         loadValues()
+        sizeToFitSection(animate: false)
         window.center()
     }
 
@@ -231,9 +235,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 .font = NSFont.systemFont(ofSize: 10)
         }
 
-        let opacityRow = NSStackView(views: [caption("30%"), opacitySlider, caption("Opaque")])
+        // Council #11: a LIVE readout — the slider says what it is set to,
+        // not just its endpoints ("Opaque" at 100%, "NN%" below).
+        let opacityRow = NSStackView(views: [caption("30%"), opacitySlider, opacityLabel])
         opacityRow.orientation = .horizontal
         opacitySlider.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        opacityLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        opacityLabel.textColor = .secondaryLabelColor
+        opacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
 
         let resetColors = NSButton(title: "Use Default Colors", target: self,
                                    action: #selector(resetColorsAction))
@@ -266,7 +275,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSGridCell.emptyContentView, caption("Per-tab ↑ history, prompt marks, and directory tracking, injected at spawn — no dotfile edits. Applies to new panes; zsh only for now.")],
             [label("Serial line ending:"), serialLineEndingPopUp],
             [NSGridCell.emptyContentView, serialEchoCheck],
-            [NSGridCell.emptyContentView, caption("Defaults for Shell ▸ New Serial Connection…. Each device remembers what you last used with it.")],
+            [NSGridCell.emptyContentView, caption("Defaults for Shell ▸ New Serial Connection. Each device remembers what you last used with it.")],
         ])
 
         // -- Memory --
@@ -278,6 +287,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         usageRow.orientation = .horizontal
         diskUsageLabel.font = NSFont.systemFont(ofSize: 12)
         diskUsageLabel.textColor = .secondaryLabelColor
+        // Council #5: a deep state-dir path truncates in the MIDDLE (the
+        // interesting parts are the ends) instead of stretching the window;
+        // the tooltip carries the full path.
+        diskUsageLabel.lineBreakMode = .byTruncatingMiddle
+        diskUsageLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        diskUsageLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 330).isActive = true
 
         let forget = NSButton(title: "Forget Everything…", target: self,
                               action: #selector(forgetEverythingAction))
@@ -295,11 +310,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ])
         scrollbackField.widthAnchor.constraint(equalToConstant: 90).isActive = true
 
-        let tabView = NSTabView()
         tabView.addTabViewItem(general)
         tabView.addTabViewItem(appearance)
         tabView.addTabViewItem(terminal)
         tabView.addTabViewItem(memory)
+        tabView.delegate = self
         tabView.translatesAutoresizingMaskIntoConstraints = false
 
         let content = NSView()
@@ -313,6 +328,48 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window?.contentView = content
         window?.setContentSize(NSSize(width: 560, height: 480))
     }
+
+    // MARK: - Per-section sizing (council #5)
+
+    /// Native Settings behavior: the window is as tall as the SELECTED
+    /// section needs — never stuck at the tallest section's height, top edge
+    /// pinned across switches. Width stays fixed (560): nothing may stretch
+    /// it, which is what keeps a deep state-dir path truncating instead.
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        sizeToFitSection(animate: true)
+    }
+
+    private func sizeToFitSection(animate: Bool) {
+        guard let window, let view = tabView.selectedTabViewItem?.view else { return }
+        window.contentView?.layoutSubtreeIfNeeded()
+        view.layoutSubtreeIfNeeded()
+        // Constant chrome around the section: tab control + outer margins.
+        let chrome = (window.contentView?.frame.height ?? 0) - tabView.contentRect.height
+        let target = NSRect(x: 0, y: 0, width: 560,
+                            height: view.fittingSize.height + chrome)
+        var frame = window.frameRect(forContentRect: target)
+        frame.origin.x = window.frame.origin.x
+        frame.origin.y = window.frame.maxY - frame.height  // keep the top edge
+        window.setFrame(frame, display: true, animate: animate && window.isVisible)
+    }
+
+    // MARK: - Probe accessors (MEMTERM_UI_PROBE, council #5 gate)
+
+    func probeSelectSection(_ label: String) {
+        guard let item = tabView.tabViewItems.first(where: { $0.label == label })
+        else { return }
+        tabView.selectTabViewItem(item)
+    }
+
+    var probeContentSize: NSSize {
+        window.map { $0.contentRect(forFrameRect: $0.frame).size } ?? .zero
+    }
+
+    var probeDiskUsageTruncatesMiddle: Bool {
+        diskUsageLabel.lineBreakMode == .byTruncatingMiddle
+    }
+
+    var probeOpacityReadout: String { opacityLabel.stringValue }
 
     // MARK: - Load
 
@@ -365,6 +422,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let palette = config.ansiColors ?? Config.defaultAnsiPalette
         for (well, color) in zip(ansiWells, palette) { well.color = color.nsColor }
         opacitySlider.doubleValue = config.windowOpacity
+        updateOpacityReadout(config.windowOpacity)
         blurCheck.state = config.windowBlur ? .on : .off
         blurCheck.isEnabled = !config.isWindowOpaque
 
@@ -416,6 +474,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                          blue: Int(round(c.blueComponent * 255)))
     }
 
+    /// Council #11: live "%" readout beside the transparency slider —
+    /// "Opaque" at 100 keeps the old endpoint's honesty.
+    private func updateOpacityReadout(_ opacity: Double) {
+        let pct = Int((opacity * 100).rounded())
+        opacityLabel.stringValue = pct >= 100 ? "Opaque" : "\(pct)%"
+    }
+
     @objc private func sizeStepped(_ sender: NSStepper) {
         sizeField.stringValue = String(sender.integerValue)
         controlChanged(sender)
@@ -442,6 +507,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         config.lineSpacing = (lineSpacingSlider.doubleValue * 100).rounded() / 100
         lineSpacingLabel.stringValue = String(format: "%.2f×", config.lineSpacing)
         config.windowOpacity = (opacitySlider.doubleValue * 100).rounded() / 100
+        updateOpacityReadout(config.windowOpacity)
         config.windowBlur = blurCheck.state == .on
         blurCheck.isEnabled = !config.isWindowOpaque
 
@@ -590,6 +656,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             let path = (dir.path as NSString).abbreviatingWithTildeInPath
             DispatchQueue.main.async {
                 self?.diskUsageLabel.stringValue = "\(size) · \(path)"
+                self?.diskUsageLabel.toolTip = dir.path  // full path on hover
             }
         }
     }

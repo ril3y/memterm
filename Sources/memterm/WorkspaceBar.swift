@@ -268,11 +268,12 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             // Pin the TEXT BASELINE, not the frame center: frame-centering
             // rode the glyphs high (font-box descender space is empty for
             // typical names, plus pixel rounding of the fractional frame) —
-            // founder screenshot 2026-09-01. 4.25pt below chip center
-            // (constants are positive-down) optically centers the size-11
-            // glyph band; the probe's chip-vertical-centering step gates the
-            // rendered result.
-            label.firstBaselineAnchor.constraint(equalTo: centerYAnchor, constant: 4.25),
+            // founder screenshot 2026-09-01. 3.85pt below chip center
+            // (constants are positive-down) optically centers the size-10
+            // glyph band (council #10 dropped the chips one size below the
+            // tab pills; 4.25 was the size-11 tuning, scaled 10/11); the
+            // probe's chip-vertical-centering step gates the rendered result.
+            label.firstBaselineAnchor.constraint(equalTo: centerYAnchor, constant: 3.85),
             label.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -338,6 +339,15 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     /// gate samples independently of the dot/background decorations.
     var probeLabelFrame: NSRect { label.frame }
 
+    /// Council #10 hierarchy gate: the chip label's rendered point size
+    /// (must sit BELOW the tab pills' size).
+    var probeLabelFontSize: CGFloat {
+        guard label.attributedStringValue.length > 0,
+              let font = label.attributedStringValue.attribute(
+                .font, at: 0, effectiveRange: nil) as? NSFont else { return 0 }
+        return font.pointSize
+    }
+
     func configure(name: String, color: NSColor, isActive: Bool, isParked: Bool,
                    activity: TabActivityState = .idle) {
         self.name = name
@@ -345,13 +355,16 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         self.isParked = isParked
         let dimmed = isParked && !isActive
         dotColor = dimmed ? color.withAlphaComponent(0.45) : color
+        // Council #10: chips sit one visual level BELOW the tab pills —
+        // size 10 vs the pills' 11, medium at heaviest — so the two rows
+        // read as workspace context over tab content, not two tab bars.
         let title = NSMutableAttributedString(
             string: name,
             attributes: [.foregroundColor: isActive ? NSColor.labelColor
                             : dimmed ? NSColor.tertiaryLabelColor
                             : NSColor.secondaryLabelColor,
-                         .font: NSFont.systemFont(ofSize: 11,
-                                                  weight: isActive ? .semibold : .medium)])
+                         .font: NSFont.systemFont(ofSize: 10,
+                                                  weight: isActive ? .medium : .regular)])
         if isParked {
             title.append(NSAttributedString(
                 string: "  (parked)",
@@ -363,8 +376,10 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         // the chrome follows the theme (council #2), which may disagree with
         // the app-wide appearance that .cgColor would otherwise snapshot.
         effectiveAppearance.performAsCurrentDrawingAppearance {
+            // 0.10 (vs the selected tab pill's 0.16): the active chip reads
+            // marked, the pill reads SELECTED — lighter up top (council #10).
             layer?.backgroundColor = isActive
-                ? NSColor.labelColor.withAlphaComponent(0.12).cgColor
+                ? NSColor.labelColor.withAlphaComponent(0.10).cgColor
                 : NSColor.clear.cgColor
         }
         // The active workspace's chip never indicates (the user is looking at
@@ -403,7 +418,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         layer?.backgroundColor = isActive
-            ? NSColor.labelColor.withAlphaComponent(0.12).cgColor
+            ? NSColor.labelColor.withAlphaComponent(0.10).cgColor
             : NSColor.clear.cgColor
         dot.layer?.backgroundColor = dotColor.cgColor
         ring.layer?.borderColor = dotColor.cgColor
@@ -458,7 +473,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     func beginRename() {
         guard editor == nil else { return }
         let field = NSTextField(string: name)
-        field.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        field.font = NSFont.systemFont(ofSize: 10, weight: .medium)
         field.isBordered = false
         field.focusRingType = .none
         field.drawsBackground = true

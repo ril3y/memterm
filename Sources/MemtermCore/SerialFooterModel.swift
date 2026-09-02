@@ -97,22 +97,25 @@ public struct SerialFooterModel: Equatable {
         return String(format: "%.1f %@", value, units[unit])
     }
 
-    // MARK: - Settings summary ("115200-8N1 · RTS/CTS", baud clickable)
+    // MARK: - Settings summary ("115200 8N1 · RTS/CTS", baud clickable)
 
     /// The clickable half: just the rate.
     public static func baudText(_ settings: SerialSettings) -> String {
         "\(settings.baud)"
     }
 
-    /// The static half after the baud control: "-8N1" plus the flow suffix
-    /// when flow control is on — together they read "115200-8N1 · RTS/CTS".
+    /// The static half after the baud control: "8N1" plus the flow suffix
+    /// when flow control is on — together they read "115200 8N1 · RTS/CTS".
+    /// (Council #11: the old "-8N1" rendered an orphan hyphen hanging off
+    /// the clickable baud; the journal's compact "115200-8N1" form is a
+    /// different string and unchanged.)
     public static func frameText(_ settings: SerialSettings) -> String {
-        let frame = "-\(settings.dataBits)\(settings.parity.rawValue)\(settings.stopBits)"
+        let frame = "\(settings.dataBits)\(settings.parity.rawValue)\(settings.stopBits)"
         guard let flow = flowLabel(settings.flow) else { return frame }
         return "\(frame) · \(flow)"
     }
 
-    /// Human flow-control label; nil for none (no suffix — "115200-8N1").
+    /// Human flow-control label; nil for none (no suffix — "115200 8N1").
     public static func flowLabel(_ flow: SerialSettings.FlowControl) -> String? {
         switch flow {
         case .none: return nil

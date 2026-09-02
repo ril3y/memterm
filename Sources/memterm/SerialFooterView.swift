@@ -147,7 +147,8 @@ final class SerialFooterView: NSVisualEffectView {
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 6
-        stack.setCustomSpacing(2, after: baudButton)
+        // "115200 8N1" — a thin space, no orphan hyphen (council #11).
+        stack.setCustomSpacing(3, after: baudButton)
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         NSLayoutConstraint.activate([
@@ -182,10 +183,13 @@ final class SerialFooterView: NSVisualEffectView {
             dot.toolTip = "Not connected"
         }
         portLabel.stringValue = portName
+        // Council #11: blue is reserved for actual TOGGLE STATE (the filled
+        // DTR/RTS chips). The baud is a click target, not a state — label
+        // color, medium weight, tooltip carries the affordance.
         baudButton.attributedTitle = NSAttributedString(
             string: SerialFooterModel.baudText(settings),
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
-                         .foregroundColor: NSColor.controlAccentColor])
+                         .foregroundColor: NSColor.labelColor])
         frameLabel.stringValue = SerialFooterModel.frameText(settings)
         hexBadge.isHidden = !hexOn
         // Chips only where the device HAS modem lines and the port is open —

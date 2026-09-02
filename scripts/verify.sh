@@ -176,6 +176,7 @@ probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
 check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-contrast-rendered reason=workspace_bar=false"
 check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"
 check "matrix-nobar-skips-chipclick" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-click-rename-gate reason=workspace_bar=false"
+check "matrix-nobar-skips-hierarchy" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-pill-hierarchy reason=workspace_bar=false"
 probe "matrix-light"   fresh "$CFGDIR/light.toml"
 probe "matrix-dark"    fresh "$CFGDIR/dark.toml"
 

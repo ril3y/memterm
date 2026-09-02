@@ -4,6 +4,10 @@ import AppKit
 // copy:/paste:/selectAll: only fire via the responder chain from menu items.
 
 func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
+    // We provide the Enter Full Screen item OURSELVES (council #6) — turn
+    // off AppKit's automatic insertion, which on this macOS stacks its own
+    // copies next to ours (live-verified: three identical items).
+    UserDefaults.standard.register(defaults: ["NSFullScreenMenuItemEverywhere": false])
     let main = NSMenu()
 
     func add(_ title: String, to menu: NSMenu, _ action: Selector?, _ key: String,
@@ -35,6 +39,13 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Forget Everything…", to: appMenu,
         #selector(MemtermAppDelegate.forgetEverythingAction(_:)), "", modifiers: [],
         target: app)
+    appMenu.addItem(.separator())
+    // Council #6 menu hygiene: the standard Services submenu (every native
+    // app has one; text selected in a pane feeds system services).
+    let servicesItem = appMenu.addItem(withTitle: "Services", action: nil, keyEquivalent: "")
+    let servicesMenu = NSMenu(title: "Services")
+    appMenu.setSubmenu(servicesMenu, for: servicesItem)
+    NSApp.servicesMenu = servicesMenu
     appMenu.addItem(.separator())
     add("Hide memterm", to: appMenu, #selector(NSApplication.hide(_:)), "h")
     add("Hide Others", to: appMenu, #selector(NSApplication.hideOtherApplications(_:)), "h",
@@ -76,7 +87,10 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Forget Tab Memory", to: shellMenu,
         #selector(MemtermAppDelegate.forgetTabMemory(_:)), "", modifiers: [], target: app)
     shellMenu.addItem(.separator())
-    add("Close Pane/Tab", to: shellMenu, #selector(MemtermAppDelegate.closePane(_:)), "w",
+    // Council #6: the title is DYNAMIC — "Close Pane" while the focused tab
+    // is split, "Close Tab" on its last pane (validateMenuItem retitles it;
+    // the slashed compound named neither action honestly).
+    add("Close Tab", to: shellMenu, #selector(MemtermAppDelegate.closePane(_:)), "w",
         target: app)
 
     // Edit — copy:/paste:/selectAll: resolve to the focused terminal view.
@@ -96,6 +110,10 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
         target: app)
     add("Find Previous", to: findMenu, #selector(MemtermAppDelegate.findPreviousInPane(_:)),
         "g", modifiers: [.command, .shift], target: app)
+    // Council #6: the standard ⌘E — the current selection becomes the find
+    // bar's term (validated against a usable single-line selection).
+    add("Use Selection for Find", to: findMenu,
+        #selector(MemtermAppDelegate.useSelectionForFind(_:)), "e", target: app)
 
     // View
     let viewMenu = submenu("View")
@@ -109,6 +127,10 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     biggerAlias.isHidden = true
     viewMenu.addItem(biggerAlias)
     add("Smaller", to: viewMenu, #selector(MemtermAppDelegate.decreaseFontSize(_:)), "-",
+        target: app)
+    // Council #6: ⌘0 resets the font to the configured size (Bigger/Smaller
+    // drifted with no way home short of Settings).
+    add("Actual Size", to: viewMenu, #selector(MemtermAppDelegate.resetFontSize(_:)), "0",
         target: app)
     viewMenu.addItem(.separator())
     add("Clear", to: viewMenu, #selector(MemtermAppDelegate.clearBuffer(_:)), "k", target: app)
@@ -131,6 +153,11 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
         up, modifiers: arrows, target: app)
     add("Focus Pane Down", to: viewMenu, #selector(MemtermAppDelegate.focusPaneDown(_:)),
         down, modifiers: arrows, target: app)
+    viewMenu.addItem(.separator())
+    // Council #6: the standard Enter Full Screen item (⌃⌘F). AppKit retitles
+    // it to "Exit Full Screen" while fullscreen — one item, honest both ways.
+    add("Enter Full Screen", to: viewMenu, #selector(NSWindow.toggleFullScreen(_:)), "f",
+        modifiers: [.control, .command])
 
     // Window — standard items plus our tab set (all actions target the app
     // delegate's custom-chrome tab plumbing, not NSWindow tab selectors).
@@ -191,6 +218,15 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     add("Bring All to Front", to: windowMenu, #selector(NSApplication.arrangeInFront(_:)),
         "", modifiers: [])
     NSApp.windowsMenu = windowMenu
+
+    // Help — council #6: About (its standard second home) and the README,
+    // which IS the manual for now (bundled into Resources by make-app.sh).
+    let helpMenu = submenu("Help")
+    add("About memterm", to: helpMenu,
+        #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "", modifiers: [])
+    add("memterm README", to: helpMenu, #selector(MemtermAppDelegate.openReadme(_:)),
+        "", modifiers: [], target: app)
+    NSApp.helpMenu = helpMenu
 
     return main
 }

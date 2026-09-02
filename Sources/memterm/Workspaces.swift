@@ -768,6 +768,23 @@ extension MemtermAppDelegate: NSMenuItemValidation {
             item.state = serial?.hexMode == true ? .on : .off
             return serial != nil
         }
+        // Council #6 menu hygiene: honest titles and honest enablement.
+        if item.action == #selector(closePane(_:)) {
+            // ⌘W closes the focused PANE of a split, the TAB otherwise —
+            // the title says which one THIS press would do.
+            item.title = (keyController()?.allPanes().count ?? 1) > 1
+                ? "Close Pane" : "Close Tab"
+            return keyController() != nil
+        }
+        if item.action == #selector(selectTab(_:)) {
+            // ⌘1–⌘8 only exist for tabs that exist; ⌘9 (Last Tab) needs a
+            // tab to jump to that isn't just "the only tab".
+            let count = keyHost()?.tabs.count ?? 0
+            return item.tag == 9 ? count > 1 : item.tag <= count
+        }
+        if item.action == #selector(useSelectionForFind(_:)) {
+            return keyController()?.currentPane()?.hasFindableSelection == true
+        }
         guard let store = memory?.store else { return true }
         switch item.action {
         case #selector(parkActiveWorkspaceAction(_:)):

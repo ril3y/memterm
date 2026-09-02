@@ -62,6 +62,40 @@ final class ChromeContrastTests: XCTestCase {
                        "no theme = the dark default palette = dark chrome")
     }
 
+    /// Council #8: the split divider color is DERIVED from the theme ground
+    /// with the contrast floor guaranteed — including the dark themes where
+    /// the system separator vanished into the terminal background.
+    func testDividerColorClearsFloorOnEveryGround() {
+        let grounds: [ConfigRGB?] = [
+            nil,                                  // default (near-black)
+            ConfigRGB(hex: "#000000")!,
+            ConfigRGB(hex: "#1d1f21")!,           // memterm dark
+            ConfigRGB(hex: "#002b36")!,           // solarized dark
+            ConfigRGB(hex: "#ffffff")!,
+            ConfigRGB(hex: "#fdf6e3")!,           // solarized light
+            ConfigRGB(hex: "#808080")!,           // worst case: mid gray
+        ]
+        for ground in grounds {
+            let divider = ChromeContrast.dividerColor(themeBackground: ground)
+            let bg = ground ?? ConfigRGB(red: 0, green: 0, blue: 0)
+            let ratio = ChromeContrast.contrastRatio(divider, bg)
+            XCTAssertGreaterThanOrEqual(
+                ratio, ChromeContrast.minimumDividerContrast,
+                "divider contrast \(ratio) below floor on \(String(describing: ground))")
+        }
+    }
+
+    func testDividerLightensDarkGroundsAndDarkensLightOnes() {
+        let dark = ConfigRGB(hex: "#1d1f21")!
+        let darkDivider = ChromeContrast.dividerColor(themeBackground: dark)
+        XCTAssertGreaterThan(ChromeContrast.relativeLuminance(darkDivider),
+                             ChromeContrast.relativeLuminance(dark))
+        let light = ConfigRGB(hex: "#fdf6e3")!
+        let lightDivider = ChromeContrast.dividerColor(themeBackground: light)
+        XCTAssertLessThan(ChromeContrast.relativeLuminance(lightDivider),
+                          ChromeContrast.relativeLuminance(light))
+    }
+
     func testCompositeEndpoints() {
         let white = ConfigRGB(red: 255, green: 255, blue: 255)
         XCTAssertEqual(ChromeContrast.composite(row, over: white, alpha: 1.0), row)

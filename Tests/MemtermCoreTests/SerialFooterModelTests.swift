@@ -117,18 +117,20 @@ final class SerialFooterModelTests: XCTestCase {
 
     // MARK: Settings summary
 
+    // Council #11: no orphan hyphen — the static half reads "8N1", so the
+    // footer composes "115200 8N1 · RTS/CTS" around the clickable baud.
     func testSummaryStringsSplitAtTheClickableBaud() {
-        let plain = SerialSettings()  // 115200-8N1, flow none
+        let plain = SerialSettings()  // 115200 8N1, flow none
         XCTAssertEqual(SerialFooterModel.baudText(plain), "115200")
-        XCTAssertEqual(SerialFooterModel.frameText(plain), "-8N1")
+        XCTAssertEqual(SerialFooterModel.frameText(plain), "8N1")
 
         let rtscts = SerialSettings(baud: 115200, flow: .rtscts)
-        XCTAssertEqual(SerialFooterModel.frameText(rtscts), "-8N1 · RTS/CTS")
+        XCTAssertEqual(SerialFooterModel.frameText(rtscts), "8N1 · RTS/CTS")
 
         let odd = SerialSettings(baud: 9600, dataBits: 7, parity: .even,
                                  stopBits: 2, flow: .xonxoff)
         XCTAssertEqual(SerialFooterModel.baudText(odd), "9600")
-        XCTAssertEqual(SerialFooterModel.frameText(odd), "-7E2 · XON/XOFF")
+        XCTAssertEqual(SerialFooterModel.frameText(odd), "7E2 · XON/XOFF")
     }
 
     func testFlowLabels() {

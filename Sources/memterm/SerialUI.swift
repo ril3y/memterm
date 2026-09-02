@@ -88,6 +88,12 @@ final class SerialConnectSheetController: NSObject {
         moreButton.action = #selector(toggleMore)
         moreButton.bezelStyle = .inline
         moreButton.controlSize = .small
+        // Council #11: a real disclosure chevron — the bare text button did
+        // not read as expandable.
+        moreButton.image = NSImage(systemSymbolName: "chevron.right",
+                                   accessibilityDescription: "Show more options")?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
+        moreButton.imagePosition = .imageLeading
 
         dataBitsPopUp.addItems(withTitles: ["5", "6", "7", "8"])
         dataBitsPopUp.selectItem(withTitle: "8")
@@ -214,7 +220,7 @@ final class SerialConnectSheetController: NSObject {
         selectLineEnding(profile.txLineEnding)
         echoCheck.state = profile.localEcho ? .on : .off
         if settings != SerialSettings(baud: settings.baud) {
-            grid?.row(at: 6).isHidden = false  // non-8N1 profile: show framing
+            setFramingRowVisible(true)  // non-8N1 profile: show framing
         }
     }
 
@@ -252,8 +258,21 @@ final class SerialConnectSheetController: NSObject {
 
     @objc private func toggleMore(_ sender: Any?) {
         guard let grid else { return }
-        grid.row(at: 6).isHidden = !grid.row(at: 6).isHidden
-        moreButton.title = grid.row(at: 6).isHidden ? "More Options" : "Fewer Options"
+        setFramingRowVisible(grid.row(at: 6).isHidden)
+    }
+
+    /// One place flips the disclosure (click AND the non-8N1-profile auto-
+    /// reveal) so the chevron, title, and sheet size never disagree.
+    private func setFramingRowVisible(_ visible: Bool) {
+        guard let grid else { return }
+        grid.row(at: 6).isHidden = !visible
+        moreButton.title = visible ? "Fewer Options" : "More Options"
+        moreButton.image = NSImage(
+            systemSymbolName: visible ? "chevron.down" : "chevron.right",
+            accessibilityDescription: visible ? "Show fewer options"
+                                              : "Show more options")?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
+        sheet.setContentSize(sheet.contentView?.fittingSize ?? sheet.frame.size)
     }
 
     /// Honest auto-baud: opens the port (this click is the consent), samples

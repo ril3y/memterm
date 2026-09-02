@@ -665,6 +665,29 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         for controller in controllers { controller.applyFont(font) }
     }
 
+    /// ⌘0 Actual Size (council #6): back to the CONFIGURED size — the same
+    /// home applyConfigLive resets to when Settings changes the font.
+    @objc func resetFontSize(_ sender: Any?) {
+        fontSize = CGFloat(config.fontSize)
+        let font = currentFont()
+        for controller in controllers { controller.applyFont(font) }
+    }
+
+    /// ⌘E (council #6): the pane's current selection becomes the find term —
+    /// silently, macOS-style (⌘F/⌘G pick it up; a visible bar re-runs live).
+    @objc func useSelectionForFind(_ sender: Any?) {
+        keyController()?.currentPane()?.useSelectionForFind()
+    }
+
+    /// Help ▸ memterm README — bundled into Contents/Resources by make-app.sh.
+    @objc func openReadme(_ sender: Any?) {
+        if let url = Bundle.main.url(forResource: "README", withExtension: "md") {
+            NSWorkspace.shared.open(url)
+        } else {
+            NSSound.beep()  // unbundled dev binary: no README resource
+        }
+    }
+
     @objc func clearBuffer(_ sender: Any?) {
         keyController()?.currentPane()?.clearScrollback()
     }

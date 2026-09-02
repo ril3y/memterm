@@ -51,6 +51,8 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
 cp "$REPO_ROOT/.build/release/memterm" "$APP_DIR/Contents/MacOS/memterm"
 cp "$REPO_ROOT/Assets/memterm.icns" "$APP_DIR/Contents/Resources/memterm.icns"
+# Help ▸ memterm README opens this bundled copy (council #6 menu hygiene).
+cp "$REPO_ROOT/README.md" "$APP_DIR/Contents/Resources/README.md"
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

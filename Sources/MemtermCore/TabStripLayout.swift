@@ -13,7 +13,10 @@ public struct TabStripLayout: Equatable {
     /// Narrowest a tab body may get before the strip scrolls instead.
     public static let minTabWidth: Double = 72
     /// Widest a tab body ever gets (a lone tab doesn't span a huge window).
-    public static let maxTabWidth: Double = 220
+    /// Council #4: tabs USE the strip — long host:path titles get room to
+    /// breathe when the strip has it, capped sensibly (the strip view
+    /// middle-truncates titles that still don't fit).
+    public static let maxTabWidth: Double = 360
     /// Gap between tab bodies.
     public static let tabGap: Double = 4
 

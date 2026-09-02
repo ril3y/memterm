@@ -472,6 +472,14 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         return tabStrip.convert(tabStrip.bounds, to: nil)
     }
 
+    /// Council #10 alignment gate: the bar-row gear's frame in WINDOW
+    /// coordinates (nil while the bar row is hidden — the strip shows its
+    /// own gear then).
+    func gearFrameInWindow() -> NSRect? {
+        guard !barRow.isHidden, gearButton.window === window else { return nil }
+        return gearButton.convert(gearButton.bounds, to: nil)
+    }
+
     // MARK: - NSWindowDelegate
 
     func windowDidBecomeKey(_ notification: Notification) {

@@ -146,7 +146,10 @@ final class TabStripView: NSVisualEffectView {
         super.layout()
         separator.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 1)
         let plusSize: CGFloat = 24
-        var trailingX = bounds.width - 6
+        // Council #10: the strip's "+" aligns with the bar row's gear above
+        // it (both 24pt wide, both trailing at -8) — one trailing cluster,
+        // not two slightly-off columns.
+        var trailingX = bounds.width - 8
         if showsGear {
             gearButton.frame = NSRect(x: trailingX - plusSize,
                                       y: (bounds.height - plusSize) / 2 + 0.5,
@@ -276,6 +279,23 @@ final class TabStripView: NSVisualEffectView {
         items.compactMap { $0.tab?.tabId }
     }
 
+    /// Council #10 alignment gate: the strip "+" frame in WINDOW coordinates
+    /// (compared against the bar row's gear).
+    func probePlusFrameInWindow() -> NSRect? {
+        guard plusButton.window != nil else { return nil }
+        return plusButton.convert(plusButton.bounds, to: nil)
+    }
+
+    /// Council #10 hierarchy gate: the rendered point size of a tab label.
+    func probeLabelFontSize(of tabId: String) -> CGFloat? {
+        items.first { $0.tab?.tabId == tabId }?.probeLabelFontSize
+    }
+
+    /// Council #4: how a too-long title truncates (middle, keeping the leaf).
+    func probeLabelLineBreak(of tabId: String) -> NSLineBreakMode? {
+        items.first { $0.tab?.tabId == tabId }?.probeLabelLineBreak
+    }
+
     /// The rendered BODY fill of a tab (whole-tab tint probe — the founder's
     /// ask is the tab body tinted, not a text attribute).
     func probeBodyColor(of tabId: String) -> CGColor? {
@@ -341,7 +361,9 @@ final class TabItemView: NSView {
         layer?.cornerRadius = 6
 
         label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        label.lineBreakMode = .byTruncatingTail
+        // Council #4: titles are host:path shaped — the interesting parts are
+        // the ends, so a too-long title loses its MIDDLE, never its leaf.
+        label.lineBreakMode = .byTruncatingMiddle
         label.alignment = .center
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
@@ -387,6 +409,8 @@ final class TabItemView: NSView {
 
     var probeLabelColor: NSColor? { label.textColor }
     var probeLabelFrame: NSRect { label.frame }
+    var probeLabelFontSize: CGFloat { label.font?.pointSize ?? 0 }
+    var probeLabelLineBreak: NSLineBreakMode { label.lineBreakMode }
 
     func configure(selected: Bool) {
         self.selected = selected
