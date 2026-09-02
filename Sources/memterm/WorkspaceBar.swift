@@ -189,6 +189,13 @@ final class WorkspaceBarView: NSVisualEffectView {
             return (id, chip.convert(chip.probeLabelFrame, to: self))
         }
     }
+
+    /// MEMTERM_UI_PROBE support (chip-click-rename-gate leg): the live chip
+    /// view for a workspace, so the probe can drive its REAL mouseDown with
+    /// synthesized single/double clicks (gesture-path fidelity).
+    func probeChipView(_ workspaceId: String) -> WorkspaceChipView? {
+        chipsById[workspaceId]
+    }
 }
 
 /// One workspace chip: color dot + name, rounded background when active,
@@ -491,6 +498,11 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             window.makeFirstResponder(nil)
         }
     }
+
+    /// MEMTERM_UI_PROBE support: whether the inline rename editor is up —
+    /// the chip-click-rename-gate leg asserts a synthesized single click on
+    /// the active chip leaves this false and a double click flips it true.
+    var probeIsEditing: Bool { editor != nil }
 
     /// MEMTERM_UI_PROBE diagnostics: the rename-commit focus handoff is the
     /// probe's flakiest contract — log every step of end-editing so a failed

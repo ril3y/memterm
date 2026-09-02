@@ -66,6 +66,14 @@ final class SerialPaneView: PaneView {
     /// the probe can drive the chip gesture end to end. nil in real use.
     var probeModemLinesStub: SerialModemLines?
 
+    /// Test seam (reconnect-keeps-counters leg): rebinds the device path
+    /// exactly as hotplugAttached does when /dev renumbers on return, so the
+    /// probe's second pty can stand in for a returning device before it
+    /// drives the same connect() every reconnect path funnels through.
+    func probeRebindPath(_ path: String) {
+        setup.path = path
+    }
+
     init(setup: Setup, frame: NSRect, font: NSFont, options: TerminalOptions) {
         self.setup = setup
         super.init(frame: frame, font: font, options: options)

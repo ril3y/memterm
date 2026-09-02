@@ -652,6 +652,105 @@ extension MemtermAppDelegate {
             }))
 
         // ---------------------------------------------------------------
+        // Chip click gate (founder polish 2026-09-01): rename is DOUBLE-CLICK
+        // ONLY. Driven through the chip's REAL mouseDown with synthesized
+        // events (gesture fidelity — the rename legs above enter via
+        // beginWorkspaceRename and cannot see the click routing): a single
+        // click on the ACTIVE chip must be a no-op (no editor, no switch), a
+        // double click must open the inline editor.
+        // ---------------------------------------------------------------
+        var chipClickSingleOpened = true   // pessimistic until measured
+        var chipClickDoubleOpened = false
+        probe.add(ProbeStep(
+            name: "chip-click-rename-gate", timeout: 8,
+            action: { [self] in
+                guard config.workspaceBar else { return }
+                guard let host = keyHost(), let bar = host.workspaceBar,
+                      let chip = bar.probeChipView(activeWorkspaceId) else {
+                    probeFail("chip-click leg: no active workspace chip")
+                }
+                renameHost = host
+                let center = NSPoint(x: chip.bounds.midX, y: chip.bounds.midY)
+                guard let single = probeMouseEvent(.leftMouseDown, in: chip,
+                                                   at: center, clickCount: 1),
+                      let double = probeMouseEvent(.leftMouseDown, in: chip,
+                                                   at: center, clickCount: 2) else {
+                    probeFail("chip-click leg: could not synthesize events")
+                }
+                let wsBefore = activeWorkspaceId
+                chip.mouseDown(with: single)
+                chipClickSingleOpened = chip.probeIsEditing
+                if chipClickSingleOpened {
+                    probeFail("single click on the active chip opened the rename editor")
+                }
+                if activeWorkspaceId != wsBefore {
+                    probeFail("single click on the active chip switched workspaces")
+                }
+                chip.mouseDown(with: double)
+                chipClickDoubleOpened = chip.probeIsEditing
+                guard chipClickDoubleOpened,
+                      let editor = host.window?.firstResponder as? NSTextView else {
+                    probeFail("double click on the active chip did not open the inline editor (editing=\(chipClickDoubleOpened))")
+                }
+                // Cancel through the real field-editor path; the condition
+                // rides the focus handoff back to the pane.
+                editor.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
+            },
+            condition: { [self] in
+                !config.workspaceBar || (renameHost?.window?.firstResponder is PaneView)
+            },
+            assert: { [self] in
+                guard config.workspaceBar else {
+                    probe.skipLine(step: "chip-click-rename-gate", reason: "workspace_bar=false")
+                    return
+                }
+                print("UIPROBE-CHIPCLICK single_opened_editor=\(chipClickSingleOpened) double_opened_editor=\(chipClickDoubleOpened) focus_back_to_pane=true")
+            },
+            onFailure: {
+                print("UIPROBE-CHIPCLICK single_opened_editor=\(chipClickSingleOpened) double_opened_editor=\(chipClickDoubleOpened) fr=\(String(describing: renameHost?.window?.firstResponder))")
+            }))
+
+        // ---------------------------------------------------------------
+        // Random workspace colors (founder polish 2026-09-01): every NEW
+        // workspace draws a preset no existing workspace is using — repeats
+        // are legal only once all six presets are taken. Exercises the REAL
+        // createWorkspace draw (the pure candidate math is L1-tested in
+        // WorkspaceColorPickTests); world restored via the FR-50/57 forget
+        // path afterwards.
+        // ---------------------------------------------------------------
+        probe.add(ProbeStep(
+            name: "workspace-random-colors",
+            assert: { [self] in
+                guard let store = memory?.store else {
+                    throw ProbeFailure("no store (random-colors leg)")
+                }
+                let presets = Set(Self.workspaceColorPresets.map(\.hex))
+                var created: [String] = []
+                var drawn: [String] = []
+                defer { for id in created { forgetWorkspace(id) } }
+                for i in 1...3 {
+                    let usedBefore = store.listWorkspaces().map(\.color)
+                    let unused = presets.subtracting(usedBefore)
+                    guard let id = createWorkspace(named: "ColorProbe-\(i)") else {
+                        throw ProbeFailure("createWorkspace failed (random-colors leg)")
+                    }
+                    created.append(id)
+                    guard let color = store.listWorkspaces()
+                        .first(where: { $0.id == id })?.color else {
+                        throw ProbeFailure("created workspace has no color row")
+                    }
+                    drawn.append(color)
+                    guard presets.contains(color) else {
+                        throw ProbeFailure("workspace color \(color) is not one of the 6 presets")
+                    }
+                    if !unused.isEmpty, !unused.contains(color) {
+                        throw ProbeFailure("workspace color \(color) repeats a used preset while \(unused.count) presets were still free (used=\(usedBefore))")
+                    }
+                }
+                print("UIPROBE-WSCOLORS drawn=\(drawn) all_presets=true no_repeat_while_free=true")
+            }))
+
+        // ---------------------------------------------------------------
         // Fullscreen. Quiet mode asserts the chrome across a frame
         // transition instead of driving a real Spaces animation (§2.5);
         // MEMTERM_PROBE_VISIBLE=1 keeps the real round-trip.
@@ -861,13 +960,13 @@ extension MemtermAppDelegate {
     /// A real mouse event aimed at a point in `view`'s own coordinates, for
     /// driving the overlay scroller's actual event handlers.
     private func probeMouseEvent(_ type: NSEvent.EventType, in view: NSView,
-                                 at point: NSPoint) -> NSEvent? {
+                                 at point: NSPoint, clickCount: Int = 1) -> NSEvent? {
         NSEvent.mouseEvent(with: type,
                            location: view.convert(point, to: nil),
                            modifierFlags: [],
                            timestamp: ProcessInfo.processInfo.systemUptime,
                            windowNumber: view.window?.windowNumber ?? 0,
-                           context: nil, eventNumber: 0, clickCount: 1,
+                           context: nil, eventNumber: 0, clickCount: clickCount,
                            pressure: 1)
     }
 
@@ -1177,6 +1276,47 @@ extension MemtermAppDelegate {
                 }
             }))
 
+        // With the bar VISIBLE (pinned by the drag above), the band eats only
+        // its own 12pt strip: a click point in the band resolves to the
+        // overlay, a point outside it resolves through to the pane — the
+        // terminal's mouse path (selection drags, mouse reporting) is never
+        // intercepted outside the band.
+        probe.add(ProbeStep(
+            name: "overlay-scroller-click-transparency", timeout: 8,
+            assert: { [self] in
+                if let pane { probeRepairPaneFrame(pane) }
+                guard let pane, let overlay = pane.scrollerOverlay else {
+                    throw ProbeFailure("transparency leg: overlay lost")
+                }
+                // Fresh activity keeps the leg honest even if the ~1s idle
+                // fade elapsed between steps.
+                if !overlay.probeVisible { pane.scrollUp(lines: 1) }
+                guard overlay.probeVisible else {
+                    throw ProbeFailure("transparency leg: band would not present on activity")
+                }
+                // NSView.hitTest takes superview coordinates.
+                func paneHit(atPaneX x: CGFloat, y: CGFloat) -> NSView? {
+                    pane.hitTest(pane.convert(NSPoint(x: x, y: y),
+                                              to: pane.superview))
+                }
+                let inBand = paneHit(atPaneX: pane.bounds.width
+                                        - OverlayScrollerLayout.bandWidth / 2,
+                                     y: pane.bounds.midY)
+                let outsideBand = paneHit(atPaneX: pane.bounds.midX,
+                                          y: pane.bounds.midY)
+                let bandHitOK = inBand === overlay
+                    || inBand?.isDescendant(of: overlay) == true
+                let outsideRoutesToPane = outsideBand != nil
+                    && outsideBand?.isDescendant(of: overlay) != true
+                print("UIPROBE-SCROLLER visible_band_hit=\(bandHitOK) outside_band_hits_pane=\(outsideRoutesToPane) outside_view=\(outsideBand.map { String(describing: type(of: $0)) } ?? "nil")")
+                guard bandHitOK else {
+                    throw ProbeFailure("visible band did not claim clicks in its own strip")
+                }
+                guard outsideRoutesToPane else {
+                    throw ProbeFailure("visible scroller intercepts clicks outside its band (hit=\(String(describing: outsideBand)))")
+                }
+            }))
+
         probe.add(ProbeStep(
             name: "overlay-scroller-track-page", timeout: 8,
             assert: { [self] in
@@ -1223,6 +1363,76 @@ extension MemtermAppDelegate {
                 if let overlay = pane?.scrollerOverlay {
                     print("UIPROBE-SCROLLER hidden=\(overlay.isHidden) alpha=\(overlay.alphaValue)")
                 }
+            }))
+
+        // Per-pane in a split: each pane owns its own band — scrolling one
+        // pane presents ITS band only, the sibling's stays hidden. The split
+        // is torn down through the real close(pane:) path afterwards.
+        var splitPane: PaneView?
+        var splitController: TerminalWindowController?
+        var splitPaneCountBefore = 0
+        probe.add(ProbeStep(
+            name: "overlay-scroller-per-pane-split", timeout: 20,
+            action: { [self] in
+                guard let pane,
+                      let controller = controllers.first(where: { c in
+                          c.allPanes().contains { $0 === pane }
+                      }) else {
+                    probeFail("per-pane leg: scroll-ux pane lost its controller")
+                }
+                splitController = controller
+                if let host = controller.host {
+                    host.focusWindow()
+                    host.select(controller)
+                }
+                let before = controller.allPanes()
+                splitPaneCountBefore = before.count
+                controller.splitCurrentPane(vertical: false)
+                splitPane = controller.allPanes()
+                    .first { p in !before.contains { $0 === p } }
+                guard let fresh = splitPane else {
+                    probeFail("per-pane leg: split created no new pane")
+                }
+                fresh.send(txt: "seq 1 250\r")
+            },
+            condition: { [self] in
+                guard let fresh = splitPane else { return false }
+                probeRepairPaneFrame(fresh)
+                return fresh.process?.running == true && fresh.canScroll
+                    && probeAbsoluteRow(of: "250", in: fresh) != nil
+            },
+            assert: { [self] in
+                guard let pane, let fresh = splitPane,
+                      let controller = splitController else {
+                    throw ProbeFailure("per-pane leg: setup lost")
+                }
+                probeRepairPaneFrame(fresh)
+                guard let freshOverlay = fresh.scrollerOverlay,
+                      let mainOverlay = pane.scrollerOverlay else {
+                    throw ProbeFailure("a split pane is missing its overlay scroller")
+                }
+                guard freshOverlay !== mainOverlay,
+                      freshOverlay.superview === fresh,
+                      mainOverlay.superview === pane else {
+                    throw ProbeFailure("split panes share/misparent overlay scrollers")
+                }
+                fresh.scroll(toPosition: 0.5)
+                let freshVisible = freshOverlay.probeVisible
+                let siblingStayedHidden = !mainOverlay.probeVisible
+                print("UIPROBE-SCROLLER split_distinct_bands=true fresh_band_visible=\(freshVisible) sibling_band_hidden=\(siblingStayedHidden)")
+                guard freshVisible else {
+                    throw ProbeFailure("scrolling a split pane did not present its own band")
+                }
+                guard siblingStayedHidden else {
+                    throw ProbeFailure("scrolling one split pane presented the sibling's band too")
+                }
+                controller.close(pane: fresh)
+                guard controller.allPanes().count == splitPaneCountBefore else {
+                    throw ProbeFailure("per-pane leg teardown left \(controller.allPanes().count) panes (want \(splitPaneCountBefore))")
+                }
+            },
+            onFailure: {
+                print("UIPROBE-SCROLLER split_pane=\(String(describing: splitPane?.bounds)) can_scroll=\(splitPane?.canScroll == true) overlay=\(String(describing: splitPane?.scrollerOverlay?.frame))")
             }))
     }
 
@@ -1436,6 +1646,31 @@ extension MemtermAppDelegate {
                 if var t = serialPane?.currentTermiosForProbe() { speed = cfgetispeed(&t) }
                 print("UIPROBE-SERIAL baud_live_applied=false termios_ispeed=\(speed) settings=\(serialPane?.setup.settings.compactString ?? "-") connected=\(serialPane?.isConnected == true)")
             }))
+        // The other half of "applies live": the SAME fd keeps streaming
+        // after the termios round-trip — RX written after the baud changes
+        // must land in the pane through the original read pump. The pane is
+        // in the HEX lens here (serial-tx-crlf switched it on), so the
+        // marker is a 4-byte run written 4x — like the deadbeef pattern, at
+        // least one run renders intact across any hex line wrap.
+        probe.add(ProbeStep(
+            name: "serial-baud-stream-after", timeout: 8,
+            action: {
+                let bytes: [UInt8] = [0xfa, 0xce, 0xb0, 0x0c, 0xfa, 0xce, 0xb0, 0x0c,
+                                      0xfa, 0xce, 0xb0, 0x0c, 0xfa, 0xce, 0xb0, 0x0c]
+                _ = bytes.withUnsafeBytes { write(serialMasterFD, $0.baseAddress, $0.count) }
+            },
+            condition: {
+                serialPane?.scrollbackText(maxLines: 300).contains("fa ce b0 0c") == true
+            },
+            assert: {
+                guard serialPane?.isConnected == true else {
+                    throw ProbeFailure("pane not connected after the live baud round-trip")
+                }
+                print("UIPROBE-SERIAL post_baud_rx_streams=true")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL post_baud_rx_streams=false connected=\(serialPane?.isConnected == true) tail=\(serialPane?.scrollbackText(maxLines: 100).suffix(200) ?? "")")
+            }))
         // DTR/RTS chips: filled = asserted, click toggles — driven through
         // the REAL chip button action (gesture fidelity). Ptys ENOTTY every
         // modem-line ioctl, so the pane's stub seam stands in for the fd;
@@ -1531,6 +1766,70 @@ extension MemtermAppDelegate {
             onFailure: {
                 let text = serialPane?.scrollbackText(maxLines: 200) ?? ""
                 print("UIPROBE-SERIAL disconnect_banner=false still_connected=\(serialPane?.isConnected == true) tail=\(text.suffix(200))")
+            }))
+        // Reconnect keeps the lifetime counters: the model lives on the PANE,
+        // and every reconnect path (hotplug return, ⌘R) funnels through
+        // connect() — driven here for real against a second pty standing in
+        // for the returned device (the revoked slave path cannot come back;
+        // probeRebindPath mirrors hotplugAttached's own /dev-renumber
+        // rebinding). RX after the reconnect must ACCUMULATE on the old
+        // totals, not restart them.
+        var reconnectTxBefore = -1
+        var reconnectRxBefore = -1
+        probe.add(ProbeStep(
+            name: "serial-reconnect-keeps-counters", timeout: 10,
+            action: {
+                guard let pane = serialPane else { probeFail("reconnect leg: pane lost") }
+                reconnectTxBefore = pane.footerModel.txBytes
+                reconnectRxBefore = pane.footerModel.rxBytes
+                guard reconnectTxBefore > 0, reconnectRxBefore > 0 else {
+                    probeFail("reconnect leg: counters not primed (tx=\(reconnectTxBefore) rx=\(reconnectRxBefore))")
+                }
+                let master = posix_openpt(O_RDWR | O_NOCTTY)
+                guard master >= 0, grantpt(master) == 0, unlockpt(master) == 0,
+                      let slaveC = ptsname(master),
+                      case let slavePath = String(cString: slaveC), !slavePath.isEmpty else {
+                    probeFail("reconnect leg: second pty pair")
+                }
+                var t = termios()
+                tcgetattr(master, &t)
+                cfmakeraw(&t)
+                tcsetattr(master, TCSANOW, &t)
+                _ = fcntl(master, F_SETFL, O_NONBLOCK)
+                serialMasterFD = master
+                pane.probeRebindPath(slavePath)
+                do { try pane.connect() } catch {
+                    probeFail("reconnect leg: connect() failed (\(error))")
+                }
+                // Hex lens is still on: a 4-byte run written 4x, as above.
+                let bytes: [UInt8] = [0xca, 0xfe, 0xf0, 0x0d, 0xca, 0xfe, 0xf0, 0x0d,
+                                      0xca, 0xfe, 0xf0, 0x0d, 0xca, 0xfe, 0xf0, 0x0d]
+                _ = bytes.withUnsafeBytes { write(master, $0.baseAddress, $0.count) }
+            },
+            condition: {
+                guard let pane = serialPane else { return false }
+                return pane.footerModel.rxBytes > reconnectRxBefore
+                    && pane.scrollbackText(maxLines: 300).contains("ca fe f0 0d")
+            },
+            assert: {
+                guard let pane = serialPane, let footer = pane.footerView else {
+                    throw ProbeFailure("reconnect leg: pane/footer lost")
+                }
+                guard pane.isConnected, footer.currentLinkState == .connected else {
+                    throw ProbeFailure("reconnect did not land connected-green (connected=\(pane.isConnected))")
+                }
+                // ACCUMULATED, not reset: TX untouched by the reconnect, RX
+                // strictly above its pre-unplug total.
+                guard pane.footerModel.txBytes == reconnectTxBefore else {
+                    throw ProbeFailure("reconnect changed the TX total (\(reconnectTxBefore) -> \(pane.footerModel.txBytes))")
+                }
+                guard pane.footerModel.rxBytes >= reconnectRxBefore + 16 else {
+                    throw ProbeFailure("reconnect reset the RX total (\(reconnectRxBefore) -> \(pane.footerModel.rxBytes))")
+                }
+                print("UIPROBE-SERIAL reconnect_keeps_counters=true tx=\(pane.footerModel.txBytes) rx_before=\(reconnectRxBefore) rx_after=\(pane.footerModel.rxBytes)")
+            },
+            onFailure: {
+                print("UIPROBE-SERIAL reconnect_keeps_counters=false connected=\(serialPane?.isConnected == true) tx=\(serialPane?.footerModel.txBytes ?? -1) rx=\(serialPane?.footerModel.rxBytes ?? -1) before_tx=\(reconnectTxBefore) before_rx=\(reconnectRxBefore)")
             }))
         // Restore-offer: drives the EXACT per-tab restore path with a
         // journaled serial snapshot for an absent device. NOTE (TESTING.md
