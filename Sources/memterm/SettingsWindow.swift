@@ -1,5 +1,6 @@
 import AppKit
 import MemtermCore
+import MemtermExtensionKit
 import UniformTypeIdentifiers
 
 // FR-44/48: the real settings UI — Settings 2.0. Four small native sections
@@ -314,6 +315,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         tabView.addTabViewItem(appearance)
         tabView.addTabViewItem(terminal)
         tabView.addTabViewItem(memory)
+        // ExtensionKit ui.settingsSection: each registered section hangs off
+        // the same NSTabView as a small native tab (registration happens at
+        // extension activation, before this window is ever built). The rows'
+        // views are the extension's own; they cannot reach memterm's config.
+        for section in app.extensionRuntime?.settingsSections ?? [] {
+            tabView.addTabViewItem(makeTab(section.title, rows: section.rows.map { row in
+                [row.label.map { label($0 + ":") } ?? NSGridCell.emptyContentView,
+                 row.makeView()]
+            }))
+        }
         tabView.delegate = self
         tabView.translatesAutoresizingMaskIntoConstraints = false
 

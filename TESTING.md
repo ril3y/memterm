@@ -153,11 +153,12 @@ The gate IS this script. Humans and agents run nothing else to claim green.
 
 1. **Preflight:** `git status --porcelain` empty (or explicit `--allow-dirty`, which taints the report); record HEAD sha.
 2. `swift test` (L1/L2).
-3. `scripts/make-app.sh` → the one stamped release artifact.
-4. **Identity check:** `dist/memterm.app/Contents/MacOS/memterm --version` must report the recorded HEAD hash, non-dirty. Never rebuild between this check and the probes.
-5. Run everything **against the dist binary**: `--config-dump`; `--bench`/`--latency`/`--flood` with enforced thresholds; `--smoke=save` + `--smoke=verify` in a fresh `mktemp` dir; `MEMTERM_UI_PROBE=1` in `fresh`, `restored` (seeded from a smoke save), and `observe` modes; the config matrix (quiet) + one visible pixel pass; serial coverage via the probe's pty-pair legs (real `/dev/cu.*` nodes are never touched; `MEMTERM_SERIAL_PROBE_PTY` remains the connect-sheet stand-in hook).
-6. **Pass criterion = grepped sentinels with matching step counts** (`UIPROBE-PASS steps=N/N`, `SMOKE-PASS`, `LATENCY-PASS`, ...). Exit codes are necessary, never sufficient.
-7. Write `dist/verify-report-<hash>.log`: build stamp, post-sign binary sha256, per-gate results, state-dir lines proving isolation, screenshot paths. This file is the ONLY citable gate evidence.
+3. `scripts/check-extension-firewall.sh` (`FIREWALL-PASS` sentinel): the extension-architecture import firewall's CI backstop — MemtermExtensionKit imports only Foundation/AppKit; extension targets (Sources/MemtermClaudeBrowser, Sources/MemtermTimeline, Sources/MemtermExt\*) import only the kit + AppKit + Foundation and depend, in Package.swift, on the kit alone; no networking symbols in either. The compiler (SPM target dependencies) is the real enforcement; this step makes an eroding diff loud.
+4. `scripts/make-app.sh` → the one stamped release artifact.
+5. **Identity check:** `dist/memterm.app/Contents/MacOS/memterm --version` must report the recorded HEAD hash, non-dirty. Never rebuild between this check and the probes.
+6. Run everything **against the dist binary**: `--config-dump`; `--bench`/`--latency`/`--flood` with enforced thresholds; `--smoke=save` + `--smoke=verify` in a fresh `mktemp` dir; `MEMTERM_UI_PROBE=1` in `fresh`, `restored` (seeded from a smoke save), and `observe` modes; the config matrix (quiet) + one visible pixel pass; serial coverage via the probe's pty-pair legs (real `/dev/cu.*` nodes are never touched; `MEMTERM_SERIAL_PROBE_PTY` remains the connect-sheet stand-in hook).
+7. **Pass criterion = grepped sentinels with matching step counts** (`UIPROBE-PASS steps=N/N`, `SMOKE-PASS`, `LATENCY-PASS`, ...). Exit codes are necessary, never sufficient.
+8. Write `dist/verify-report-<hash>.log`: build stamp, post-sign binary sha256, per-gate results, state-dir lines proving isolation, screenshot paths. This file is the ONLY citable gate evidence.
 
 ### 3.4 Pre-merge checklist (feature branch → main; each item mechanically checkable)
 

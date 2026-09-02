@@ -61,7 +61,7 @@ check() {
 }
 
 # ---------------------------------------------------------------- L1/L2
-echo "== [1/7] swift test (L1 model truth + L2 headless seams)"
+echo "== [1/8] swift test (L1 model truth + L2 headless seams)"
 if swift test > "$LOG/swift-test.log" 2>&1; then
     TESTCOUNT="$(grep -cE " passed \(" "$LOG/swift-test.log" || true)"
     note "GATE PASS swift-test — $TESTCOUNT tests passed"
@@ -71,8 +71,13 @@ else
     grep -E "error|failed" "$LOG/swift-test.log" | head -20 | sed 's/^/    /'
 fi
 
+# ---------------------------------------------------------------- firewall
+echo "== [2/8] extension import firewall (structural CI backstop)"
+scripts/check-extension-firewall.sh > "$LOG/firewall.log" 2>&1
+check "extension-firewall" "$LOG/firewall.log" "FIREWALL-PASS "
+
 # ---------------------------------------------------------------- artifact
-echo "== [2/7] stamped release artifact (make-app.sh)"
+echo "== [3/8] stamped release artifact (make-app.sh)"
 if [ "$ALLOW_DIRTY" = "1" ]; then
     MEMTERM_ALLOW_DIRTY=1 scripts/make-app.sh > "$LOG/make-app.log" 2>&1
 else
@@ -99,7 +104,7 @@ else
 fi
 
 # ---------------------------------------------------------------- identity
-echo "== [3/7] artifact identity (--version vs HEAD; no rebuild after this)"
+echo "== [4/8] artifact identity (--version vs HEAD; no rebuild after this)"
 VERSION_LINE="$("$BIN" --version)"
 note "ARTIFACT $VERSION_LINE"
 note "ARTIFACT sha256(post-codesign)=$BIN_SHA"
@@ -113,7 +118,7 @@ else
 fi
 
 # ---------------------------------------------------------------- gates
-echo "== [4/7] headless + perf gates against the dist binary"
+echo "== [5/8] headless + perf gates against the dist binary"
 CFGDIR="$WORK/configs"; mkdir -p "$CFGDIR"
 : > "$CFGDIR/default.toml"
 printf 'window_opacity = 0.37\nwindow_blur = true\n' > "$CFGDIR/founder.toml"
@@ -128,7 +133,7 @@ check "config-dump" "$LOG/config-dump.log" "^config: "
 "$BIN" --latency > "$LOG/latency.log" 2>&1; check "latency" "$LOG/latency.log" "LATENCY-PASS p95_total="
 "$BIN" --flood   > "$LOG/flood.log" 2>&1;  check "flood"   "$LOG/flood.log"   "FLOOD-PASS worst_stall="
 
-echo "== [5/7] smoke (reboot-restore promise, capture -> crash-sim -> restore)"
+echo "== [6/8] smoke (reboot-restore promise, capture -> crash-sim -> restore)"
 SMOKEDIR="$(mktemp -d)"
 MEMTERM_STATE_DIR="$SMOKEDIR" MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" \
     "$BIN" --smoke=save > "$LOG/smoke-save.log" 2>&1
@@ -139,7 +144,7 @@ MEMTERM_STATE_DIR="$SMOKEDIR" MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" \
 check "smoke-verify" "$LOG/smoke-verify.log" "SMOKE-PASS run=verify steps=([0-9]+)/\1"
 check "smoke-geometry-golden" "$LOG/smoke-verify.log" "SMOKE-GEOMETRY golden=match"
 
-echo "== [6/7] UI probe: fresh / restored / observe + config matrix (+1 visible pass)"
+echo "== [7/8] UI probe: fresh / restored / observe + config matrix (+1 visible pass)"
 probe() {  # probe <label> <mode> <configfile> <statedir(optional)> [visible]
     local label="$1" pmode="$2" cfg="$3" sdir="${4:-}" vis="${5:-}"
     local envs=(MEMTERM_UI_PROBE=1 "MEMTERM_PROBE_MODE=$pmode" "MEMTERM_CONFIG_PATH=$cfg")
@@ -186,7 +191,7 @@ probe "matrix-dark"    fresh "$CFGDIR/dark.toml"
 probe "visible-founder" fresh "$CFGDIR/founder.toml" "" visible
 
 # ---------------------------------------------------------------- report
-echo "== [7/7] report"
+echo "== [8/8] report"
 REPORT="$REPO_ROOT/dist/verify-report-$HEAD_HASH.log"
 {
     echo "memterm verify report"

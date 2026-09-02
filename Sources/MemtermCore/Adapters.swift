@@ -346,6 +346,179 @@ public enum Adapters {
             && !s.hasPrefix("-")
     }
 
+    // MARK: ~/.claude scanning — SAME one version-fragile site (§8, FR-35)
+    //
+    // The ExtensionKit claude.* surface (kit v0): typed project/session
+    // scans the app's Host implementation maps into kit types, so extensions
+    // never touch raw ~/.claude paths or fork jsonl parsing. Everything here
+    // is read-only and version-TOLERANT per the FR-35 discipline: undocumented
+    // formats are parsed defensively — a malformed file or line is skipped,
+    // never a crash, never a guess — and each session surfaces the Claude
+    // Code `version` that wrote it so consumers can gate features per release.
+
+    /// One project directory under ~/.claude/projects. The slug encoding is
+    /// lossy (cwd → every non-alphanumeric becomes '-'), so it is never
+    /// inverted into a path (§8); per-session cwd carries the honest path.
+    public struct ClaudeProjectScan: Equatable {
+        public let slug: String
+        public let sessionCount: Int
+        public let lastActivity: Date?
+    }
+
+    public struct ClaudeSessionScan: Equatable {
+        public let id: String
+        public let projectSlug: String
+        /// Session jsonl mtime — when Claude last wrote.
+        public let lastActivity: Date
+        /// The live-session registry (~/.claude/sessions/<pid>.json — FR-35's
+        /// primary capture signal) names this session under a pid that is
+        /// still alive.
+        public let isLive: Bool
+        /// HEURISTIC: live but jsonl-quiet past the idle threshold — a
+        /// working Claude writes its jsonl continuously, so a live-but-quiet
+        /// session is most likely waiting on the user (prompt/permission).
+        public let needsAttention: Bool
+        public let lastPrompt: String?
+        public let cwd: String?
+        public let claudeVersion: String?
+    }
+
+    public static var defaultClaudeSessionsDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/sessions")
+    }
+
+    /// Live-but-quiet-this-long ⇒ needsAttention (see ClaudeSessionScan).
+    public static let claudeAttentionIdleThreshold: TimeInterval = 30
+
+    /// All project slugs under the projects dir, most recently active first.
+    /// A directory with no session jsonls still lists (sessionCount 0).
+    public static func claudeProjectScans(projectsDir: URL = defaultClaudeProjectsDir)
+        -> [ClaudeProjectScan] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: projectsDir, includingPropertiesForKeys: [.isDirectoryKey]) else { return [] }
+        var scans: [ClaudeProjectScan] = []
+        for dir in entries {
+            guard (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+            else { continue }
+            let jsonls = sessionJsonls(in: dir)
+            scans.append(ClaudeProjectScan(
+                slug: dir.lastPathComponent,
+                sessionCount: jsonls.count,
+                lastActivity: jsonls.map { mtime($0) }.max()))
+        }
+        return scans.sorted {
+            ($0.lastActivity ?? .distantPast) > ($1.lastActivity ?? .distantPast)
+        }
+    }
+
+    /// One project's sessions, most recently active first, with liveness and
+    /// needs-attention resolved against the live-session registry.
+    public static func claudeSessionScans(projectSlug: String,
+                                          projectsDir: URL = defaultClaudeProjectsDir,
+                                          sessionsDir: URL = defaultClaudeSessionsDir,
+                                          now: Date = Date(),
+                                          attentionIdleThreshold: TimeInterval = claudeAttentionIdleThreshold)
+        -> [ClaudeSessionScan] {
+        let dir = projectsDir.appendingPathComponent(projectSlug)
+        let live = claudeLiveRegistry(sessionsDir: sessionsDir)
+        var scans: [ClaudeSessionScan] = []
+        for file in sessionJsonls(in: dir) {
+            let id = file.deletingPathExtension().lastPathComponent
+            guard isValidClaudeSessionId(id) else { continue }
+            let activity = mtime(file)
+            let registry = live[id]
+            let isLive = registry != nil
+            let tail = claudeJsonlTailScan(file)
+            scans.append(ClaudeSessionScan(
+                id: id,
+                projectSlug: projectSlug,
+                lastActivity: activity,
+                isLive: isLive,
+                needsAttention: isLive
+                    && now.timeIntervalSince(activity) > attentionIdleThreshold,
+                lastPrompt: tail.lastPrompt,
+                cwd: registry?.cwd ?? tail.cwd,
+                claudeVersion: registry?.version ?? tail.version))
+        }
+        return scans.sorted { $0.lastActivity > $1.lastActivity }
+    }
+
+    /// The live-session registry: ~/.claude/sessions/<pid>.json records
+    /// ({pid, sessionId, cwd, version, …}) whose pid still names a running
+    /// process (kill(pid, 0): success or EPERM = alive). Undocumented format —
+    /// any record missing the fields we need is skipped.
+    static func claudeLiveRegistry(sessionsDir: URL)
+        -> [String: (cwd: String?, version: String?)] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: sessionsDir, includingPropertiesForKeys: nil) else { return [:] }
+        var registry: [String: (cwd: String?, version: String?)] = [:]
+        for file in entries where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file), data.count < 1_048_576,
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  let record = object as? [String: Any],
+                  let sessionId = record["sessionId"] as? String,
+                  isValidClaudeSessionId(sessionId),
+                  let pid = record["pid"] as? Int, pid > 0
+            else { continue }
+            let alive = kill(pid_t(pid), 0) == 0 || errno == EPERM
+            guard alive else { continue }
+            registry[sessionId] = (cwd: record["cwd"] as? String,
+                                   version: record["version"] as? String)
+        }
+        return registry
+    }
+
+    /// Session jsonl files (files only, .jsonl extension) in one project dir.
+    private static func sessionJsonls(in dir: URL) -> [URL] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+        else { return [] }
+        return files.filter {
+            $0.pathExtension == "jsonl"
+                && (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
+        }
+    }
+
+    /// Reads the TAIL of a session jsonl (bounded — jsonls grow to many MB)
+    /// and scans lines newest-first for the user's last prompt, the session's
+    /// cwd, and the writing Claude Code version. Every line is parsed
+    /// defensively: malformed JSON or unknown shapes are skipped.
+    static func claudeJsonlTailScan(_ file: URL, maxTailBytes: Int = 262_144)
+        -> (lastPrompt: String?, cwd: String?, version: String?) {
+        guard let handle = try? FileHandle(forReadingFrom: file) else {
+            return (nil, nil, nil)
+        }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let offset = size > UInt64(maxTailBytes) ? size - UInt64(maxTailBytes) : 0
+        try? handle.seek(toOffset: offset)
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else {
+            return (nil, nil, nil)
+        }
+        var lastPrompt: String?
+        var cwd: String?
+        var version: String?
+        for line in text.split(separator: "\n").reversed() {
+            if lastPrompt != nil, cwd != nil, version != nil { break }
+            guard let lineData = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: lineData),
+                  let record = object as? [String: Any] else { continue }
+            if lastPrompt == nil, record["type"] as? String == "last-prompt",
+               let prompt = record["lastPrompt"] as? String, !prompt.isEmpty {
+                lastPrompt = prompt
+            }
+            if cwd == nil, let recordCwd = record["cwd"] as? String, !recordCwd.isEmpty {
+                cwd = recordCwd
+            }
+            if version == nil, let v = record["version"] as? String, !v.isEmpty {
+                version = v
+            }
+        }
+        return (lastPrompt, cwd, version)
+    }
+
     // MARK: FR-30 denylist — checked before any offer, outside the adapters
 
     /// Wrapper commands that execute their arguments — their argv elements are

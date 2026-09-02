@@ -22,12 +22,25 @@ let package = Package(
             dependencies: ["CProcShim"],
             path: "Sources/MemtermCore"
         ),
+        // Extension architecture (option B, decision doc 496a85fe): the ONLY
+        // module in-tree extension targets may depend on. Pure protocols and
+        // value types — NO app-side dependencies (system AppKit only); the
+        // app target implements Host. Future extension targets
+        // (MemtermClaudeBrowser, MemtermTimeline) declare dependencies:
+        // ["MemtermExtensionKit"] and NOTHING else — that dependency list IS
+        // the import firewall (compiler-enforced; re-checked in CI by
+        // scripts/check-extension-firewall.sh).
+        .target(
+            name: "MemtermExtensionKit",
+            path: "Sources/MemtermExtensionKit"
+        ),
         .executableTarget(
             name: "memterm",
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
                 "CProcShim",
-                "MemtermCore"
+                "MemtermCore",
+                "MemtermExtensionKit"
             ],
             path: "Sources/memterm"
         ),
@@ -43,6 +56,13 @@ let package = Package(
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ],
             path: "Tests/MemtermCoreTests"
+        ),
+        // Kit contract tests: the Host surface against a mock implementation
+        // (pins the API shape and the archive-stub contract).
+        .testTarget(
+            name: "MemtermExtensionKitTests",
+            dependencies: ["MemtermExtensionKit"],
+            path: "Tests/MemtermExtensionKitTests"
         )
     ]
 )

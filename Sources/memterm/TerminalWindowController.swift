@@ -1,5 +1,6 @@
 import AppKit
 import MemtermCore
+import MemtermExtensionKit
 import SwiftTerm
 
 // One TAB hosting a pane tree (custom-tab-chrome stage: this class is the
@@ -65,6 +66,10 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
     /// renders it via the host.
     private var activity = TabActivityTracker()
     private var activityRefreshWork: DispatchWorkItem?
+    /// ExtensionKit ui.setBadge: an extension-driven mark rendered through
+    /// the SAME indicator slot. Real pty activity always outranks it; the
+    /// extension owns clearing it (selection clears pty marks, not badges).
+    private var extensionBadge: TabActivityState = .idle
 
     /// `initialCwd`: where the first pane's shell starts (nil = home). ⌘T/⌘N
     /// pass the key pane's kernel-truth cwd here when `new_tab_same_cwd` is on
@@ -172,6 +177,8 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         if userInitiated {
             app.workspaceEmptiedByUserClose(workspaceId)
         }
+        // ExtensionKit events: the tab is gone (any teardown intent).
+        app.extensionRuntime?.emit(.tabClosed, tab: TabRef(tabId: tabId))
     }
 
     // MARK: - Pane context menu (FR-58: right-click is a first-class affordance)
@@ -510,9 +517,19 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
     }
 
     /// MEMTERM_UI_PROBE support (and the strip's render source): the
-    /// tracker's current state.
+    /// tracker's current state, merged with any extension badge (pty
+    /// activity outranks; the default .idle badge changes nothing).
     func activityStateForProbe() -> TabActivityState {
-        activity.state(at: ProcessInfo.processInfo.systemUptime)
+        let tracked = activity.state(at: ProcessInfo.processInfo.systemUptime)
+        if tracked == .active || extensionBadge == .active { return .active }
+        if tracked == .unseen || extensionBadge == .unseen { return .unseen }
+        return .idle
+    }
+
+    /// ExtensionKit ui.setBadge (via ExtensionHostRuntime).
+    func setExtensionBadge(_ state: TabActivityState) {
+        extensionBadge = state
+        host?.tabChanged(self)
     }
 
     private func scheduleActivityRefresh(after delay: TimeInterval) {

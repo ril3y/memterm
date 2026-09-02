@@ -37,6 +37,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// FR-36/§9: offer-time registry ensuring one `--resume <uuid>` per UUID
     /// across every restore path (launch, workspace switch, unpark).
     let claudeClaims = ClaudeSessionClaims()
+    /// ExtensionKit v0: the app-side Host implementation + registries for the
+    /// compiled-in extension targets (none yet — the kit dry-runs its API
+    /// against tests until MemtermClaudeBrowser lands).
+    private(set) var extensionRuntime: ExtensionHostRuntime?
 
     // -- Serial (feature/serial UX) --
     /// One app-wide hotplug watcher, started lazily by the first serial pane
@@ -164,6 +168,12 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         engine.start()
         engine.scheduleTopologySave()
 
+        // ExtensionKit v0: build the Host and activate the compiled-in
+        // extension list (empty until the Claude-browser stage).
+        let runtime = ExtensionHostRuntime(app: self)
+        extensionRuntime = runtime
+        runtime.activateCompiledIn()
+
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(workspaceWillPowerOff(_:)),
             name: NSWorkspace.willPowerOffNotification, object: nil)
@@ -237,6 +247,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(colorItem)
         menu.addItem(.separator())
         add("Forget Tab Memory", #selector(ctxTabForget(_:)))
+        // ExtensionKit: registered extension items (enumerable, typed — no
+        // authority beyond their own closures). No-op while none registered.
+        extensionRuntime?.appendTabMenuItems(to: menu)
         menu.addItem(.separator())
         add("Close Tab", #selector(ctxTabClose(_:)))
         return menu
