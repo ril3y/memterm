@@ -873,9 +873,21 @@ extension MemtermAppDelegate {
         // MEMTERM_PROBE_VISIBLE=1 keeps the real round-trip.
         // ---------------------------------------------------------------
         if ProbeSupport.visible {
+            var fsEntered = false
+            var fsEnterObserver: NSObjectProtocol?
             probe.add(ProbeStep(
                 name: "fullscreen-enter", timeout: 10,
-                action: { [self] in keyHost()?.window?.toggleFullScreen(nil) },
+                action: { [self] in
+                    guard let window = keyHost()?.window else { return }
+                    // Track the END of the enter transition: the exit leg
+                    // must not toggle mid-transition (AppKit drops it —
+                    // visible-run flake on the founder's 7680-wide display).
+                    fsEntered = false
+                    fsEnterObserver = NotificationCenter.default.addObserver(
+                        forName: NSWindow.didEnterFullScreenNotification, object: window,
+                        queue: .main) { _ in fsEntered = true }
+                    window.toggleFullScreen(nil)
+                },
                 condition: { [self] in
                     keyHost()?.window?.styleMask.contains(.fullScreen) == true
                 },
@@ -885,12 +897,27 @@ extension MemtermAppDelegate {
                 },
                 onFailure: { print("UIPROBE-FS entered=false") }))
             probe.add(ProbeStep(
-                name: "fullscreen-exit", timeout: 10,
+                name: "fullscreen-exit", timeout: 15,
                 action: { [self] in
-                    // Give the enter animation a beat, then leave.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                        self.keyHost()?.window?.toggleFullScreen(nil)
+                    // Leave only once the enter transition has COMPLETED
+                    // (didEnterFullScreen), plus a beat; poll for it rather
+                    // than toggling on a clock.
+                    func leaveWhenEntered(attempt: Int = 0) {
+                        if fsEntered || attempt >= 40 {
+                            if let observer = fsEnterObserver {
+                                NotificationCenter.default.removeObserver(observer)
+                                fsEnterObserver = nil
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                                self.keyHost()?.window?.toggleFullScreen(nil)
+                            }
+                        } else {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                leaveWhenEntered(attempt: attempt + 1)
+                            }
+                        }
                     }
+                    leaveWhenEntered()
                 },
                 condition: { [self] in
                     keyHost()?.window?.styleMask.contains(.fullScreen) == false

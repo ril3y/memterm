@@ -79,11 +79,21 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         // Quiet probe/smoke runs (TESTING.md §2.5) position windows offscreen
         // — ProbeQuietWindow disables AppKit's frame constraining so they
         // stay there.
-        let window = ProbeSupport.quiet
-            ? ProbeQuietWindow(contentRect: rect, styleMask: styleMask,
-                               backing: .buffered, defer: false)
-            : NSWindow(contentRect: rect, styleMask: styleMask,
-                       backing: .buffered, defer: false)
+        let window: NSWindow
+        if role == .dropdown {
+            // The panel parks fully OFF its screen edge between shows; a
+            // plain NSWindow's constrainFrameRect would clamp that back on
+            // screen (visible-probe finding, 2026-09-09) and the slide would
+            // stop short.
+            window = DropdownWindow(contentRect: rect, styleMask: styleMask,
+                                    backing: .buffered, defer: false)
+        } else if ProbeSupport.quiet {
+            window = ProbeQuietWindow(contentRect: rect, styleMask: styleMask,
+                                      backing: .buffered, defer: false)
+        } else {
+            window = NSWindow(contentRect: rect, styleMask: styleMask,
+                              backing: .buffered, defer: false)
+        }
         window.title = "memterm"
         // Custom chrome: the strip draws titles; native tabbing is OFF.
         window.titleVisibility = .hidden
@@ -569,4 +579,15 @@ private final class TabContentContainerView: NSView {
             sub.frame = bounds
         }
     }
+}
+
+/// The drop-down panel's window: frames are never constrained to the screen
+/// (it slides off its edge), and it can take keyboard focus without a
+/// title bar's chrome.
+final class DropdownWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
