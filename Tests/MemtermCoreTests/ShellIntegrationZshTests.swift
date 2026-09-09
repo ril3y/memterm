@@ -57,6 +57,10 @@ final class ShellIntegrationZshTests: XCTestCase {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "TERM": "xterm-256color",
             "SHELL": zshPath,
+            // Real panes inherit the login locale; without one, zsh on the
+            // CI runners (macos-15) prints multibyte history entries
+            // meta-escaped and the unicode-entry assertion fails there.
+            "LANG": "en_US.UTF-8",
         ]
         env["ZDOTDIR"] = zdotdir ?? integrationDir.path
         if let paneId {
