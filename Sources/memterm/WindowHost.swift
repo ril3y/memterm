@@ -60,11 +60,22 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     // here first if multi-pane focus targeting regresses after an OS update.
     private var firstResponderObservation: NSKeyValueObservation?
 
-    init(app: MemtermAppDelegate, frame: NSRect?) {
+    /// Quake-style drop-down (2026-09-09): a .dropdown host is the active
+    /// workspace's slide-in panel — journaled with role "dropdown", restored
+    /// hidden, placed by DropdownController, never a swap slot.
+    enum Role { case normal, dropdown }
+    let role: Role
+    var isDropdown: Bool { role == .dropdown }
+
+    init(app: MemtermAppDelegate, frame: NSRect?, role: Role = .normal) {
         self.app = app
+        self.role = role
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable,
-                                             .resizable, .fullSizeContentView]
+        // The panel has no traffic lights and is not user-movable: its place
+        // is the configured edge, and Esc-style dismissal is the hotkey.
+        let styleMask: NSWindow.StyleMask = role == .dropdown
+            ? [.titled, .fullSizeContentView]
+            : [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         // Quiet probe/smoke runs (TESTING.md §2.5) position windows offscreen
         // — ProbeQuietWindow disables AppKit's frame constraining so they
         // stay there.
@@ -86,6 +97,17 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         // the traffic lights.
         window.titlebarAppearsTransparent = true
         window.tabbingMode = .disallowed
+        if role == .dropdown {
+            window.isMovable = false
+            window.isMovableByWindowBackground = false
+            window.level = .floating
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+            window.hidesOnDeactivate = false
+            window.isExcludedFromWindowsMenu = true
+            window.standardWindowButton(.closeButton)?.isHidden = true
+            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+            window.standardWindowButton(.zoomButton)?.isHidden = true
+        }
         if let frame {
             window.setFrame(frame, display: false)
         } else {
@@ -502,6 +524,10 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         app.noteHostFocused(self)
         // Everything on the selected tab is seen: its activity mark clears.
         selectedTab?.noteSelected()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        if role == .dropdown { app.dropdown.panelResignedKey(self) }
     }
 
     func windowWillClose(_ notification: Notification) {

@@ -232,6 +232,30 @@ extension MemtermAppDelegate {
                 }
             }))
 
+        // Quake-style drop-down (2026-09-09): a panel with a live shell is
+        // left open in the default workspace so run 2 proves it restores AS
+        // a panel — role kept, hidden, its tab live — not as a plain window.
+        smoke.add(ProbeStep(
+            name: "save-dropdown-panel", timeout: 10,
+            action: { [self] in
+                var c = config
+                c.dropdownEnabled = true
+                c.dropdownAnimationMs = 0
+                applyConfigLive(c)
+                dropdown.show()
+            },
+            condition: { [self] in
+                dropdown.panelHost?.selectedTab?.allPanes().first?.process?.running == true
+            },
+            assert: { [self] in
+                guard let engine = memory else { throw ProbeFailure("no engine") }
+                engine.flushSync()
+                let rows = engine.store.loadState(workspaceId: StateStore.defaultWorkspaceId)
+                let panel = rows.contains { $0.isDropdown }
+                print("SMOKE-DROPDOWN journaled_role=\(panel) windows=\(rows.count)")
+                guard panel else { throw ProbeFailure("drop-down panel not journaled with its role") }
+            }))
+
         // FR-56 leg — SEMANTICS UPDATED with the founder-amended FR-56
         // (approved 2026-09-02), the ONE place the meaning legitimately
         // changes: a user close now ARCHIVES instead of deleting. This leg
@@ -245,6 +269,7 @@ extension MemtermAppDelegate {
             assert: { [self] in
                 guard let engine = memory, let doomed = controllers.first(where: {
                     $0.workspaceId == activeWorkspaceId && $0.allPanes().count == 1
+                        && $0.host?.isDropdown != true
                 }) else {
                     throw ProbeFailure("no single-pane tab to close")
                 }
@@ -307,8 +332,19 @@ extension MemtermAppDelegate {
                         .allSatisfy { $0.frame.width >= 1 && $0.frame.height >= 1 }
             },
             assert: { [self] in
-                let windows = hosts.filter { !$0.tabs.isEmpty }.count
-                let panes = controllers.flatMap { $0.allPanes() }
+                // The drop-down panel restores AS a panel: hidden, role kept,
+                // its tab live; it is not one of the normal windows counted
+                // below.
+                let panelHosts = hosts.filter { $0.isDropdown }
+                let panelHidden = panelHosts.allSatisfy { $0.window?.isVisible != true }
+                let panelTabs = panelHosts.flatMap(\.tabs)
+                print("SMOKE-DROPDOWN restored_panels=\(panelHosts.count) hidden=\(panelHidden) panel_tabs=\(panelTabs.count) panel_ws=\(panelHosts.first?.workspaceId ?? "nil")")
+                guard panelHosts.count == 1, panelHidden, panelTabs.count == 1,
+                      panelHosts[0].workspaceId == StateStore.defaultWorkspaceId else {
+                    throw ProbeFailure("drop-down panel did not restore as a hidden panel")
+                }
+                let windows = hosts.filter { !$0.tabs.isEmpty && !$0.isDropdown }.count
+                let panes = controllers.filter { $0.host?.isDropdown != true }.flatMap { $0.allPanes() }
                 let cwds = panes.compactMap { $0.lastKnownCwd }
                 print("SMOKE-RESTORED windows=\(windows) tabs=\(controllers.count) panes=\(panes.count) cwds=\(cwds)")
                 // Workspace assertions: parked B is listed but NOT restored.
@@ -345,8 +381,9 @@ extension MemtermAppDelegate {
                 // forever: its sessions row and frozen files must have
                 // survived the crash-sim relaunch (including the launch-time
                 // orphan sweep and retention pass).
-                guard controllers.count == 1, panes.count == 2 else {
-                    throw ProbeFailure("close-forget: expected 1 tab / 2 panes restored, got \(controllers.count) tab(s) / \(panes.count) pane(s)")
+                let normalTabs = controllers.filter { $0.host?.isDropdown != true }.count
+                guard normalTabs == 1, panes.count == 2 else {
+                    throw ProbeFailure("close-forget: expected 1 tab / 2 panes restored, got \(normalTabs) tab(s) / \(panes.count) pane(s)")
                 }
                 guard let engine = memory else { throw ProbeFailure("no engine") }
                 engine.store.barrier()  // launch sweep + retention have run
@@ -374,7 +411,7 @@ extension MemtermAppDelegate {
         smoke.add(ProbeStep(
             name: "verify-restore-geometry-golden", timeout: 10,
             assert: { [self] in
-                guard let host = hosts.first(where: { !$0.tabs.isEmpty }),
+                guard let host = hosts.first(where: { !$0.tabs.isEmpty && !$0.isDropdown }),
                       let window = host.window, let tab = host.selectedTab else {
                     throw ProbeFailure("no restored window for the geometry golden")
                 }

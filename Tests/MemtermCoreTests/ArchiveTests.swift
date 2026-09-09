@@ -127,7 +127,7 @@ final class ArchiveTests: XCTestCase {
         authorV5Fixture(at: dbURL)
 
         var store: StateStore? = StateStore(url: dbURL)
-        XCTAssertEqual(store!.getMeta("schema_version"), "6")
+        XCTAssertEqual(store!.getMeta("schema_version"), "7")
         XCTAssertEqual(store!.archivedSessionCount(), 0)
         XCTAssertTrue(store!.archivedSessions().isEmpty)
         XCTAssertTrue(store!.searchArchivedSessions("anything").isEmpty)
@@ -142,7 +142,7 @@ final class ArchiveTests: XCTestCase {
         // over a v6 file and changes nothing.
         store = nil
         store = StateStore(url: dbURL)
-        XCTAssertEqual(store!.getMeta("schema_version"), "6")
+        XCTAssertEqual(store!.getMeta("schema_version"), "7")
         restored = store!.loadState()
         XCTAssertEqual(restored.count, 1)
         XCTAssertEqual(restored[0].tabs[0].panes["p1"]?.snapshot?.adapter, "ssh")
