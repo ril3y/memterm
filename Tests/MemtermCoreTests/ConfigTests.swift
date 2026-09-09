@@ -307,3 +307,21 @@ final class ConfigTests: XCTestCase {
                           Config.fontCandidates.firstIndex(of: "Menlo")!)
     }
 }
+
+// Founder ask 2026-09-09: confirm-on-close for tabs, with the sheet's
+// "Don't ask me again" writing the key back.
+final class ConfirmCloseTabConfigTests: XCTestCase {
+    func testDefaultsOnAndParses() {
+        XCTAssertTrue(Config().confirmCloseTab)
+        XCTAssertFalse(Config.parse("confirm_close_tab = false\n").confirmCloseTab)
+        XCTAssertTrue(Config.parse("confirm_close_tab = true\n").confirmCloseTab)
+    }
+
+    func testRoundTripsThroughSerialization() {
+        var c = Config()
+        c.confirmCloseTab = false
+        let text = c.serialize()
+        XCTAssertTrue(text.contains("confirm_close_tab = false"), text)
+        XCTAssertFalse(Config.parse(text).confirmCloseTab)
+    }
+}

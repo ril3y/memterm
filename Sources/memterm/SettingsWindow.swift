@@ -20,6 +20,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     private let sameCwdCheck = NSButton(checkboxWithTitle: "New tabs open in the current directory", target: nil, action: nil)
     private let copyOnSelectCheck = NSButton(checkboxWithTitle: "Selecting text copies it", target: nil, action: nil)
     private let confirmQuitCheck = NSButton(checkboxWithTitle: "Confirm quitting while jobs are running", target: nil, action: nil)
+    private let confirmCloseTabCheck = NSButton(checkboxWithTitle: "Confirm before closing a tab", target: nil, action: nil)
     private let workspaceBarCheck = NSButton(checkboxWithTitle: "Show the workspace bar", target: nil, action: nil)
     private let shellField = NSTextField()
 
@@ -125,7 +126,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private func buildForm() {
-        for check in [sameCwdCheck, copyOnSelectCheck, confirmQuitCheck, workspaceBarCheck,
+        for check in [sameCwdCheck, copyOnSelectCheck, confirmQuitCheck, confirmCloseTabCheck, workspaceBarCheck,
                       optionMetaCheck, mouseReportingCheck, blurCheck,
                       shellIntegrationCheck] {
             wire(check)
@@ -205,6 +206,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             [NSGridCell.emptyContentView, copyOnSelectCheck],
             [NSGridCell.emptyContentView, confirmQuitCheck],
             [NSGridCell.emptyContentView, caption("⌘Q asks only while foreground jobs are running. Quitting always remembers your layout and sessions.")],
+            [NSGridCell.emptyContentView, confirmCloseTabCheck],
+            [NSGridCell.emptyContentView, caption("The tab's ✕ and Close Tab ask first. The sheet's “Don't ask me again” turns this off.")],
             [NSGridCell.emptyContentView, workspaceBarCheck],
             [label("Shell:"), shellField],
             [NSGridCell.emptyContentView, caption("Applies to new panes. Blank uses $SHELL.")],
@@ -410,6 +413,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         sameCwdCheck.state = config.newTabSameCwd ? .on : .off
         copyOnSelectCheck.state = config.copyOnSelect ? .on : .off
         confirmQuitCheck.state = config.confirmQuit ? .on : .off
+        confirmCloseTabCheck.state = config.confirmCloseTab ? .on : .off
         workspaceBarCheck.state = config.workspaceBar ? .on : .off
         shellField.stringValue = config.shell ?? ""
 
@@ -520,6 +524,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         config.newTabSameCwd = sameCwdCheck.state == .on
         config.copyOnSelect = copyOnSelectCheck.state == .on
         config.confirmQuit = confirmQuitCheck.state == .on
+        config.confirmCloseTab = confirmCloseTabCheck.state == .on
         config.workspaceBar = workspaceBarCheck.state == .on
         let shell = shellField.stringValue.trimmingCharacters(in: .whitespaces)
         config.shell = shell.isEmpty ? nil : shell

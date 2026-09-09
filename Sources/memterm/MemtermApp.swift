@@ -296,7 +296,15 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// FR-56: closing from the menu is a user gesture — windowWillClose runs
     /// the standard forget path.
     @objc private func ctxTabClose(_ sender: NSMenuItem) {
-        (sender.representedObject as? MoveTabRequest)?.controller?.close()
+        (sender.representedObject as? MoveTabRequest)?.controller?.requestUserClose()
+    }
+
+    /// The close sheet's "Don't ask me again": one key flipped and saved —
+    /// not applyConfigLive, which would also reset the ⌘+/⌘- zoom.
+    func setConfirmCloseTab(_ on: Bool) {
+        guard config.confirmCloseTab != on else { return }
+        config.confirmCloseTab = on
+        config.save()
     }
 
     /// FR-59 corollary: hidden live controllers keep the app alive — closing

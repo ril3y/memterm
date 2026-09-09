@@ -3753,10 +3753,79 @@ extension MemtermAppDelegate {
     private func addTabGestureSteps(_ probe: ProbeRunner) {
         // Hover-✕: the strip's close button through the REAL button action —
         // a USER close, so FR-56 forgets its rows at the gesture.
+        // confirm_close_tab (founder 2026-09-09): with the default ON, the ✕
+        // opens a confirmation SHEET on the host window carrying a "Don't
+        // ask me again" box. The leg checks that box and presses Close Tab
+        // through the sheet's real buttons; the tab must close AND the
+        // setting must flip to false in memory and in config.toml.
+        var confirmDoomed: TerminalWindowController?
+        var confirmBefore = -1
+        probe.addStateful(ProbeStep(
+            name: "close-x-confirm-sheet", timeout: 10,
+            action: { [self] in
+                guard let host = keyHost(), let window = host.window else {
+                    probeFail("no host (confirm-sheet leg)")
+                }
+                guard config.confirmCloseTab else {
+                    probeFail("confirm_close_tab must default ON for this leg (config says off)")
+                }
+                newWindowForTab(nil)
+                guard let doomed = host.selectedTab else { probeFail("confirm leg: no new tab") }
+                confirmDoomed = doomed
+                memory?.flushSync()
+                confirmBefore = memory?.store.counts().tabs ?? -1
+                let clicked = host.tabStrip.probeClickClose(of: doomed.tabId)
+                guard clicked, let sheet = window.attachedSheet, let root = sheet.contentView else {
+                    probeFail("✕ with confirm_close_tab on did not open the confirmation sheet")
+                }
+                // The tab must still be alive behind the sheet.
+                guard controllers.contains(where: { $0 === doomed }) else {
+                    probeFail("tab closed BEFORE the confirmation was answered")
+                }
+                func buttons(_ view: NSView) -> [NSButton] {
+                    var out: [NSButton] = []
+                    if let b = view as? NSButton { out.append(b) }
+                    for sub in view.subviews { out += buttons(sub) }
+                    return out
+                }
+                let all = buttons(root)
+                guard let suppress = all.first(where: { $0.title == "Don't ask me again" }),
+                      let closeButton = all.first(where: { $0.title == "Close Tab" }),
+                      all.contains(where: { $0.title == "Cancel" }) else {
+                    probeFail("confirmation sheet lacks its controls: \(all.map(\.title))")
+                }
+                suppress.state = .on
+                print("UIPROBE-CLOSE-CONFIRM sheet=true buttons=\(all.map(\.title)) suppress_checked=true")
+                closeButton.performClick(nil)
+            },
+            condition: { [self] in
+                guard let doomed = confirmDoomed else { return false }
+                return !controllers.contains { $0 === doomed }
+                    && keyHost()?.window?.attachedSheet == nil
+            },
+            assert: { [self] in
+                memory?.store.barrier()
+                let afterTabs = memory?.store.counts().tabs ?? -1
+                let onDisk = (try? String(contentsOf: Config.configURL, encoding: .utf8)) ?? ""
+                let saved = onDisk.contains("confirm_close_tab = false")
+                print("UIPROBE-CLOSE-CONFIRM closed=true rows_forgotten=\(afterTabs == confirmBefore - 1) setting_now=\(config.confirmCloseTab) saved_false=\(saved)")
+                guard afterTabs == confirmBefore - 1 else {
+                    throw ProbeFailure("confirmed close did not archive the tab's rows (FR-56)")
+                }
+                guard !config.confirmCloseTab, saved else {
+                    throw ProbeFailure("\"Don't ask me again\" did not turn confirm_close_tab off (memory=\(config.confirmCloseTab) disk=\(saved))")
+                }
+            }))
+
+        // Hover-✕ with the confirmation now suppressed: closes immediately,
+        // no sheet — the "don't ask again" actually took.
         probe.addStateful(ProbeStep(
             name: "hover-x-close", timeout: 8,
             assert: { [self] in
                 guard let host = keyHost() else { throw ProbeFailure("no host (close-x leg)") }
+                guard !config.confirmCloseTab else {
+                    throw ProbeFailure("close-x leg expects confirm_close_tab off after the sheet leg")
+                }
                 newWindowForTab(nil)
                 guard let doomed = host.selectedTab else {
                     throw ProbeFailure("close-x leg: no new tab")
@@ -3764,6 +3833,9 @@ extension MemtermAppDelegate {
                 memory?.flushSync()
                 let beforeTabs = memory?.store.counts().tabs ?? -1
                 let clicked = host.tabStrip.probeClickClose(of: doomed.tabId)
+                guard host.window?.attachedSheet == nil else {
+                    throw ProbeFailure("a confirmation sheet appeared although confirm_close_tab is off")
+                }
                 memory?.store.barrier()
                 let afterTabs = memory?.store.counts().tabs ?? -1
                 let forgotten = afterTabs == beforeTabs - 1

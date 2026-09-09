@@ -147,6 +147,37 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         }
     }
 
+    /// A user's TAB-close gesture — the hover ✕ and the tab menu's Close Tab
+    /// (founder ask 2026-09-09). With confirm_close_tab on, a window sheet
+    /// asks first; its "Don't ask me again" box turns the setting off (saved
+    /// to config.toml, mirrored by Settings) — honored only when the user
+    /// actually closes, so a Cancel never silently changes a setting. The
+    /// close itself is the unchanged FR-56 archive path. Council #1: a
+    /// sheet on the host window, never a screen-centered runModal.
+    func requestUserClose() {
+        guard app.config.confirmCloseTab, let window = host?.window else {
+            close()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Close “\(displayTitle)”?"
+        alert.informativeText = "Its shells will be terminated. The scrollback is filed in the timeline archive."
+        alert.addButton(withTitle: "Close Tab")
+        alert.addButton(withTitle: "Cancel")
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Don't ask me again"
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            if alert.suppressionButton?.state == .on {
+                self.app.setConfirmCloseTab(false)
+            }
+            // Deferred: the sheet is still winding down inside its own
+            // completion; closing the tab (and maybe its window) from here
+            // raced AppKit's sheet teardown.
+            DispatchQueue.main.async { self.close() }
+        }
+    }
+
     /// Set just before close() when the ROOT pane's shell died on its own
     /// (processTerminated) so teardown archives with the honest close_reason.
     private var teardownCloseReason: SessionCloseReason?

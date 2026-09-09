@@ -187,6 +187,9 @@ probe "matrix-founder" fresh "$CFGDIR/founder.toml"
 check "matrix-founder-seam" "$LOG/probe-matrix-founder.log" "UIPROBE-SEAM-MODEL opacity=0.37 pane_alpha=0.00 window_alpha=0.37 cells_follow_opacity=true ok=true"
 check "fresh-default-seam-skips" "$LOG/probe-fresh-default.log" "UIPROBE-SKIP step=translucent-ground-seam reason=window_opacity=1"
 check "fresh-default-capture-cells" "$LOG/probe-fresh-default.log" "UIPROBE-CAPTURE-CELLS gap_ok=true nul=false"
+# confirm_close_tab (founder 2026-09-09): the sheet was driven, the tab closed,
+# and "Don't ask me again" persisted false.
+check "fresh-default-close-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CLOSE-CONFIRM closed=true rows_forgotten=true setting_now=false saved_false=true"
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
 check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-contrast-rendered reason=workspace_bar=false"
 check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"

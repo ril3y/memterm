@@ -70,6 +70,9 @@ public struct Config {
     /// Founder confirm-quit stage: ⌘Q with running foreground jobs asks first
     /// (plain shells quit instantly either way — FR-20 stays lossless).
     public var confirmQuit = true
+    /// Founder ask 2026-09-09: the hover ✕ / Close Tab ask first; the sheet's
+    /// "Don't ask me again" box writes this back as false.
+    public var confirmCloseTab = true
     /// Vertical line-spacing multiplier (SwiftTerm's lineSpacing), 1.0–1.6.
     public var lineSpacing = 1.0
     /// Terminal mouse reporting (vim/htop capture the mouse). SwiftTerm's
@@ -185,6 +188,7 @@ public struct Config {
         }
         if let b = boolean(values["serial_local_echo"]) { c.serialLocalEcho = b }
         if let b = boolean(values["confirm_quit"]) { c.confirmQuit = b }
+        if let b = boolean(values["confirm_close_tab"]) { c.confirmCloseTab = b }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
         // Numeric knobs clamp into their sane range (a hand-typed 3.0 line
@@ -279,6 +283,7 @@ public struct Config {
         lines.append("new_tab_same_cwd = \(newTabSameCwd)  # new tabs/windows open in the current directory")
         lines.append("option_as_meta = \(optionAsMeta)  # Option sends Esc+ (readline/emacs word keys)")
         lines.append("confirm_quit = \(confirmQuit)  # ⌘Q asks first when foreground jobs are running")
+        lines.append("confirm_close_tab = \(confirmCloseTab)  # the tab ✕ / Close Tab ask first (\"Don't ask me again\" turns this off)")
         lines.append("allow_mouse_reporting = \(allowMouseReporting)  # apps (vim, htop) may capture the mouse")
         lines.append("bell_style = \"\(bellStyle)\"  # \(Self.bellStyles.joined(separator: " | "))")
         if let bellSound {
@@ -357,6 +362,7 @@ public struct Config {
         # ⌘Q asks first when foreground jobs are still running. Plain shells
         # quit instantly either way (quit always keeps your layout/sessions).
         # confirm_quit = true
+        # confirm_close_tab = true   # closing a tab asks first; "Don't ask me again" sets false
 
         # Let terminal apps (vim, htop) capture the mouse. false keeps native
         # text selection everywhere.

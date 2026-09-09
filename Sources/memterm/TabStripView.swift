@@ -227,7 +227,8 @@ final class TabStripView: NSVisualEffectView {
     func closeItem(_ item: TabItemView) {
         // FR-56: the hover ✕ is a user gesture; close() infers user intent
         // from the live flags (active workspace, not quitting/switching).
-        item.tab?.close()
+        // confirm_close_tab (founder 2026-09-09): the gesture asks first.
+        item.tab?.requestUserClose()
     }
 
     func renameItem(_ item: TabItemView) {
