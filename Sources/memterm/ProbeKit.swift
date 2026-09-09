@@ -446,11 +446,17 @@ func probeContentBoundingBox(_ bmp: NSBitmapImageRep, region: CGRect,
     }
     guard !samples.isEmpty else { return nil }
     let floor = max(1, samples.count / 5)  // >= 20% of pixels = background
-    let backgrounds: [(CGFloat, CGFloat, CGFloat)] = histogram
-        .filter { $0.value >= floor }
-        .map { key, _ in ((CGFloat((key >> 8) & 15) + 0.5) / 16,
-                          (CGFloat((key >> 4) & 15) + 0.5) / 16,
-                          (CGFloat(key & 15) + 0.5) / 16) }
+    // Spelled out step by step: the one-expression filter/map form is fine
+    // on Swift 6.2 but Swift 6.0 (macos-15 CI runners) gives up
+    // type-checking it.
+    func bucketCenter(_ nibble: Int) -> CGFloat { (CGFloat(nibble) + 0.5) / 16 }
+    var backgrounds: [(CGFloat, CGFloat, CGFloat)] = []
+    for (key, count) in histogram where count >= floor {
+        let r = bucketCenter((key >> 8) & 15)
+        let g = bucketCenter((key >> 4) & 15)
+        let b = bucketCenter(key & 15)
+        backgrounds.append((r, g, b))
+    }
     guard !backgrounds.isEmpty else { return nil }
 
     var minPX = Int.max, maxPX = Int.min, minPY = Int.max, maxPY = Int.min
