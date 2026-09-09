@@ -41,13 +41,19 @@ Every terminal on macOS loses your work at reboot. iTerm2's session restoration 
 
 ## Install / build
 
+**Download:** the latest DMG is on the [Releases page](https://github.com/ril3y/memterm/releases). The app self-updates (Sparkle, iTerm2-style): it checks the release feed daily and offers new versions; **memterm ▸ Check for Updates…** checks now. Builds are ad-hoc signed — on first launch, right-click ▸ Open.
+
+**From source:**
+
 ```sh
-git clone <repo> && cd memterm
+git clone https://github.com/ril3y/memterm.git && cd memterm
 bash scripts/make-app.sh     # builds release, stamps version+sha, produces dist/memterm.app
 open dist/memterm.app
 ```
 
 Requires macOS 14+ and a Swift 6 toolchain. `dist/memterm.app/Contents/MacOS/memterm --version` prints the exact commit and build time of any binary.
+
+**Releasing:** push a tag `vX.Y.Z`. The Release workflow builds the stamped app, wraps it in a DMG (`scripts/make-dmg.sh`), signs it with the Sparkle EdDSA key (`SPARKLE_PRIVATE_KEY` secret), writes the appcast (`scripts/make-appcast.sh`), and publishes both on the GitHub Release. Running apps pick it up from `releases/latest/download/appcast.xml`. CI runs the unit tests and the smoke save/verify restore gate on every push.
 
 ## Configuration
 

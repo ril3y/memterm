@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: build · unit tests · smoke restore
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+      - name: Build
+        run: swift build
+      - name: Unit tests
+        run: swift test
+      - name: Config dump (headless wiring)
+        run: |
+          mkdir -p /tmp/cfg && : > /tmp/cfg/default.toml
+          MEMTERM_CONFIG_PATH=/tmp/cfg/default.toml .build/debug/memterm --config-dump
+      # The reboot-restore promise: capture → crash-sim → restore, against the
+      # committed geometry golden (TESTING.md L3). Runs the real AppKit app in
+      # quiet mode on the runner's GUI session.
+      - name: Smoke save
+        run: |
+          mkdir -p /tmp/smoke
+          MEMTERM_STATE_DIR=/tmp/smoke MEMTERM_CONFIG_PATH=/tmp/cfg/default.toml \
+            .build/debug/memterm --smoke=save | tee smoke-save.log
+          grep -qE 'SMOKE-PASS run=save steps=([0-9]+)/\1' smoke-save.log
+      - name: Smoke verify
+        run: |
+          MEMTERM_STATE_DIR=/tmp/smoke MEMTERM_CONFIG_PATH=/tmp/cfg/default.toml \
+            MEMTERM_SMOKE_GOLDEN="$PWD/Tests/goldens/smoke-restore-geometry.txt" \
+            .build/debug/memterm --smoke=verify | tee smoke-verify.log
+          grep -qE 'SMOKE-PASS run=verify steps=([0-9]+)/\1' smoke-verify.log
+          grep -q 'SMOKE-GEOMETRY golden=match' smoke-verify.log
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: smoke-*.log
+          if-no-files-found: ignore

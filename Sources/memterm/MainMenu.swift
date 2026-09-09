@@ -29,6 +29,8 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     let appMenu = submenu("memterm")
     add("About memterm", to: appMenu,
         #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "", modifiers: [])
+    add("Check for Updates…", to: appMenu,
+        #selector(MemtermAppDelegate.checkForUpdates(_:)), "", modifiers: [])
     appMenu.addItem(.separator())
     add("Settings…", to: appMenu, #selector(MemtermAppDelegate.openPreferences(_:)), ",",
         target: app)

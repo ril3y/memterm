@@ -31,7 +31,15 @@ fi
 GIT_HASH="$(git rev-parse --short HEAD)$DIRTY_SUFFIX"
 GIT_COUNT="$(git rev-list --count HEAD)"
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-SHORT_VERSION="0.1.$GIT_COUNT"
+# Release builds (release.yml) pass the tag's version; local builds stamp
+# 0.1.<commit count>. CFBundleVersion stays the commit count either way —
+# numeric and monotonic, which is what Sparkle compares.
+SHORT_VERSION="${MEMTERM_VERSION:-0.1.$GIT_COUNT}"
+# Sparkle self-update (Updater.swift): the appcast every release publishes,
+# and the EdDSA public key its DMG signatures verify against (private half:
+# the SPARKLE_PRIVATE_KEY Actions secret; keychain item on the founder's Mac).
+SPARKLE_FEED_URL="${MEMTERM_SPARKLE_FEED:-https://github.com/ril3y/memterm/releases/latest/download/appcast.xml}"
+SPARKLE_PUBLIC_KEY="oylrv6N1LwQaMXjT3mSLlWlk49DtlpUqExStT2++Sac="
 
 STAMP_FILE="$REPO_ROOT/Sources/memterm/BuildStamp.generated.swift"
 cat > "$STAMP_FILE" <<STAMP
@@ -47,9 +55,13 @@ swift build -c release -Xswiftc -DMEMTERM_STAMPED >&2
 
 APP_DIR="$REPO_ROOT/dist/memterm.app"
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Frameworks"
 
 cp "$REPO_ROOT/.build/release/memterm" "$APP_DIR/Contents/MacOS/memterm"
+# Sparkle.framework (SwiftPM binary target) rides in Contents/Frameworks; the
+# binary links it via @rpath, so give it the standard app rpath.
+cp -R "$REPO_ROOT/.build/release/Sparkle.framework" "$APP_DIR/Contents/Frameworks/Sparkle.framework"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_DIR/Contents/MacOS/memterm" 2>/dev/null || true
 cp "$REPO_ROOT/Assets/memterm.icns" "$APP_DIR/Contents/Resources/memterm.icns"
 # Help ▸ memterm README opens this bundled copy (council #6 menu hygiene).
 cp "$REPO_ROOT/README.md" "$APP_DIR/Contents/Resources/README.md"
@@ -81,10 +93,25 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>SUFeedURL</key>
+	<string>$SPARKLE_FEED_URL</string>
+	<key>SUPublicEDKey</key>
+	<string>$SPARKLE_PUBLIC_KEY</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 </dict>
 </plist>
 PLIST
 
+# Ad-hoc signing, inside-out (Sparkle's nested Autoupdate/XPC bundles first,
+# then the framework, then the app — never --deep over the app).
+codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" >&2 2>/dev/null || true
+codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" >&2 2>/dev/null || true
+codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" >&2
+codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app" >&2
+codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework" >&2
 codesign --force --sign - "$APP_DIR" >&2
 
 # Artifact identity = embedded stamp + POST-codesign binary hash (codesign

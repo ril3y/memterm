@@ -56,6 +56,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// Workspaces with windows on screen this session; scopes topology saves
     /// so switched-away / parked workspaces' journal rows are never erased.
     var materializedWorkspaceIds: Set<String> = []
+    /// Sparkle self-update (packaged app only; nil in bare/automated runs).
+    var updater: UpdaterHost?
     /// Set while park/forget tear windows down (and around a switch's
     /// hide/show transition) so those events aren't captured as topology
     /// mutations (same idea as isTerminating).
@@ -196,6 +198,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(workspaceWillPowerOff(_:)),
             name: NSWorkspace.willPowerOffNotification, object: nil)
+
+        // iTerm2-style self-update: scheduled checks against the GitHub
+        // Releases appcast, packaged app only (see Updater.swift).
+        if UpdaterHost.isSupported { updater = UpdaterHost() }
 
         // Custom-tab-chrome stage: the tab strip is OURS now — double-click
         // rename, right-click menus, hover ✕, and drag reorder are handled by
@@ -668,6 +674,19 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openConfigFile(_ sender: Any?) {
         NSWorkspace.shared.open(Config.configURL)
+    }
+
+    /// memterm ▸ Check for Updates… — Sparkle's interactive check. A bare
+    /// build (no bundle feed) says so instead of failing silently.
+    @objc func checkForUpdates(_ sender: Any?) {
+        if let updater {
+            updater.controller.checkForUpdates(sender)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Updates need the packaged app"
+        alert.informativeText = "This memterm was run from a bare build. Releases at https://github.com/ril3y/memterm/releases update themselves."
+        alert.runModal()
     }
 
     /// Settings changes land here: adopt, apply to every open pane, persist.

@@ -1,0 +1,60 @@
+name: Release
+
+# Tag vX.Y.Z → stamped memterm.app → DMG → EdDSA-signed → GitHub Release
+# carrying the DMG and the Sparkle appcast the running apps poll
+# (SUFeedURL = …/releases/latest/download/appcast.xml).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  SPARKLE_VERSION: "2.9.6"
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # make-app.sh stamps CFBundleVersion from the commit count
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+      - name: Unit tests
+        run: swift test
+      - name: Build app bundle
+        run: MEMTERM_VERSION="${GITHUB_REF_NAME#v}" ./scripts/make-app.sh
+      - name: Build DMG
+        id: dmg
+        run: echo "path=$(./scripts/make-dmg.sh)" >> "$GITHUB_OUTPUT"
+      - name: Sparkle tools
+        run: |
+          curl -sSL -o /tmp/sparkle.tar.xz \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          mkdir -p /tmp/sparkle && tar -xJf /tmp/sparkle.tar.xz -C /tmp/sparkle
+      - name: Sign DMG (EdDSA) + appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          test -n "$SPARKLE_PRIVATE_KEY" || { echo "SPARKLE_PRIVATE_KEY secret missing"; exit 1; }
+          umask 077; printf '%s' "$SPARKLE_PRIVATE_KEY" > /tmp/ed.key
+          SIG="$(/tmp/sparkle/bin/sign_update --ed-key-file /tmp/ed.key "${{ steps.dmg.outputs.path }}")"
+          rm -f /tmp/ed.key
+          echo "$SIG"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$(basename "${{ steps.dmg.outputs.path }}")"
+          ./scripts/make-appcast.sh "${{ steps.dmg.outputs.path }}" "$URL" "$SIG"
+          cat dist/appcast.xml
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "memterm ${GITHUB_REF_NAME#v}" --generate-notes \
+            "${{ steps.dmg.outputs.path }}" dist/appcast.xml

@@ -7,7 +7,11 @@ let package = Package(
         .macOS(.v14)
     ],
     dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.2.0")
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.2.0"),
+        // Self-update (iTerm2-style): Sparkle 2 via its SwiftPM binary
+        // distribution. Feed URL + EdDSA public key live in the app's
+        // Info.plist (scripts/make-app.sh); release.yml signs each DMG.
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.6")
     ],
     targets: [
         // libproc has no Swift module; tiny C wrappers for kernel-truth capture.
@@ -53,6 +57,7 @@ let package = Package(
             name: "memterm",
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
+                .product(name: "Sparkle", package: "Sparkle"),
                 "CProcShim",
                 "MemtermCore",
                 "MemtermExtensionKit",
