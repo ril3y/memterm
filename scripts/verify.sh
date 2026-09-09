@@ -182,6 +182,7 @@ probe "observe" observe "$CFGDIR/default.toml" "$SEED2"
 # config matrix, quiet (chip contrast asserted per config — bug 2's gate;
 # founder-like = the exact opacity 0.37 + blur that shipped the escape).
 probe "matrix-founder" fresh "$CFGDIR/founder.toml"
+check "fresh-default-capture-cells" "$LOG/probe-fresh-default.log" "UIPROBE-CAPTURE-CELLS gap_ok=true nul=false"
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
 check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-contrast-rendered reason=workspace_bar=false"
 check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"

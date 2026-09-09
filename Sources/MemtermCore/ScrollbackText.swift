@@ -18,13 +18,26 @@ public enum ScrollbackText {
         }
     }
 
+    /// Founder bug 2026-09-09 (ghost text "Theexitcodecamefromthelastls"):
+    /// a terminal cell that was never written — TUI renderers (Claude Code's
+    /// included) skip runs of spaces with cursor-forward moves instead of
+    /// emitting spaces — is code 0 in the engine buffer, and the engine's
+    /// line-to-string conversion emits it as a literal NUL. Fed back as
+    /// ghost history, the parser drops NUL, so every skipped gap vanished
+    /// and words glued together. On the grid a never-written cell IS a
+    /// blank, so the serialized form says so.
+    public static func normalizeCells(_ text: String) -> String {
+        text.contains("\0") ? text.replacingOccurrences(of: "\0", with: " ") : text
+    }
+
     public static func assemble(rows: [Row], maxLines: Int) -> String {
         var lines: [String] = []
         for row in rows {
+            let text = normalizeCells(row.text)
             if row.isWrapped, !lines.isEmpty {
-                lines[lines.count - 1] += row.text
+                lines[lines.count - 1] += text
             } else {
-                lines.append(row.text)
+                lines.append(text)
             }
         }
         while let last = lines.last, last.isEmpty { lines.removeLast() }
@@ -54,8 +67,10 @@ public enum ScrollbackText {
 
     /// LF-joined serialized scrollback → CRLF text safe to feed() into a
     /// terminal view as ghost history (display only — never written to a pty).
+    /// Captures written before the NUL fix (2026-09-09) still carry NULs on
+    /// disk; healing them here keeps every existing ghost readable.
     public static func ghostFeedText(_ serialized: String) -> String {
-        serialized.replacingOccurrences(of: "\n", with: "\r\n")
+        normalizeCells(serialized).replacingOccurrences(of: "\n", with: "\r\n")
     }
 
     // MARK: - Restore dividers (council #9: collapse stacked generations)

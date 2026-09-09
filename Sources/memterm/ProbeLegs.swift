@@ -1059,6 +1059,28 @@ extension MemtermAppDelegate {
                 }
                 probeCompositedShot(host.window, name: "council3-content-inset")
             }))
+
+        // Founder bug 2026-09-09 (ghost "Theexitcodecamefromthelastls"): a
+        // renderer that skips space runs with cursor-forward leaves
+        // never-written cells; the LIVE capture surface must serialize them
+        // as spaces, never NUL. Display-only feed into the pane — nothing
+        // reaches the pty.
+        probe.add(ProbeStep(
+            name: "capture-skipped-cells",
+            assert: { [self] in
+                guard let host = keyHost(), let tab = host.selectedTab,
+                      let pane = tab.allPanes().first else {
+                    throw ProbeFailure("no pane (capture-cells leg)")
+                }
+                pane.feed(text: "\r\nprobe-gap\u{1b}[3Ccells\u{1b}[2Cend\r\n")
+                let text = pane.scrollbackText(maxLines: 200)
+                let hasNul = text.contains("\0")
+                let hasGap = text.contains("probe-gap   cells  end")
+                print("UIPROBE-CAPTURE-CELLS gap_ok=\(hasGap) nul=\(hasNul)")
+                guard hasGap, !hasNul else {
+                    throw ProbeFailure("capture lost skipped cells: gap_ok=\(hasGap) nul=\(hasNul)")
+                }
+            }))
     }
 
     // -----------------------------------------------------------------

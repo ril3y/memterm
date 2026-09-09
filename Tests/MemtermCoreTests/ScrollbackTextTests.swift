@@ -197,3 +197,27 @@ final class ScrollbackTextTests: XCTestCase {
         ].joined(separator: "\n"))
     }
 }
+
+// Founder bug 2026-09-09: ghost history read "Theexitcodecamefromthelastls" —
+// never-written cells (TUI renderers skip space runs with cursor-forward)
+// serialized as NUL and vanished on replay. Pure half of the gate; the
+// capture half (wide-glyph padding excluded) is CaptureCellsTests.
+final class ScrollbackNulCellTests: XCTestCase {
+    func testNeverWrittenCellsSerializeAsSpaces() {
+        let text = ScrollbackText.assemble(rows: [
+            ScrollbackText.Row(text: "The\0exit\0code", isWrapped: false),
+        ], maxLines: 10)
+        XCTAssertEqual(text, "The exit code")
+        XCTAssertFalse(text.contains("\0"))
+    }
+
+    /// Captures written before the fix carry NULs on disk — the ghost feed
+    /// heals them so existing history reads correctly too.
+    func testGhostFeedHealsLegacyNuls() {
+        XCTAssertEqual(ScrollbackText.ghostFeedText("a\0b\nc"), "a b\r\nc")
+    }
+
+    func testNormalizeIsIdentityWithoutNuls() {
+        XCTAssertEqual(ScrollbackText.normalizeCells("plain text"), "plain text")
+    }
+}

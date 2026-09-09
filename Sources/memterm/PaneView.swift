@@ -158,8 +158,14 @@ class PaneView: LocalProcessTerminalView {
         var rows: [ScrollbackText.Row] = []
         var row = terminal.buffer.totalLinesTrimmed
         while let line = terminal.getScrollInvariantLine(row: row) {
-            rows.append(ScrollbackText.Row(text: line.translateToString(trimRight: true),
-                                           isWrapped: line.isWrapped))
+            // skipNullCellsFollowingWide: a wide glyph's padding cell is code 0
+            // too — dropped here so ScrollbackText's never-written-cell →
+            // space normalization (founder bug 2026-09-09) can't add a
+            // phantom space after every CJK/emoji glyph.
+            rows.append(ScrollbackText.Row(
+                text: line.translateToString(trimRight: true,
+                                             skipNullCellsFollowingWide: true),
+                isWrapped: line.isWrapped))
             row += 1
         }
         return ScrollbackText.assemble(rows: rows, maxLines: maxLines)
