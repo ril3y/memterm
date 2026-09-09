@@ -3850,6 +3850,76 @@ extension MemtermAppDelegate {
                 }
             }))
 
+        // ⌘W on a single-pane tab is a TAB close, so it asks too (founder
+        // 2026-09-09) — and this leg takes the CANCEL path the ✕ leg does
+        // not: the tab must survive and the setting must stay untouched.
+        // Then, with the setting off again, ⌘W closes the tab with no sheet.
+        var cmdWTab: TerminalWindowController?
+        probe.addStateful(ProbeStep(
+            name: "cmd-w-tab-confirm-cancel", timeout: 10,
+            action: { [self] in
+                guard let host = keyHost(), let window = host.window else {
+                    probeFail("no host (⌘W confirm leg)")
+                }
+                newWindowForTab(nil)
+                guard let tab = host.selectedTab, tab.allPanes().count == 1 else {
+                    probeFail("⌘W leg: no fresh single-pane tab")
+                }
+                cmdWTab = tab
+                setConfirmCloseTab(true)
+                closePane(nil)  // the Shell ▸ Close Tab / ⌘W action
+                guard let sheet = window.attachedSheet, let root = sheet.contentView else {
+                    probeFail("⌘W on a single-pane tab did not open the confirmation sheet")
+                }
+                guard controllers.contains(where: { $0 === tab }) else {
+                    probeFail("⌘W closed the tab before the sheet was answered")
+                }
+                func buttons(_ view: NSView) -> [NSButton] {
+                    var out: [NSButton] = []
+                    if let b = view as? NSButton { out.append(b) }
+                    for sub in view.subviews { out += buttons(sub) }
+                    return out
+                }
+                let all = buttons(root)
+                guard let suppress = all.first(where: { $0.title == "Don't ask me again" }),
+                      let cancel = all.first(where: { $0.title == "Cancel" }) else {
+                    probeFail("⌘W sheet lacks its controls: \(all.map(\.title))")
+                }
+                // Check the box, then CANCEL: the setting must NOT change.
+                suppress.state = .on
+                cancel.performClick(nil)
+            },
+            condition: { [self] in keyHost()?.window?.attachedSheet == nil },
+            assert: { [self] in
+                guard let tab = cmdWTab, let host = keyHost() else {
+                    throw ProbeFailure("⌘W leg lost its tab")
+                }
+                let alive = controllers.contains { $0 === tab }
+                let settingKept = config.confirmCloseTab
+                print("UIPROBE-CMDW-CONFIRM sheet=true cancelled=true tab_alive=\(alive) setting_kept_on=\(settingKept)")
+                guard alive, settingKept else {
+                    throw ProbeFailure("Cancel on the ⌘W sheet: tab alive=\(alive), setting still on=\(settingKept)")
+                }
+                // Setting off → ⌘W closes the tab outright, no sheet.
+                setConfirmCloseTab(false)
+                closePane(nil)
+                guard host.window?.attachedSheet == nil else {
+                    throw ProbeFailure("⌘W showed a sheet although confirm_close_tab is off")
+                }
+            }))
+        probe.addStateful(ProbeStep(
+            name: "cmd-w-tab-closes-when-off", timeout: 8,
+            condition: { [self] in
+                guard let tab = cmdWTab else { return false }
+                return !controllers.contains { $0 === tab }
+            },
+            assert: { [self] in
+                print("UIPROBE-CMDW-CONFIRM off=true closed=true focus_in_pane=\(keyHost()?.window?.firstResponder is PaneView)")
+                guard keyHost()?.window?.firstResponder is PaneView else {
+                    throw ProbeFailure("⌘W tab close left focus outside a pane")
+                }
+            }))
+
         // Strip double-click rename through the sheet's own controls.
         var renamedTab: TerminalWindowController?
         probe.addStateful(ProbeStep(

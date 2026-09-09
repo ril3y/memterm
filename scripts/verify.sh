@@ -190,6 +190,7 @@ check "fresh-default-capture-cells" "$LOG/probe-fresh-default.log" "UIPROBE-CAPT
 # confirm_close_tab (founder 2026-09-09): the sheet was driven, the tab closed,
 # and "Don't ask me again" persisted false.
 check "fresh-default-close-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CLOSE-CONFIRM closed=true rows_forgotten=true setting_now=false saved_false=true"
+check "fresh-default-cmdw-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CMDW-CONFIRM sheet=true cancelled=true tab_alive=true setting_kept_on=true"
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
 check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-contrast-rendered reason=workspace_bar=false"
 check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"

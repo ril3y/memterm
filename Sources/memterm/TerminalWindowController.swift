@@ -857,6 +857,13 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
 
     func closeCurrentPane() {
         guard let pane = currentPane() else { return }
+        // ⌘W on the tab's LAST pane closes the whole tab — that is a tab
+        // close, so it asks like the ✕ does (confirm_close_tab; founder
+        // 2026-09-09). On a split it just closes the pane, no question.
+        if allPanes().count == 1 {
+            requestUserClose()
+            return
+        }
         close(pane: pane)
     }
 
