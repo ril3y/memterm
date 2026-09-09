@@ -7,7 +7,11 @@ let package = Package(
         .macOS(.v14)
     ],
     dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.2.0"),
+        // ril3y/SwiftTerm = upstream 1.20.0 + translucentCellBackgrounds
+        // (explicit cell backgrounds follow window opacity, iTerm2-style —
+        // founder ask 2026-09-09; PR'd upstream). Back to upstream once merged.
+        .package(url: "https://github.com/ril3y/SwiftTerm.git",
+                 branch: "feature/translucent-cell-backgrounds"),
         // Self-update (iTerm2-style): Sparkle 2 via its SwiftPM binary
         // distribution. Feed URL + EdDSA public key live in the app's
         // Info.plist (scripts/make-app.sh); release.yml signs each DMG.

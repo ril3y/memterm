@@ -465,6 +465,11 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         } else if !config.isWindowOpaque {
             pane.nativeBackgroundColor = NSColor.black.withAlphaComponent(0)
         }
+        // Founder 2026-09-09 ("why does the black background stand out so
+        // much"): explicit cell backgrounds (Claude Code's prompt rows, diff
+        // lines) follow the window opacity like iTerm2, instead of
+        // Terminal.app's solid blocks. Our fork of SwiftTerm carries the knob.
+        pane.translucentCellBackgrounds = true
         if let fg = config.themeForegroundColor { pane.nativeForegroundColor = fg }
         if let cursor = config.themeCursorColor { pane.caretColor = cursor }
         if let selection = config.themeSelectionColor {
@@ -957,6 +962,7 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             // Translucency is the window's; the pane ground is clear (see
             // constructPane — the founder's 2026-09-09 margin seam).
             pane.nativeBackgroundColor = opaque ? bg : bg.withAlphaComponent(0)
+            pane.translucentCellBackgrounds = true
             pane.nativeForegroundColor = fg
             pane.caretColor = config.themeCursorColor ?? fg
             pane.selectedTextBackgroundColor = config.themeSelectionColor

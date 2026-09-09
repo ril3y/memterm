@@ -184,7 +184,7 @@ probe "observe" observe "$CFGDIR/default.toml" "$SEED2"
 probe "matrix-founder" fresh "$CFGDIR/founder.toml"
 # Founder bug 2026-09-09 (translucent margin seam): the leg must MEASURE a
 # match at 0.37, never skip; opaque configs skip by design.
-check "matrix-founder-seam" "$LOG/probe-matrix-founder.log" "UIPROBE-SEAM-MODEL opacity=0.37 pane_alpha=0.00 window_alpha=0.37 ok=true"
+check "matrix-founder-seam" "$LOG/probe-matrix-founder.log" "UIPROBE-SEAM-MODEL opacity=0.37 pane_alpha=0.00 window_alpha=0.37 cells_follow_opacity=true ok=true"
 check "fresh-default-seam-skips" "$LOG/probe-fresh-default.log" "UIPROBE-SKIP step=translucent-ground-seam reason=window_opacity=1"
 check "fresh-default-capture-cells" "$LOG/probe-fresh-default.log" "UIPROBE-CAPTURE-CELLS gap_ok=true nul=false"
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"

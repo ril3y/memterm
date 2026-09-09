@@ -1,5 +1,5 @@
 {
-  "originHash" : "095b10cd3b586adef1e3e4dfb1f454a437d2792c9ebf37af8a342894906e2b2d",
+  "originHash" : "a1ccf66895a1d16d51756b59112c72cd44dcf975ece4359c0052b5e13e27ad12",
   "pins" : [
     {
       "identity" : "sparkle",
@@ -22,10 +22,10 @@
     {
       "identity" : "swiftterm",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/migueldeicaza/SwiftTerm.git",
+      "location" : "https://github.com/ril3y/SwiftTerm.git",
       "state" : {
-        "revision" : "5d14406844143538cd8f8851d2d8a67c1fe443e5",
-        "version" : "1.20.0"
+        "branch" : "feature/translucent-cell-backgrounds",
+        "revision" : "968fa6fd38f0efed7e614d470a6dee9326924088"
       }
     }
   ],

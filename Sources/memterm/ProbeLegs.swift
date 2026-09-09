@@ -1089,11 +1089,20 @@ extension MemtermAppDelegate {
                 // 0 with AND without the bug), so gate on the property itself.
                 let paneAlpha = pane.nativeBackgroundColor.alphaComponent
                 let windowAlpha = window.backgroundColor.alphaComponent
+                // Founder 2026-09-09 ("why does the black background stand
+                // out so much"): explicit cell backgrounds follow the window
+                // opacity (iTerm2-style) — the fork's translucentCellBackgrounds
+                // must be on, and a red-background cell must map to the
+                // window's alpha, not a solid block.
+                // (The per-cell alpha itself is pinned by the fork's own
+                // BackgroundOpacityTests; the mapping is internal to SwiftTerm.)
+                let cellsFollow = pane.translucentCellBackgrounds
                 let modelOk = paneAlpha <= 0.01
                     && abs(windowAlpha - config.effectiveOpacity) <= 0.01
-                print("UIPROBE-SEAM-MODEL opacity=\(config.windowOpacity) pane_alpha=\(String(format: "%.2f", paneAlpha)) window_alpha=\(String(format: "%.2f", windowAlpha)) ok=\(modelOk)")
+                    && cellsFollow
+                print("UIPROBE-SEAM-MODEL opacity=\(config.windowOpacity) pane_alpha=\(String(format: "%.2f", paneAlpha)) window_alpha=\(String(format: "%.2f", windowAlpha)) cells_follow_opacity=\(cellsFollow) ok=\(modelOk)")
                 guard modelOk else {
-                    throw ProbeFailure("translucent ground painted twice: pane alpha \(String(format: "%.2f", paneAlpha)) over window alpha \(String(format: "%.2f", windowAlpha))")
+                    throw ProbeFailure("translucent ground model broken: pane alpha \(String(format: "%.2f", paneAlpha)), window alpha \(String(format: "%.2f", windowAlpha)), explicit cell backgrounds follow opacity: \(cellsFollow)")
                 }
                 guard ProbeSupport.visible else { return }
                 guard let bmp = probeCompositedBitmap(window, name: "translucent-seam") else {
