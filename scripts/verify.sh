@@ -143,6 +143,11 @@ MEMTERM_STATE_DIR="$SMOKEDIR" MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" \
     "$BIN" --smoke=verify > "$LOG/smoke-verify.log" 2>&1
 check "smoke-verify" "$LOG/smoke-verify.log" "SMOKE-PASS run=verify steps=([0-9]+)/\1"
 check "smoke-geometry-golden" "$LOG/smoke-verify.log" "SMOKE-GEOMETRY golden=match"
+# Founder bug 2026-09-09 (duplicate window at launch): the seed carries a
+# hidden-unparked workspace; launch must show exactly the active one and
+# leave C journaled for a lazy resurrect on switch-in.
+check "smoke-launch-visible" "$LOG/smoke-verify.log" "SMOKE-LAUNCH-VISIBLE hosts=1 visible=1 stray=0 c_restored=false"
+check "smoke-lazy-resurrect" "$LOG/smoke-verify.log" "SMOKE-LAZY-RESURRECT c_tabs=1 visible=1 stray=0 "
 
 echo "== [7/8] UI probe: fresh / restored / observe + config matrix (+1 visible pass)"
 probe() {  # probe <label> <mode> <configfile> <statedir(optional)> [visible]

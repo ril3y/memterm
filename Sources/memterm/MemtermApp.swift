@@ -157,13 +157,20 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             // Everything was parked: the active one reopens so a window exists.
             engine.store.setWorkspaceParked(active, parked: false)
         }
-        var restoredAnything = false
-        for workspace in engine.store.listWorkspaces() where !workspace.isParked {
-            let restored = engine.store.loadState(workspaceId: workspace.id)
-            guard !restored.isEmpty else { continue }
-            restoreWindows(restored, workspaceId: workspace.id)
-            materializedWorkspaceIds.insert(workspace.id)
-            restoredAnything = true
+        // FR-59 invariant at launch (founder bug 2026-09-09: "the window
+        // opens 2x with the same exact workspace duplicated"): exactly the
+        // ACTIVE workspace's windows come back on screen. Every other
+        // unparked workspace — hidden at quit under FR-59's non-destructive
+        // switching — keeps its journal rows untouched (it is NOT
+        // materialized, so the scoped topology save never rewrites it) and
+        // resurrects through the standard pipeline on its first switch-in,
+        // exactly as a parked workspace reopens. Restoring them all here
+        // presented every workspace's windows at once (the pre-FR-59 loop),
+        // stacked over the active one.
+        let restored = engine.store.loadState(workspaceId: activeWorkspaceId)
+        let restoredAnything = !restored.isEmpty
+        if restoredAnything {
+            restoreWindows(restored, workspaceId: activeWorkspaceId)
         }
         materializedWorkspaceIds.insert(activeWorkspaceId)
         if controllers.isEmpty {

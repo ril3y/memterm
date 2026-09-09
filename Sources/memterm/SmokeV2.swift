@@ -191,6 +191,47 @@ extension MemtermAppDelegate {
                 guard parked == 1 else { throw ProbeFailure("B not parked") }
             }))
 
+        // Founder bug 2026-09-09 ("the window opens 2x with the same exact
+        // workspace duplicated"): a workspace left HIDDEN-but-unparked at
+        // quit (FR-59 switching) must not come back on screen next to the
+        // active one. Seed that world: C is created, visited, and switched
+        // away from — unparked, journaled, hidden. Run 2 asserts the launch
+        // shows exactly the active workspace, then that C resurrects on
+        // switch-in.
+        var workspaceC: String?
+        smoke.add(ProbeStep(
+            name: "save-hidden-c-open", timeout: 10,
+            action: { [self] in
+                workspaceC = createWorkspace(named: "C")
+                if let c = workspaceC { switchToWorkspace(c) }
+            },
+            condition: { [self] in
+                guard let c = workspaceC else { return false }
+                return controllers.contains { $0.workspaceId == c && $0.window?.isVisible == true }
+                    && defaultControllers().allSatisfy { $0.window?.isVisible != true }
+            }))
+        smoke.add(ProbeStep(
+            name: "save-hidden-c-leave", timeout: 10,
+            action: { [self] in switchToWorkspace(StateStore.defaultWorkspaceId) },
+            condition: { [self] in
+                guard let c = workspaceC else { return false }
+                return defaultControllers().contains { $0.window?.isVisible == true }
+                    && controllers.filter { $0.workspaceId == c }
+                        .allSatisfy { $0.window?.isVisible != true }
+            },
+            assert: { [self] in
+                guard let engine = memory, let c = workspaceC else {
+                    throw ProbeFailure("no workspace C")
+                }
+                engine.flushSync()
+                let row = engine.store.listWorkspaces().first { $0.id == c }
+                let windows = engine.store.loadState(workspaceId: c).count
+                print("SMOKE-HIDDEN-C parked=\(row?.isParked == true) journaled_windows=\(windows)")
+                guard row?.isParked == false, windows >= 1 else {
+                    throw ProbeFailure("hidden C must be unparked with journal rows (parked=\(String(describing: row?.isParked)) windows=\(windows))")
+                }
+            }))
+
         // FR-56 leg — SEMANTICS UPDATED with the founder-amended FR-56
         // (approved 2026-09-02), the ONE place the meaning legitimately
         // changes: a user close now ARCHIVES instead of deleting. This leg
@@ -279,6 +320,25 @@ extension MemtermAppDelegate {
                 if controllers.contains(where: { $0.workspaceId == b.id }) {
                     throw ProbeFailure("parked workspace B was restored")
                 }
+                // Founder bug 2026-09-09: hidden-but-unparked C has journal
+                // rows, is NOT restored at launch, and exactly the active
+                // workspace's windows are visible — no second window stacked
+                // over the active one.
+                guard let c = list.first(where: { $0.name == "C" }), !c.isParked else {
+                    throw ProbeFailure("workspace C missing or parked")
+                }
+                guard !store.loadState(workspaceId: c.id).isEmpty else {
+                    throw ProbeFailure("hidden workspace C lost its journal rows across the relaunch")
+                }
+                let visibleHosts = hosts.filter { $0.window?.isVisible == true }
+                let strayVisible = visibleHosts.filter { $0.workspaceId != activeWorkspaceId }
+                print("SMOKE-LAUNCH-VISIBLE hosts=\(hosts.count) visible=\(visibleHosts.count) stray=\(strayVisible.count) c_restored=\(controllers.contains { $0.workspaceId == c.id })")
+                if controllers.contains(where: { $0.workspaceId == c.id }) {
+                    throw ProbeFailure("hidden workspace C was restored at launch (the duplicate-window bug)")
+                }
+                guard strayVisible.isEmpty, !visibleHosts.isEmpty else {
+                    throw ProbeFailure("launch visibility broke FR-59: \(visibleHosts.count) visible host(s), \(strayVisible.count) outside the active workspace")
+                }
                 // FR-56 (amended 2026-09-02): the deliberately-closed tab
                 // from run 1 must NOT be restored (unchanged), while the
                 // split tab (2 panes) is — but it is now ARCHIVED, not gone
@@ -349,6 +409,43 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("restored geometry diverged from golden \(goldenPath):\nGOT:\n\(dump)\nWANT:\n\(want)")
                 }
                 print("SMOKE-GEOMETRY golden=match")
+            }))
+
+        // The other half of the launch promise (founder bug 2026-09-09):
+        // the hidden-at-quit workspace is one switch away — its journal
+        // resurrects through the standard pipeline on first switch-in, and
+        // the outgoing active workspace hides whole (FR-59).
+        var pidsBefore: [pid_t] = []
+        smoke.add(ProbeStep(
+            name: "verify-lazy-resurrect-c", timeout: 15,
+            action: { [self] in
+                pidsBefore = controllers.flatMap { $0.allPanes() }.compactMap { $0.process?.shellPid }
+                guard let c = memory?.store.listWorkspaces().first(where: { $0.name == "C" }) else {
+                    probeFail("no workspace C to switch to")
+                }
+                switchToWorkspace(c.id)
+            },
+            condition: { [self] in
+                guard let c = memory?.store.listWorkspaces().first(where: { $0.name == "C" }) else { return false }
+                let cTabs = controllers.filter { $0.workspaceId == c.id }
+                return activeWorkspaceId == c.id
+                    && cTabs.contains { $0.window?.isVisible == true }
+                    && cTabs.allSatisfy { $0.allPanes().allSatisfy { $0.frame.width >= 1 && $0.frame.height >= 1 } }
+                    && controllers.filter { $0.workspaceId == StateStore.defaultWorkspaceId }
+                        .allSatisfy { $0.window?.isVisible != true }
+            },
+            assert: { [self] in
+                guard let c = memory?.store.listWorkspaces().first(where: { $0.name == "C" }) else {
+                    throw ProbeFailure("no workspace C")
+                }
+                let cTabs = controllers.filter { $0.workspaceId == c.id }
+                let survivors = pidsBefore.filter { kill($0, 0) == 0 }.count
+                let visibleHosts = hosts.filter { $0.window?.isVisible == true }
+                let stray = visibleHosts.filter { $0.workspaceId != c.id }.count
+                print("SMOKE-LAZY-RESURRECT c_tabs=\(cTabs.count) visible=\(visibleHosts.count) stray=\(stray) default_pids_alive=\(survivors)/\(pidsBefore.count)")
+                guard cTabs.count >= 1, stray == 0, survivors == pidsBefore.count else {
+                    throw ProbeFailure("lazy resurrect of C: tabs=\(cTabs.count) stray_visible=\(stray) default pids alive \(survivors)/\(pidsBefore.count)")
+                }
             }))
     }
 }
