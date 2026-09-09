@@ -182,6 +182,9 @@ check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip
 check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"
 check "matrix-nobar-skips-chipclick" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-click-rename-gate reason=workspace_bar=false"
 check "matrix-nobar-skips-hierarchy" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-pill-hierarchy reason=workspace_bar=false"
+# Appearance › Size scales the chrome (founder bug 2026-09-09): the leg
+# must MEASURE a grown pill, never pass vacuously.
+check "fresh-default-chrome-scales" "$LOG/probe-fresh-default.log" "UIPROBE-CHROME-SCALE size=20 tab_font=11.0->17.0 "
 probe "matrix-light"   fresh "$CFGDIR/light.toml"
 probe "matrix-dark"    fresh "$CFGDIR/dark.toml"
 

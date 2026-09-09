@@ -1323,6 +1323,63 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("gear/+ cluster misaligned: gear midX \(gearMid) vs plus midX \(plusMid)")
                 }
             }))
+
+        // Founder bug (2026-09-09): "the settings in appearance sets the size
+        // of the text but the tabs/workspace does not really abide by this
+        // setting". Flip Appearance › Size LIVE (the Settings path,
+        // applyConfigLive) and assert the RENDERED chrome follows
+        // ChromeMetrics: pill + chip fonts, both row heights — and the
+        // council-#10 hierarchy survives the scale. Restores the config after.
+        probe.add(ProbeStep(
+            name: "chrome-scales-with-size",
+            assert: { [self] in
+                guard let host = keyHost(), let strip = host.tabStrip,
+                      let selectedId = host.selectedTab?.tabId else {
+                    throw ProbeFailure("no strip (chrome-scale leg)")
+                }
+                let original = config
+                let bigSize = original.fontSize + 7   // 13 → 20: pill 11 → 17
+                var big = original
+                big.fontSize = bigSize
+                let expected = ChromeMetrics.derived(fromTerminalFontSize: bigSize)
+                let before = strip.probeLabelFontSize(of: selectedId) ?? -1
+                defer {
+                    applyConfigLive(original)
+                    host.window?.contentView?.layoutSubtreeIfNeeded()
+                }
+                applyConfigLive(big)
+                host.window?.contentView?.layoutSubtreeIfNeeded()
+                guard let tabFont = strip.probeLabelFontSize(of: selectedId),
+                      let tabFrame = strip.probeItemFrame(of: selectedId) else {
+                    throw ProbeFailure("no tab to measure after resize")
+                }
+                let stripH = strip.frame.height
+                var chipFont = CGFloat(-1), chipH = CGFloat(-1), barH = CGFloat(-1)
+                if config.workspaceBar, let bar = host.workspaceBar,
+                   let chip = bar.probeChipView(activeWorkspaceId) {
+                    chipFont = chip.probeLabelFontSize
+                    chipH = chip.frame.height
+                    barH = bar.frame.height
+                }
+                print("UIPROBE-CHROME-SCALE size=\(bigSize) tab_font=\(before)->\(tabFont) strip_h=\(stripH) chip_font=\(chipFont) chip_h=\(chipH) bar_h=\(barH) expected_pill=\(expected.pillFontSize) expected_strip=\(expected.tabStripHeight)")
+                guard tabFont == CGFloat(expected.pillFontSize), tabFont > before else {
+                    throw ProbeFailure("tab pill font \(tabFont)pt did not follow Appearance › Size (expected \(expected.pillFontSize)pt, was \(before)pt)")
+                }
+                guard abs(stripH - CGFloat(expected.tabStripHeight)) <= 0.5 else {
+                    throw ProbeFailure("tab strip height \(stripH) did not follow size (expected \(expected.tabStripHeight))")
+                }
+                if config.workspaceBar {
+                    guard chipFont == CGFloat(expected.chipFontSize) else {
+                        throw ProbeFailure("chip font \(chipFont)pt did not follow size (expected \(expected.chipFontSize)pt)")
+                    }
+                    guard abs(barH - CGFloat(expected.workspaceBarHeight)) <= 0.5 else {
+                        throw ProbeFailure("workspace bar height \(barH) did not follow size (expected \(expected.workspaceBarHeight))")
+                    }
+                    guard chipFont < tabFont, chipH < tabFrame.height else {
+                        throw ProbeFailure("council #10 hierarchy broke at size \(bigSize): chip \(chipFont)pt/\(chipH) vs tab \(tabFont)pt/\(tabFrame.height)")
+                    }
+                }
+            }))
     }
 
     // -----------------------------------------------------------------

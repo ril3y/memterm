@@ -128,6 +128,13 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         config.resolveFont(size: fontSize)
     }
 
+    /// Chrome-row sizing (chips, pills, row heights) derived from the
+    /// CONFIGURED terminal size — Settings › Appearance › Size — never the
+    /// transient ⌘+/⌘- zoom (founder bug 2026-09-09: chrome ignored Size).
+    var chromeMetrics: ChromeMetrics {
+        .derived(fromTerminalFontSize: config.fontSize)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = buildMainMenu(for: self)
 

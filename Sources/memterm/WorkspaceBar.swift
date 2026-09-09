@@ -28,7 +28,10 @@ import MemtermCore
 // menu all keep working. Always visible; `workspace_bar = false` hides it.
 
 final class WorkspaceBarView: NSVisualEffectView {
-    static let height: CGFloat = 26
+    /// Reference-design row height; the live height is ChromeMetrics'
+    /// workspaceBarHeight (the host owns the constraint).
+    static let height: CGFloat = CGFloat(ChromeMetrics.reference.workspaceBarHeight)
+    private var metrics = ChromeMetrics.reference
 
     private unowned let app: MemtermAppDelegate
     private let stack = NSStackView()
@@ -125,6 +128,8 @@ final class WorkspaceBarView: NSVisualEffectView {
     /// pulses while output flows, keeps an unseen ring after).
     func update(workspaces: [WorkspaceRow], activeId: String,
                 activity: [String: TabActivityState] = [:]) {
+        let metrics = app.chromeMetrics
+        if metrics != self.metrics { applyMetrics(metrics) }
         for view in stack.arrangedSubviews {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -134,6 +139,7 @@ final class WorkspaceBarView: NSVisualEffectView {
         for workspace in workspaces {
             let chip = chipsById[workspace.id] ?? WorkspaceChipView(app: app,
                                                                     workspaceId: workspace.id)
+            chip.apply(metrics: metrics)
             chip.configure(name: workspace.name,
                            color: MemtermAppDelegate.nsColor(hex: workspace.color),
                            isActive: workspace.id == activeId,
@@ -148,6 +154,15 @@ final class WorkspaceBarView: NSVisualEffectView {
 
     func beginRename(workspaceId: String) {
         chipsById[workspaceId]?.beginRename()
+    }
+
+    /// Appearance › Size: the bar's own text follows ChromeMetrics (chips
+    /// pick theirs up in update / configure).
+    func applyMetrics(_ metrics: ChromeMetrics) {
+        self.metrics = metrics
+        titleLabel.font = NSFont.systemFont(ofSize: CGFloat(metrics.chipFontSize),
+                                            weight: .semibold)
+        for chip in chipsById.values { chip.apply(metrics: metrics) }
     }
 
     /// MEMTERM_UI_PROBE support: the rendered chip labels, in order.
@@ -221,6 +236,14 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     private var name = ""
     private var dotColor = NSColor.systemGray
     private(set) var activityState: TabActivityState = .idle
+    /// Appearance › Size: every size-bearing constant below is the reference
+    /// design's, scaled by ChromeMetrics (apply(metrics:)).
+    private var metrics = ChromeMetrics.reference
+    private var dotSize: NSLayoutConstraint!
+    private var ringSize: NSLayoutConstraint!
+    private var closeSize: NSLayoutConstraint!
+    private var labelBaseline: NSLayoutConstraint!
+    private var chipHeight: NSLayoutConstraint!
 
     private static let pulseKey = "memterm.chip.pulse"
 
@@ -254,15 +277,19 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         closeButton.target = self
         closeButton.action = #selector(closeTapped(_:))
         addSubview(closeButton)
+        dotSize = dot.widthAnchor.constraint(equalToConstant: 8)
+        ringSize = ring.widthAnchor.constraint(equalToConstant: 14)
+        closeSize = closeButton.widthAnchor.constraint(equalToConstant: 13)
+        chipHeight = heightAnchor.constraint(equalToConstant: 19)
         NSLayoutConstraint.activate([
             dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: 8),
-            dot.heightAnchor.constraint(equalToConstant: 8),
+            dotSize,
+            dot.heightAnchor.constraint(equalTo: dot.widthAnchor),
             ring.centerXAnchor.constraint(equalTo: dot.centerXAnchor),
             ring.centerYAnchor.constraint(equalTo: dot.centerYAnchor),
-            ring.widthAnchor.constraint(equalToConstant: 14),
-            ring.heightAnchor.constraint(equalToConstant: 14),
+            ringSize,
+            ring.heightAnchor.constraint(equalTo: ring.widthAnchor),
             label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
             label.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -2),
             // Pin the TEXT BASELINE, not the frame center: frame-centering
@@ -273,15 +300,39 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             // glyph band (council #10 dropped the chips one size below the
             // tab pills; 4.25 was the size-11 tuning, scaled 10/11); the
             // probe's chip-vertical-centering step gates the rendered result.
-            label.firstBaselineAnchor.constraint(equalTo: centerYAnchor, constant: 3.85),
             label.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            closeButton.widthAnchor.constraint(equalToConstant: 13),
-            closeButton.heightAnchor.constraint(equalToConstant: 13),
-            heightAnchor.constraint(equalToConstant: 19),
+            closeSize,
+            closeButton.heightAnchor.constraint(equalTo: closeButton.widthAnchor),
+            chipHeight,
         ])
+        labelBaseline = label.firstBaselineAnchor.constraint(equalTo: centerYAnchor,
+                                                             constant: 3.85)
+        labelBaseline.isActive = true
         setContentHuggingPriority(.required, for: .horizontal)
+        apply(metrics: metrics, force: true)
+    }
+
+    /// Appearance › Size: scale the chip off ChromeMetrics. The label font
+    /// itself is (re)set by configure(); this sizes the pill, the dot/ring,
+    /// the ✕, and the baseline tuning that centers the glyph band.
+    func apply(metrics: ChromeMetrics, force: Bool = false) {
+        guard force || metrics != self.metrics else { return }
+        self.metrics = metrics
+        let s = CGFloat(metrics.scale)
+        chipHeight.constant = CGFloat(metrics.chipHeight)
+        dotSize.constant = (8 * s).rounded()
+        ringSize.constant = (14 * s).rounded()
+        closeSize.constant = (13 * s).rounded()
+        labelBaseline.constant = CGFloat(metrics.chipBaselineOffset)
+        layer?.cornerRadius = (5 * s).rounded()
+        dot.layer?.cornerRadius = dotSize.constant / 2
+        ring.layer?.cornerRadius = ringSize.constant / 2
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill",
+                                    accessibilityDescription: "Close Workspace")?
+            .withSymbolConfiguration(.init(pointSize: (9 * s).rounded(), weight: .semibold))
+        if !name.isEmpty { refreshTitle() }
     }
 
     override func updateTrackingAreas() {
@@ -355,23 +406,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         self.isParked = isParked
         let dimmed = isParked && !isActive
         dotColor = dimmed ? color.withAlphaComponent(0.45) : color
-        // Council #10: chips sit one visual level BELOW the tab pills —
-        // size 10 vs the pills' 11, medium at heaviest — so the two rows
-        // read as workspace context over tab content, not two tab bars.
-        let title = NSMutableAttributedString(
-            string: name,
-            attributes: [.foregroundColor: isActive ? NSColor.labelColor
-                            : dimmed ? NSColor.tertiaryLabelColor
-                            : NSColor.secondaryLabelColor,
-                         .font: NSFont.systemFont(ofSize: 10,
-                                                  weight: isActive ? .medium : .regular)])
-        if isParked {
-            title.append(NSAttributedString(
-                string: "  (parked)",
-                attributes: [.foregroundColor: NSColor.tertiaryLabelColor,
-                             .font: NSFont.systemFont(ofSize: 9)]))
-        }
-        label.attributedStringValue = title
+        refreshTitle()
         // Resolve the dynamic pill color against THIS window's appearance —
         // the chrome follows the theme (council #2), which may disagree with
         // the app-wide appearance that .cgColor would otherwise snapshot.
@@ -388,6 +423,28 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         toolTip = isParked ? "\(name) — parked. Click to reopen."
             : isActive ? "Double-click to rename" : "Switch to \(name)"
         closeButton.toolTip = isParked ? "Forget \(name)…" : "Park \(name) (keeps its memory)"
+    }
+
+    /// Council #10: chips sit one visual level BELOW the tab pills — chip
+    /// size vs the pills' (one point larger; 10 vs 11 at the 13pt reference,
+    /// ChromeMetrics scales both), medium at heaviest — so the two rows read
+    /// as workspace context over tab content, not two tab bars.
+    private func refreshTitle() {
+        let dimmed = isParked && !isActive
+        let title = NSMutableAttributedString(
+            string: name,
+            attributes: [.foregroundColor: isActive ? NSColor.labelColor
+                            : dimmed ? NSColor.tertiaryLabelColor
+                            : NSColor.secondaryLabelColor,
+                         .font: NSFont.systemFont(ofSize: CGFloat(metrics.chipFontSize),
+                                                  weight: isActive ? .medium : .regular)])
+        if isParked {
+            title.append(NSAttributedString(
+                string: "  (parked)",
+                attributes: [.foregroundColor: NSColor.tertiaryLabelColor,
+                             .font: NSFont.systemFont(ofSize: CGFloat(metrics.chipSuffixFontSize))]))
+        }
+        label.attributedStringValue = title
     }
 
     /// Founder 2026-09-02: the ring means "output you haven't seen" — which
@@ -473,7 +530,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     func beginRename() {
         guard editor == nil else { return }
         let field = NSTextField(string: name)
-        field.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        field.font = NSFont.systemFont(ofSize: CGFloat(metrics.chipFontSize), weight: .medium)
         field.isBordered = false
         field.focusRingType = .none
         field.drawsBackground = true

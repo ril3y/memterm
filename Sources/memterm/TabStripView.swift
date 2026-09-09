@@ -12,7 +12,9 @@ import MemtermCore
 // Strip background drags the window; double-click on background zooms.
 
 final class TabStripView: NSVisualEffectView {
-    static let height: CGFloat = 30
+    /// Reference-design row height; the live height is ChromeMetrics'
+    /// tabStripHeight (the host owns the constraint).
+    static let height: CGFloat = CGFloat(ChromeMetrics.reference.tabStripHeight)
 
     private unowned let app: MemtermAppDelegate
     private weak var host: WindowHostController?
@@ -177,9 +179,12 @@ final class TabStripView: NSVisualEffectView {
     }
 
     private func frameForItem(at index: Int) -> NSRect {
-        NSRect(x: CGFloat(layoutModel.xOrigin(of: index)), y: 3,
-               width: CGFloat(layoutModel.tabWidth),
-               height: max(0, content.frame.height - 7))
+        // Reference: 3pt above/below the pill inside the 29pt band (the
+        // strip minus its 1pt hairline) → scale the inset with the chrome.
+        let inset = (3 * CGFloat(app.chromeMetrics.scale)).rounded()
+        return NSRect(x: CGFloat(layoutModel.xOrigin(of: index)), y: inset,
+                      width: CGFloat(layoutModel.tabWidth),
+                      height: max(0, content.frame.height - 2 * inset - 1))
     }
 
     // MARK: - Interaction (called by TabItemView)
@@ -351,6 +356,11 @@ final class TabItemView: NSView {
     private let closeButton = NSButton()
     private var selected = false
     private var hovered = false
+    /// Appearance › Size: pill font + decorations scale off ChromeMetrics
+    /// (reference design: 11pt label, 16pt activity mark, 14pt ✕).
+    private var metrics = ChromeMetrics.reference
+    private var activitySize: NSLayoutConstraint!
+    private var closeSize: NSLayoutConstraint!
 
     init(app: MemtermAppDelegate, strip: TabStripView, tab: TerminalWindowController) {
         self.app = app
@@ -383,15 +393,17 @@ final class TabItemView: NSView {
         closeButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(closeButton)
 
+        activitySize = activityView.widthAnchor.constraint(equalToConstant: 16)
+        closeSize = closeButton.widthAnchor.constraint(equalToConstant: 14)
         NSLayoutConstraint.activate([
             activityView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             activityView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            activityView.widthAnchor.constraint(equalToConstant: 16),
-            activityView.heightAnchor.constraint(equalToConstant: 16),
+            activitySize,
+            activityView.heightAnchor.constraint(equalTo: activityView.widthAnchor),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            closeButton.widthAnchor.constraint(equalToConstant: 14),
-            closeButton.heightAnchor.constraint(equalToConstant: 14),
+            closeSize,
+            closeButton.heightAnchor.constraint(equalTo: closeButton.widthAnchor),
             label.leadingAnchor.constraint(equalTo: activityView.trailingAnchor, constant: 1),
             label.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -1),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -414,6 +426,7 @@ final class TabItemView: NSView {
 
     func configure(selected: Bool) {
         self.selected = selected
+        apply(metrics: app.chromeMetrics)
         guard let tab else { return }
         label.stringValue = tab.displayTitle
         toolTip = tab.displayTitle
@@ -455,7 +468,22 @@ final class TabItemView: NSView {
                 .withAlphaComponent(hovered ? 0.08 : 0.04).cgColor
             label.textColor = .secondaryLabelColor
         }
-        label.font = NSFont.systemFont(ofSize: 11, weight: selected ? .semibold : .medium)
+        label.font = NSFont.systemFont(ofSize: CGFloat(metrics.pillFontSize),
+                                       weight: selected ? .semibold : .medium)
+    }
+
+    /// Appearance › Size: scale the pill's decorations off ChromeMetrics
+    /// (the label font is set in repaint, which every configure runs).
+    private func apply(metrics: ChromeMetrics) {
+        guard metrics != self.metrics else { return }
+        self.metrics = metrics
+        let s = CGFloat(metrics.scale)
+        activitySize.constant = (16 * s).rounded()
+        closeSize.constant = (14 * s).rounded()
+        layer?.cornerRadius = (6 * s).rounded()
+        closeButton.image = NSImage(systemSymbolName: "xmark",
+                                    accessibilityDescription: "Close Tab")?
+            .withSymbolConfiguration(.init(pointSize: (8 * s).rounded(), weight: .bold))
     }
 
     override func viewDidChangeEffectiveAppearance() {

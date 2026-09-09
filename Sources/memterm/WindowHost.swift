@@ -40,6 +40,10 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     // -- Chrome --
     private let chromeStack = NSStackView()
     private let barRow = NSView()
+    /// Chrome row heights follow ChromeMetrics (Appearance › Size); kept so
+    /// applyConfig can re-size the rows live.
+    private var barRowHeight: NSLayoutConstraint!
+    private var tabStripHeight: NSLayoutConstraint!
     private(set) var workspaceBar: WorkspaceBarView?
     private let gearButton = ChipButton()
     private(set) var tabStrip: TabStripView!
@@ -113,8 +117,12 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         gearButton.translatesAutoresizingMaskIntoConstraints = false
         barRow.addSubview(gearButton)
         barRow.translatesAutoresizingMaskIntoConstraints = false
+        let metrics = app.chromeMetrics
+        bar.applyMetrics(metrics)
+        barRowHeight = barRow.heightAnchor.constraint(
+            equalToConstant: CGFloat(metrics.workspaceBarHeight))
         NSLayoutConstraint.activate([
-            barRow.heightAnchor.constraint(equalToConstant: WorkspaceBarView.height),
+            barRowHeight,
             bar.leadingAnchor.constraint(equalTo: barRow.leadingAnchor),
             bar.trailingAnchor.constraint(equalTo: barRow.trailingAnchor),
             bar.topAnchor.constraint(equalTo: barRow.topAnchor),
@@ -128,7 +136,9 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         // Row 2: the tab strip.
         tabStrip = TabStripView(app: app, host: self)
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
-        tabStrip.heightAnchor.constraint(equalToConstant: TabStripView.height).isActive = true
+        tabStripHeight = tabStrip.heightAnchor.constraint(
+            equalToConstant: CGFloat(metrics.tabStripHeight))
+        tabStripHeight.isActive = true
 
         chromeStack.orientation = .vertical
         chromeStack.alignment = .leading
@@ -398,6 +408,12 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     func applyConfig(_ config: Config) {
         updateChromeVisibility()
         applyWindowChrome(config)
+        // Appearance › Size scales the chrome rows too (ChromeMetrics): row
+        // heights here, chip/pill fonts and decorations inside the views.
+        let metrics = ChromeMetrics.derived(fromTerminalFontSize: config.fontSize)
+        barRowHeight.constant = CGFloat(metrics.workspaceBarHeight)
+        tabStripHeight.constant = CGFloat(metrics.tabStripHeight)
+        workspaceBar?.applyMetrics(metrics)
         tabStrip.reload()
     }
 
