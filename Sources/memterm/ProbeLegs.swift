@@ -1060,6 +1060,91 @@ extension MemtermAppDelegate {
                 probeCompositedShot(host.window, name: "council3-content-inset")
             }))
 
+        // Founder bug 2026-09-09 ("this weird bar or border around the whole
+        // text area"): under window_opacity < 1 the pane painted the theme
+        // ground AGAIN over the window's, so the council-#3 margin (one
+        // layer) read lighter than the pane body (two). Two truths:
+        //   * model (every run): exactly ONE layer carries the alpha — the
+        //     window ground at window_opacity, the pane ground at 0.
+        //   * composited pixels (visible runs, screen-capture permitted):
+        //     a margin sample and an adjacent blank pane-interior sample
+        //     match on screen. (cacheDisplay bitmaps omit layer grounds —
+        //     calibrated: they read 0/0/0 a0 with AND without the bug.)
+        // Opaque configs skip (the seam only exists under translucency).
+        probe.add(ProbeStep(
+            name: "translucent-ground-seam",
+            assert: { [self] in
+                guard !config.isWindowOpaque else {
+                    probe.skipLine(step: "translucent-ground-seam",
+                                   reason: "window_opacity=1")
+                    return
+                }
+                guard let host = keyHost(), let window = host.window,
+                      let tab = host.selectedTab, let pane = tab.allPanes().first else {
+                    throw ProbeFailure("no pane (seam leg)")
+                }
+                window.contentView?.layoutSubtreeIfNeeded()
+                // The engine paints its ground from nativeBackgroundColor (its
+                // layer color is a stale init-time copy — calibrated: it read
+                // 0 with AND without the bug), so gate on the property itself.
+                let paneAlpha = pane.nativeBackgroundColor.alphaComponent
+                let windowAlpha = window.backgroundColor.alphaComponent
+                let modelOk = paneAlpha <= 0.01
+                    && abs(windowAlpha - config.effectiveOpacity) <= 0.01
+                print("UIPROBE-SEAM-MODEL opacity=\(config.windowOpacity) pane_alpha=\(String(format: "%.2f", paneAlpha)) window_alpha=\(String(format: "%.2f", windowAlpha)) ok=\(modelOk)")
+                guard modelOk else {
+                    throw ProbeFailure("translucent ground painted twice: pane alpha \(String(format: "%.2f", paneAlpha)) over window alpha \(String(format: "%.2f", windowAlpha))")
+                }
+                guard ProbeSupport.visible else { return }
+                guard let bmp = probeCompositedBitmap(window, name: "translucent-seam") else {
+                    print("UIPROBE-SEAM-PIXELS skipped=no-composited-capture")
+                    return
+                }
+                let root = tab.paneRoot
+                let paneInRoot = pane.convert(pane.bounds, to: root)
+                // Adjacent samples near the container's bottom-left (the
+                // prompt lives top-left; blur makes the desktop behind two
+                // neighbouring bands near-identical): the left margin band,
+                // and the pane interior just inside it.
+                let yBand = root.bounds.minY + 24
+                let margin = root.convert(CGRect(x: 1, y: yBand,
+                                                 width: SplitLayout.contentInset - 2,
+                                                 height: 14), to: nil)
+                let interior = root.convert(CGRect(x: paneInRoot.minX + 3, y: yBand,
+                                                   width: 24, height: 14), to: nil)
+                func mean(_ region: CGRect) -> (r: CGFloat, g: CGFloat, b: CGFloat, n: Int) {
+                    let sx = CGFloat(bmp.pixelsWide) / max(window.frame.width, 1)
+                    let sy = CGFloat(bmp.pixelsHigh) / max(window.frame.height, 1)
+                    var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0
+                    var n = 0
+                    for i in 0..<8 {
+                        for j in 0..<4 {
+                            let vx = region.minX + region.width * (CGFloat(i) + 0.5) / 8
+                            let vy = region.minY + region.height * (CGFloat(j) + 0.5) / 4
+                            let px = Int(vx * sx), py = Int((window.frame.height - vy) * sy)
+                            guard px >= 0, py >= 0, px < bmp.pixelsWide, py < bmp.pixelsHigh,
+                                  let c = bmp.colorAt(x: px, y: py)?.usingColorSpace(.sRGB)
+                            else { continue }
+                            r += c.redComponent; g += c.greenComponent; b += c.blueComponent
+                            n += 1
+                        }
+                    }
+                    let d = CGFloat(max(n, 1))
+                    return (r / d, g / d, b / d, n)
+                }
+                let m = mean(margin), q = mean(interior)
+                guard m.n > 0, q.n > 0 else {
+                    throw ProbeFailure("seam samples outside the composited image")
+                }
+                let delta = max(abs(m.r - q.r), abs(m.g - q.g), abs(m.b - q.b))
+                let match = delta <= 0.06
+                print("UIPROBE-SEAM-PIXELS opacity=\(config.windowOpacity) margin=\(String(format: "%.2f/%.2f/%.2f", m.r, m.g, m.b)) interior=\(String(format: "%.2f/%.2f/%.2f", q.r, q.g, q.b)) delta=\(String(format: "%.3f", delta)) match=\(match)")
+                guard match else {
+                    probeCompositedShot(window, name: "translucent-seam-fail")
+                    throw ProbeFailure("translucent ground seam on screen: margin vs pane interior differ by \(String(format: "%.3f", delta))")
+                }
+            }))
+
         // Founder bug 2026-09-09 (ghost "Theexitcodecamefromthelastls"): a
         // renderer that skips space runs with cursor-forward leaves
         // never-written cells; the LIVE capture surface must serialize them

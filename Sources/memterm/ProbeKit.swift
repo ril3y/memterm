@@ -330,6 +330,28 @@ func probeCompositedShot(_ window: NSWindow?, name: String,
     return url.path
 }
 
+/// The composited on-screen window as a bitmap for ASSERTIONS (visible runs
+/// only): `screencapture -o -l` into the probe out dir — the path that works
+/// without the CGWindowListCreateImage screen-recording grant — with the CG
+/// image as fallback. Nil when neither source produced pixels.
+func probeCompositedBitmap(_ window: NSWindow, name: String) -> NSBitmapImageRep? {
+    guard ProbeSupport.visible else { return nil }
+    let url = ProbeSupport.outDir.appendingPathComponent("\(name).png")
+    try? FileManager.default.createDirectory(at: ProbeSupport.outDir,
+                                             withIntermediateDirectories: true)
+    try? FileManager.default.removeItem(at: url)
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    task.arguments = ["-x", "-o", "-l", String(window.windowNumber), url.path]
+    try? task.run()
+    task.waitUntilExit()
+    if let data = try? Data(contentsOf: url), let rep = NSBitmapImageRep(data: data) {
+        return rep
+    }
+    guard let cg = probeWindowImage(window) else { return nil }
+    return NSBitmapImageRep(cgImage: cg)
+}
+
 /// Bug-1 class: a pane must PRESENT with real size — frame-in-window width
 /// and height at least `minSide`, inside a non-zero container.
 func assertPaneGeometry(_ pane: NSView, paneId: String,

@@ -449,15 +449,21 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         pane.mouseReportingConfigured = config.allowMouseReporting
         if config.lineSpacing != 1.0 { pane.lineSpacing = CGFloat(config.lineSpacing) }
         pane.processDelegate = self
-        // Transparency is background-color ALPHA (SwiftTerm's CoreText path
-        // deliberately preserves a translucent background), never window
-        // alpha — text stays fully opaque.
-        let opacity = config.effectiveOpacity
+        // Transparency lives in the WINDOW's background (applyWindowChrome
+        // paints the theme ground at window_opacity), never window alpha —
+        // text stays fully opaque. The pane's own default background is
+        // fully clear under translucency: founder bug 2026-09-09 ("this
+        // weird bar or border around the whole text area") was the pane
+        // painting the same ground at the same alpha AGAIN over the window's,
+        // so the council-#3 9pt margin (one layer) read lighter than the
+        // pane body (two layers). RGB is kept (alpha 0, not .clear) so the
+        // engine's default-background color — reverse video, OSC 11 — stays
+        // the theme color.
         if let bg = config.themeBackgroundColor {
             pane.nativeBackgroundColor = config.isWindowOpaque
-                ? bg : bg.withAlphaComponent(opacity)
+                ? bg : bg.withAlphaComponent(0)
         } else if !config.isWindowOpaque {
-            pane.nativeBackgroundColor = NSColor.black.withAlphaComponent(opacity)
+            pane.nativeBackgroundColor = NSColor.black.withAlphaComponent(0)
         }
         if let fg = config.themeForegroundColor { pane.nativeForegroundColor = fg }
         if let cursor = config.themeCursorColor { pane.caretColor = cursor }
@@ -936,7 +942,6 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             split.themeDividerColor = dividerColor
         }
         let opaque = config.isWindowOpaque
-        let opacity = config.effectiveOpacity
         let bg = config.themeBackgroundColor ?? .black
         let fg = config.themeForegroundColor
             ?? NSColor(srgbRed: 0.77, green: 0.78, blue: 0.78, alpha: 1)
@@ -949,7 +954,9 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             // Live cursor restyle (Terminal.setCursorStyle is public —
             // verified in SwiftTerm's Terminal.swift:4123).
             pane.getTerminal().setCursorStyle(config.terminalCursorStyle)
-            pane.nativeBackgroundColor = opaque ? bg : bg.withAlphaComponent(opacity)
+            // Translucency is the window's; the pane ground is clear (see
+            // constructPane — the founder's 2026-09-09 margin seam).
+            pane.nativeBackgroundColor = opaque ? bg : bg.withAlphaComponent(0)
             pane.nativeForegroundColor = fg
             pane.caretColor = config.themeCursorColor ?? fg
             pane.selectedTextBackgroundColor = config.themeSelectionColor
