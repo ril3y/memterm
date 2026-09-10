@@ -138,7 +138,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         dropdownAccessibilityButton.isHidden = !doubleTap || granted
         dropdownAccessibilityCaption.stringValue = granted
             ? "Accessibility is granted: the double-tap works system-wide."
-            : "Double-tap needs Accessibility to work outside memterm (System Settings ▸ Privacy & Security ▸ Accessibility). Until then it works while memterm is frontmost."
+            : "Double-tap needs Accessibility to work outside memterm (System Settings ▸ Privacy & Security ▸ Accessibility). Until then it works only while memterm is frontmost. If memterm is already listed there but this still says not granted, remove it from the list and add it again."
     }
 
     func windowDidBecomeKey(_ notification: Notification) {

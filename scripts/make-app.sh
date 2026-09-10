@@ -40,6 +40,21 @@ SHORT_VERSION="${MEMTERM_VERSION:-0.1.$GIT_COUNT}"
 # the SPARKLE_PRIVATE_KEY Actions secret; keychain item on the founder's Mac).
 SPARKLE_FEED_URL="${MEMTERM_SPARKLE_FEED:-https://github.com/ril3y/memterm/releases/latest/download/appcast.xml}"
 SPARKLE_PUBLIC_KEY="oylrv6N1LwQaMXjT3mSLlWlk49DtlpUqExStT2++Sac="
+# Code-signing identity. A STABLE identity matters beyond Gatekeeper: macOS
+# ties Accessibility / Input Monitoring grants to the app's designated
+# requirement, and an ad-hoc signature's is the hash of that exact binary —
+# every update silently invalidated the grant the drop-down's double-tap
+# needs (founder 2026-09-10). MEMTERM_SIGN_IDENTITY overrides; otherwise the
+# first of Developer ID Application / Apple Development in the keychain;
+# else ad-hoc ("-").
+if [ -z "${MEMTERM_SIGN_IDENTITY:-}" ]; then
+    IDS="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+    for kind in "Developer ID Application" "Apple Development"; do
+        cand="$(printf '%s\n' "$IDS" | grep -oE "\"$kind: [^\"]+\"" | head -1 | tr -d '"' || true)"
+        if [ -n "$cand" ]; then MEMTERM_SIGN_IDENTITY="$cand"; break; fi
+    done
+    MEMTERM_SIGN_IDENTITY="${MEMTERM_SIGN_IDENTITY:--}"
+fi
 
 STAMP_FILE="$REPO_ROOT/Sources/memterm/BuildStamp.generated.swift"
 cat > "$STAMP_FILE" <<STAMP
@@ -105,14 +120,17 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signing, inside-out (Sparkle's nested Autoupdate/XPC bundles first,
-# then the framework, then the app — never --deep over the app).
-codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" >&2 2>/dev/null || true
-codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" >&2 2>/dev/null || true
-codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" >&2
-codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app" >&2
-codesign --force --sign - "$APP_DIR/Contents/Frameworks/Sparkle.framework" >&2
-codesign --force --sign - "$APP_DIR" >&2
+# Signing, inside-out (Sparkle's nested Autoupdate/XPC bundles first, then
+# the framework, then the app — never --deep over the app), all with the
+# same identity so the nested requirements agree.
+SIGN=(codesign --force --timestamp=none --sign "$MEMTERM_SIGN_IDENTITY")
+"${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" >&2 2>/dev/null || true
+"${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" >&2 2>/dev/null || true
+"${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" >&2
+"${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app" >&2
+"${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework" >&2
+"${SIGN[@]}" "$APP_DIR" >&2
+echo "make-app.sh: signed with ${MEMTERM_SIGN_IDENTITY} — $(codesign -d -r- "$APP_DIR" 2>&1 | grep designated | cut -c1-140)" >&2
 
 # Artifact identity = embedded stamp + POST-codesign binary hash (codesign
 # mutates the binary, so .build/release hashes can never match — record dist).

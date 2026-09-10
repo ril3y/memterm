@@ -29,8 +29,38 @@ jobs:
           restore-keys: spm-${{ runner.os }}-
       - name: Unit tests
         run: swift test
+      # A STABLE signing identity (Apple Development cert from the founder's
+      # keychain): macOS ties Accessibility grants to the app's designated
+      # requirement; ad-hoc = per-binary hash = grant lost on every update.
+      - name: Import signing identity
+        env:
+          SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          test -n "$SIGNING_CERT_P12" || { echo "SIGNING_CERT_P12 secret missing"; exit 1; }
+          KC="$RUNNER_TEMP/build.keychain-db"; KCPW="$(openssl rand -hex 16)"
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          umask 077; echo "$SIGNING_CERT_P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$SIGNING_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Apple's WWDR intermediates, so the chain builds on the runner.
+          for ca in AppleWWDRCAG3 AppleWWDRCAG4 AppleWWDRCAG5 AppleWWDRCAG6; do
+            curl -sSL -o "$RUNNER_TEMP/$ca.cer" "https://www.apple.com/certificateauthority/$ca.cer" &&               security import "$RUNNER_TEMP/$ca.cer" -k "$KC" -T /usr/bin/codesign >/dev/null 2>&1 || true
+          done
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          security find-identity -v -p codesigning "$KC"
       - name: Build app bundle
+        env:
+          MEMTERM_SIGN_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
         run: MEMTERM_VERSION="${GITHUB_REF_NAME#v}" ./scripts/make-app.sh
+      - name: Verify signature + stable requirement
+        run: |
+          codesign --verify --deep --strict dist/memterm.app
+          codesign -d -r- dist/memterm.app 2>&1 | grep designated
+          codesign -d -r- dist/memterm.app 2>&1 | grep designated | grep -q 'certificate leaf' || { echo "requirement is not certificate-bound"; exit 1; }
       - name: Build DMG
         id: dmg
         run: echo "path=$(./scripts/make-dmg.sh)" >> "$GITHUB_OUTPUT"
