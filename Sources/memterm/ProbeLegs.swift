@@ -3778,14 +3778,16 @@ extension MemtermAppDelegate {
             condition: { [self] in
                 guard let probeWs = probeWorkspaceId(), let store = memory?.store
                 else { return false }
-                return !store.listWorkspaces().contains { $0.id == probeWs }
+                return store.listWorkspaces().contains { $0.id == probeWs && $0.isParked }
                     && store.listWorkspaces().contains { $0.id == StateStore.defaultWorkspaceId }
                     && activeWorkspaceId == StateStore.defaultWorkspaceId
                     && hosts.contains { $0.window?.isVisible == true }
             },
             assert: { [self] in
-                let names = memory?.store.listWorkspaces().map { $0.name } ?? []
-                print("UIPROBE-WSCLOSE probe_removed=true default_kept=true surfaced_default=true visible_window=true names=\(names)")
+                let list = memory?.store.listWorkspaces() ?? []
+                let names = list.map { $0.name }
+                let probe = list.first { $0.id == probeWorkspaceId() }
+                print("UIPROBE-WSCLOSE probe_parked=\(probe?.isParked == true) probe_name_kept=\(probe?.name == "Probe") probe_removed=false default_kept=true surfaced_default=true visible_window=true names=\(names)")
             },
             onFailure: { [self] in
                 guard let probeWs = probeWorkspaceId(), let store = memory?.store else { return }

@@ -211,34 +211,30 @@ extension MemtermAppDelegate {
         })
     }
 
-    /// Founder (stage 2): closing the LAST tab of a non-Default workspace
-    /// removes the now-empty workspace outright — its rows, scrollback, and
-    /// chip all go; Default persists forever. Called from the tab teardown
-    /// path for USER closes only — quit, park, forget, and a shell dying on
-    /// its own never auto-remove (FR-56: memory follows intent, and only a
-    /// gesture is intent). The last remaining workspace also persists (the
-    /// app always has one).
+    /// Founder-amended 2026-09-10 (supersedes the stage-2 auto-remove):
+    /// closing the LAST tab of a non-Default workspace PARKS the now-empty
+    /// workspace — chip kept as "(parked)", name and color kept, reopenable;
+    /// nothing is deleted. The stage-2 rule deleted the workspace outright,
+    /// and the red close button (which closes every tab in a window) turned
+    /// "close a few windows" into six deleted workspaces in twenty seconds
+    /// (archive evidence, 2026-09-09 22:48). FR-56: only an EXPLICIT Forget
+    /// deletes. Called from the tab teardown path for USER closes only —
+    /// quit, park, forget, and a shell dying on its own never park.
     func workspaceEmptiedByUserClose(_ workspaceId: String) {
         guard workspaceId != StateStore.defaultWorkspaceId,
               let engine = memory,
               !controllers.contains(where: { $0.workspaceId == workspaceId }),
-              engine.store.listWorkspaces().contains(where: { $0.id == workspaceId }),
-              engine.store.listWorkspaces().count > 1 else { return }
-        // Founder-amended FR-56: this is a USER CLOSE, not an explicit
-        // Forget — the last tab already ARCHIVED itself in teardown, so the
-        // workspace's archived sessions must SURVIVE this cleanup (no
-        // archiveDir passed). Their cards keep the denormalized workspace
-        // name/color the live row is about to lose.
-        engine.store.forgetWorkspace(workspaceId, scrollbackDir: engine.scrollbackDir,
-                                     historyDir: engine.historyDir)
+              let row = engine.store.listWorkspaces().first(where: { $0.id == workspaceId }),
+              !row.isParked else { return }
+        engine.store.setWorkspaceParked(workspaceId, parked: true)
         materializedWorkspaceIds.remove(workspaceId)
-        workspaceMRU.removeAll { $0 == workspaceId }
         workspaceActivityForgotten(workspaceId)
-        // activeWorkspaceId may still name the removed workspace for a
+        // activeWorkspaceId may still name the parked workspace for a
         // moment: the deferred MRU surfacing (activeWorkspaceWindowClosed)
         // switches away, and the launch path's active-workspace fallback
         // covers a quit in between.
         rebuildWorkspaceMenu()
+        refreshWorkspaceChips()
     }
 
     /// Park = capture, close the windows, keep every journal row (FR-51).

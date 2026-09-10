@@ -328,6 +328,21 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         return controllers.isEmpty
     }
 
+    /// Dock icon click / `open -a memterm` with no visible window (the app
+    /// stays resident with the drop-down enabled, or every window was
+    /// closed): present a window — the active workspace's hidden windows if
+    /// any, else a fresh one in Default (created/un-parked as needed).
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !flag else { return true }
+        if let hidden = hosts.first(where: { !$0.isDropdown && $0.workspaceId == activeWorkspaceId && !$0.tabs.isEmpty }) {
+            hidden.focusWindow()
+            return false
+        }
+        let wsId = workspaceForDropdown()
+        openNewWindow(in: wsId)
+        return false
+    }
+
     /// The workspace a drop-down toggle lands in: the active one if it still
     /// exists (un-parked if needed); otherwise Default — created if it is
     /// somehow missing — which becomes active. Founder 2026-09-09: "when all
@@ -337,8 +352,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     func workspaceForDropdown() -> String {
         guard let store = memory?.store else { return activeWorkspaceId }
         let list = store.listWorkspaces()
-        if let current = list.first(where: { $0.id == activeWorkspaceId }) {
-            if current.isParked { store.setWorkspaceParked(current.id, parked: false) }
+        // A parked active workspace = the user just closed everything in it
+        // (FR-56a parks on the last close): the hotkey lands in Default, not
+        // back in what was just closed.
+        if let current = list.first(where: { $0.id == activeWorkspaceId }), !current.isParked {
             return current.id
         }
         let defaultId = StateStore.defaultWorkspaceId

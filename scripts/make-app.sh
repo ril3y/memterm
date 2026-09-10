@@ -106,6 +106,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 	<string>$BUILD_TIME</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>SUFeedURL</key>

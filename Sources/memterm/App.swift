@@ -261,7 +261,27 @@ func installAppIcon() {
     }
 }
 
+/// One memterm per state dir (founder 2026-09-10: "we should not allow
+/// multiple instances"): two instances on the same journal race each other's
+/// scoped topology saves. A second interactive launch of the PACKAGED app
+/// (same bundle id, real state dir) hands off to the running one and exits.
+/// Automated runs and MEMTERM_STATE_DIR-isolated launches are exempt — they
+/// run beside the founder's app by design.
+func handOffToRunningInstanceIfAny(mode: RunMode, smoke: SmokeRun?) {
+    guard mode == .interactive, smoke == nil, !ProbeSupport.isUIProbe,
+          ProcessInfo.processInfo.environment["MEMTERM_STATE_DIR"]?.isEmpty ?? true,
+          let bundleId = Bundle.main.bundleIdentifier else { return }
+    let me = ProcessInfo.processInfo.processIdentifier
+    let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+        .filter { $0.processIdentifier != me && !$0.isTerminated }
+    guard let running = others.first else { return }
+    NSLog("memterm: already running (pid %d) — activating it and exiting", running.processIdentifier)
+    running.activate(options: [.activateIgnoringOtherApps])
+    exit(0)
+}
+
 func runApp(mode: RunMode, smoke: SmokeRun? = nil) {
+    handOffToRunningInstanceIfAny(mode: mode, smoke: smoke)
     let app = NSApplication.shared
     // Quiet mode (TESTING.md §2.5): probes must be cheap to run on every
     // commit — screen-stealing is why gates get skipped. Accessory policy, no
