@@ -125,7 +125,13 @@ PLIST
 # Signing, inside-out (Sparkle's nested Autoupdate/XPC bundles first, then
 # the framework, then the app — never --deep over the app), all with the
 # same identity so the nested requirements agree.
-SIGN=(codesign --force --timestamp=none --sign "$MEMTERM_SIGN_IDENTITY")
+# A real identity signs with a secure timestamp and the hardened runtime —
+# both required for notarization (Developer ID); ad-hoc keeps neither.
+if [ "$MEMTERM_SIGN_IDENTITY" = "-" ]; then
+    SIGN=(codesign --force --timestamp=none --sign -)
+else
+    SIGN=(codesign --force --timestamp --options runtime --sign "$MEMTERM_SIGN_IDENTITY")
+fi
 "${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" >&2 2>/dev/null || true
 "${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" >&2 2>/dev/null || true
 "${SIGN[@]}" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" >&2
