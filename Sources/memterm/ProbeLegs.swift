@@ -3894,18 +3894,29 @@ extension MemtermAppDelegate {
 
         // hide_on_focus_loss: another window taking key slides the panel away;
         // with the option off it stays.
+        // Quiet runs are never the ACTIVE app, so a real key-window
+        // transition may not happen (flaked on a busy desktop); they drive
+        // the window-delegate entry point the transition calls. Visible
+        // runs take the real path.
+        func loseFocus() {
+            if ProbeSupport.visible {
+                hosts.first { !$0.isDropdown && $0.workspaceId == activeWorkspaceId }?.focusWindow()
+            } else if let panel = dropdown.panelHost {
+                dropdown.panelResignedKey(panel)
+            }
+        }
         probe.add(ProbeStep(
             name: "dropdown-focus-loss", timeout: 8,
             action: { [self] in
                 dropdown.show()
-                hosts.first { !$0.isDropdown && $0.workspaceId == activeWorkspaceId }?.focusWindow()
+                loseFocus()
             },
             condition: { [self] in dropdown.panelHost?.window?.isVisible == false },
             assert: { [self] in
-                print("UIPROBE-DROPDOWN focus_loss_hides=true")
+                print("UIPROBE-DROPDOWN focus_loss_hides=true real_key_path=\(ProbeSupport.visible)")
                 applyConfigLive(dropdownConfig(hideOnFocusLoss: false))
                 dropdown.show()
-                hosts.first { !$0.isDropdown && $0.workspaceId == activeWorkspaceId }?.focusWindow()
+                loseFocus()
                 let stayed = dropdown.panelHost?.window?.isVisible == true
                 print("UIPROBE-DROPDOWN focus_loss_off_stays=\(stayed)")
                 guard stayed else { throw ProbeFailure("hide_on_focus_loss=false must keep the panel") }
@@ -3957,6 +3968,31 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("double-tap recognition wrong")
                 }
                 if dropdown.isShowing { dropdown.hide() }
+                applyConfigLive(dropdownConfig())
+            }))
+
+        // Settings size fields (founder 2026-09-09: "nothing works unless we
+        // hit enter", "we can enter letters"): typing digits through the
+        // real field editor applies WITHOUT Enter; letters never land.
+        probe.add(ProbeStep(
+            name: "dropdown-settings-size-typing",
+            assert: { [self] in
+                let settings = SettingsWindowController(app: self)
+                let typed = settings.probeTypeDropdownWidth("40")
+                let letters = settings.probeTypeDropdownWidth("ab")
+                print("UIPROBE-DROPDOWN settings_typed_field=\(typed.field) width_after_typing=\(typed.width) letters_field=\"\(letters.field)\" width_after_letters=\(letters.width)")
+                let speed = settings.probeSetDropdownSpeed(320)
+                print("UIPROBE-DROPDOWN speed_readout=\(speed.readout) speed_config_ms=\(speed.configMs)")
+                settings.window?.orderOut(nil)
+                guard speed.readout == "320 ms", speed.configMs == 320 else {
+                    throw ProbeFailure("slide speed slider did not apply (\(speed.readout), \(speed.configMs))")
+                }
+                guard typed.field == "40", abs(typed.width - 0.4) < 0.001 else {
+                    throw ProbeFailure("typing 40 without Enter did not apply (field=\(typed.field) width=\(typed.width))")
+                }
+                guard letters.field.isEmpty || letters.field == "40", abs(letters.width - 0.4) < 0.001 else {
+                    throw ProbeFailure("letters landed in the percent field (\"\(letters.field)\")")
+                }
                 applyConfigLive(dropdownConfig())
             }))
 

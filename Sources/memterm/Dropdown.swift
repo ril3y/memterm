@@ -27,6 +27,12 @@ final class DropdownController {
     private var eventTapSource: CFRunLoopSource?
     private var localMonitor: Any?
     private var accessibilityPrompted = false
+    /// While a double-tap trigger runs on the local-monitor fallback, poll
+    /// for the Accessibility grant and upgrade to the system-wide tap the
+    /// moment it lands (founder 2026-09-09: "have the program in focus to
+    /// have the hotkey work" — the grant arrived after launch and nothing
+    /// re-checked until a relaunch).
+    private var grantPoll: Timer?
     /// The panel currently sliding away (ignored by focus-loss hiding).
     private var hiding: WindowHostController?
 
@@ -101,6 +107,21 @@ final class DropdownController {
             self?.feed(nsEvent: event)
             return event
         }
+        grantPoll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            guard Self.accessibilityGranted else { return }
+            timer.invalidate()
+            self.grantPoll = nil
+            if let localMonitor = self.localMonitor { NSEvent.removeMonitor(localMonitor) }
+            self.localMonitor = nil
+            if !self.startEventTap() {
+                // Tap refused despite the grant (rare): keep the fallback.
+                self.localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] event in
+                    self?.feed(nsEvent: event)
+                    return event
+                }
+            }
+        }
     }
 
     private func stopDoubleTap() {
@@ -114,6 +135,8 @@ final class DropdownController {
         eventTapSource = nil
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         localMonitor = nil
+        grantPoll?.invalidate()
+        grantPoll = nil
     }
 
     private func startEventTap() -> Bool {

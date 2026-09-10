@@ -12,7 +12,7 @@ import UniformTypeIdentifiers
 // shell can only affect panes created after the change; the captions say so.
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate,
-                                      NSTabViewDelegate {
+                                      NSTabViewDelegate, NSTextFieldDelegate {
     private unowned let app: MemtermAppDelegate
     private let tabView = NSTabView()
 
@@ -53,6 +53,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     private let dropdownHeightField = NSTextField()
     private let dropdownHeightStepper = NSStepper()
     private let dropdownHideCheck = NSButton(checkboxWithTitle: "Hide when another window takes focus", target: nil, action: nil)
+    private let dropdownSpeedSlider = NSSlider()
+    private let dropdownSpeedLabel = NSTextField(labelWithString: "")
 
     // Terminal
     private let cursorPopUp = NSPopUpButton()
@@ -139,6 +141,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             : "Double-tap needs Accessibility to work outside memterm (System Settings ▸ Privacy & Security ▸ Accessibility). Until then it works while memterm is frontmost."
     }
 
+    func windowDidBecomeKey(_ notification: Notification) {
+        refreshDropdownTriggerRows()
+    }
+
     @objc private func dropdownTriggerChanged(_ sender: Any?) {
         refreshDropdownTriggerRows()
         controlChanged(sender)
@@ -150,6 +156,52 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             NSWorkspace.shared.open(url)
         }
         refreshDropdownTriggerRows()
+    }
+
+    /// Live typing in the drop-down size fields: apply on every keystroke
+    /// (the field's action only fires on Enter / focus loss) and mirror the
+    /// stepper. Values are clamped by the save path (20–100).
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField,
+              field === dropdownWidthField || field === dropdownHeightField else { return }
+        let stepper = field === dropdownWidthField ? dropdownWidthStepper : dropdownHeightStepper
+        if let value = Double(field.stringValue) { stepper.doubleValue = value }
+        controlChanged(field)
+    }
+
+    /// MEMTERM_UI_PROBE: type into the drop-down width field through the
+    /// REAL field editor — no Enter — and report the field's text plus the
+    /// width the config holds afterwards.
+    func probeTypeDropdownWidth(_ text: String) -> (field: String, width: Double) {
+        guard let window else { return ("", -1) }
+        probeSelectSection("Appearance")
+        if !window.isVisible {
+            if ProbeSupport.quiet { window.setFrameOrigin(NSPoint(x: -5000, y: -5000)) }
+            window.orderFront(nil)
+        }
+        window.makeFirstResponder(dropdownWidthField)
+        if let editor = dropdownWidthField.currentEditor() as? NSTextView {
+            editor.selectAll(nil)
+            editor.insertText(text, replacementRange: editor.selectedRange())
+        }
+        return (dropdownWidthField.stringValue, app.config.dropdownWidth)
+    }
+
+    static func speedReadout(_ ms: Int) -> String {
+        ms == 0 ? "Instant" : "\(ms) ms"
+    }
+
+    @objc private func dropdownSpeedChanged(_ sender: NSSlider) {
+        let ms = Int(sender.doubleValue.rounded())
+        dropdownSpeedLabel.stringValue = Self.speedReadout(ms)
+        controlChanged(sender)
+    }
+
+    /// MEMTERM_UI_PROBE: the slide-speed readout after setting the slider.
+    func probeSetDropdownSpeed(_ ms: Int) -> (readout: String, configMs: Int) {
+        dropdownSpeedSlider.doubleValue = Double(ms)
+        dropdownSpeedChanged(dropdownSpeedSlider)
+        return (dropdownSpeedLabel.stringValue, app.config.dropdownAnimationMs)
     }
 
     @objc private func dropdownSizeStepped(_ sender: NSStepper) {
@@ -207,6 +259,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         for (field, stepper) in [(dropdownWidthField, dropdownWidthStepper),
                                  (dropdownHeightField, dropdownHeightStepper)] {
             wire(field)
+            // Founder 2026-09-09: "nothing works unless we hit enter" and
+            // "we can enter letters" — digits only, applied as you type
+            // (controlTextDidChange), stepper kept in step.
+            field.formatter = DigitsOnlyFormatter()
+            field.delegate = self
             field.alignment = .right
             stepper.minValue = DropdownLayout.sizeRange.lowerBound * 100
             stepper.maxValue = DropdownLayout.sizeRange.upperBound * 100
@@ -215,6 +272,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             stepper.action = #selector(dropdownSizeStepped(_:))
         }
         dropdownHotkey.onChange = { [weak self] _ in self?.controlChanged(nil) }
+        // Founder 2026-09-09: slide speed for show AND hide (0 = instant).
+        dropdownSpeedSlider.minValue = Double(Config.dropdownAnimationRange.lowerBound)
+        dropdownSpeedSlider.maxValue = Double(Config.dropdownAnimationRange.upperBound)
+        dropdownSpeedSlider.isContinuous = true
+        dropdownSpeedSlider.target = self
+        dropdownSpeedSlider.action = #selector(dropdownSpeedChanged(_:))
+        dropdownSpeedSlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        dropdownSpeedLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        dropdownSpeedLabel.widthAnchor.constraint(equalToConstant: 60).isActive = true
         wire(fontPopUp)
         wire(sizeField)
         sizeField.alignment = .right
@@ -362,6 +428,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             [label("Slides from:"), NSStackView(views: [dropdownEdgePopUp, label("aligned"), dropdownAlignPopUp])],
             [label("Size:"), dropdownSizeRow],
             [label("Screen:"), dropdownScreenPopUp],
+            [label("Slide speed:"), NSStackView(views: [caption("Instant"), dropdownSpeedSlider, caption("Slow"), dropdownSpeedLabel])],
             [NSGridCell.emptyContentView, dropdownHideCheck],
             [NSGridCell.emptyContentView, caption("A global hotkey slides a terminal in from the screen edge and away again. Shell ▸ Toggle Drop-down Terminal does the same.")],
         ])
@@ -568,6 +635,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         dropdownHeightField.stringValue = String(Int((config.dropdownHeight * 100).rounded()))
         dropdownHeightStepper.doubleValue = config.dropdownHeight * 100
         dropdownHideCheck.state = config.dropdownHideOnFocusLoss ? .on : .off
+        dropdownSpeedSlider.doubleValue = Double(config.dropdownAnimationMs)
+        dropdownSpeedLabel.stringValue = Self.speedReadout(config.dropdownAnimationMs)
         blurCheck.isEnabled = !config.isWindowOpaque
 
         // Terminal
@@ -672,6 +741,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             config.dropdownHeight = (DropdownLayout.clamp(h / 100) * 100).rounded() / 100
         }
         config.dropdownHideOnFocusLoss = dropdownHideCheck.state == .on
+        config.dropdownAnimationMs = Int(dropdownSpeedSlider.doubleValue.rounded())
         blurCheck.isEnabled = !config.isWindowOpaque
 
         // A color well changing means the user picked colors again — and any
@@ -853,5 +923,33 @@ private extension NSBox {
         box.translatesAutoresizingMaskIntoConstraints = false
         box.widthAnchor.constraint(equalToConstant: 320).isActive = true
         return box
+    }
+}
+
+/// Digits only, as typed: a text field with this formatter refuses letters
+/// and punctuation at the keystroke (Settings percent fields, 2026-09-09).
+final class DigitsOnlyFormatter: NumberFormatter {
+    override init() {
+        super.init()
+        allowsFloats = false
+        minimum = 0
+        maximum = 100
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func isPartialStringValid(_ partialString: String,
+                                       newEditingString newString: AutoreleasingUnsafeMutablePointer<NSString?>?,
+                                       errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
+        partialString.isEmpty || partialString.allSatisfy(\.isNumber)
+    }
+
+    // An in-progress "" or "5" must not be flagged as invalid on the way out.
+    override func getObjectValue(_ obj: AutoreleasingUnsafeMutablePointer<AnyObject?>?,
+                                 for string: String,
+                                 errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
+        obj?.pointee = NSNumber(value: Int(string) ?? 0)
+        return true
     }
 }

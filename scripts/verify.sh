@@ -196,6 +196,7 @@ check "fresh-default-cmdw-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CMDW-
 # off-edge with its tab live, journaled with its role, per-workspace.
 check "fresh-default-dropdown-show" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN show=true role=dropdown ws_is_active=true .* expected_off=0.0 level_floating=true movable=false hotkey_registered=none"
 check "fresh-default-dropdown-switch" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN switch_hides=true per_workspace_panels=true back_same_tab=true"
+check "fresh-default-dropdown-size-typing" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN settings_typed_field=40 width_after_typing=0.4 "
 check "fresh-default-dropdown-double-tap" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN double_tap_toggles=true slow_ignored=true shortcut_ignored=true other_key_ignored=true global_tap=false"
 check "smoke-dropdown-restores" "$LOG/smoke-verify.log" "SMOKE-DROPDOWN restored_panels=1 hidden=true panel_tabs=1 "
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
