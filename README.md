@@ -55,6 +55,10 @@ Requires macOS 14+ and a Swift 6 toolchain. `dist/memterm.app/Contents/MacOS/mem
 
 **Releasing:** push a tag `vX.Y.Z`. The Release workflow builds the stamped app, wraps it in a DMG (`scripts/make-dmg.sh`), signs it with the Sparkle EdDSA key (`SPARKLE_PRIVATE_KEY` secret), writes the appcast (`scripts/make-appcast.sh`), and publishes both on the GitHub Release. Running apps pick it up from `releases/latest/download/appcast.xml`. CI runs the unit tests and the smoke save/verify restore gate on every push.
 
+## Drop-down terminal (Quake style)
+
+A global hotkey slides a terminal in from a screen edge and away again — the Quake console, the way Guake and iTerm2's hotkey window do it. Off until you enable it in **Settings ▸ Appearance**: pick the trigger — a key combination (click the recorder, press keys: ⌃`, ⌘⇧T, F12…) or a **double-tap** of Control, Option, Command, Shift, or Esc (needs Accessibility to work while another app is frontmost; Settings has a Grant button, and until then it works while memterm is frontmost) — the edge it slides from (top, left, right), alignment along the top edge, width × height as a percentage of the screen, which screen (the one under the mouse, or the main one), and whether it hides when another window takes focus. **Shell ▸ Toggle Drop-down Terminal** does the same as the hotkey. The panel belongs to the active workspace: its tabs are remembered and restored (hidden) like any others, it hides with its workspace on a switch, and every workspace gets its own on first use. The same keys live under `[dropdown]` in the config file.
+
 ## Configuration
 
 One file: `~/.config/memterm/config.toml` (created with commented defaults on first launch), plus a native Settings window (⌘,) that reads and writes the same file. No preference-pane sprawl.

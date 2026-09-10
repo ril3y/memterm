@@ -64,16 +64,29 @@ extension MemtermAppDelegate {
         isSwitchingWorkspaces = true
         // Slot order: the KEY host first — the in-place presentation swaps
         // the incoming primary group into the window the user is looking at.
-        var outgoing = hosts.filter { $0.workspaceId == outgoingId }
+        // The drop-down panel is never a swap slot: the outgoing one hides
+        // with its workspace, the incoming one stays hidden until its hotkey.
+        for panel in hosts where panel.isDropdown && panel.workspaceId == outgoingId {
+            panel.window?.orderOut(nil)
+        }
+        var outgoing = hosts.filter { $0.workspaceId == outgoingId && !$0.isDropdown }
         if let keyWindow = NSApp.keyWindow ?? NSApp.mainWindow
             ?? lastFocusedHost?.window,
            let keyIndex = outgoing.firstIndex(where: { $0.window === keyWindow }),
            keyIndex != 0 {
             outgoing.swapAt(0, keyIndex)
         }
-        let incoming = hosts.filter { $0.workspaceId == id }
+        let incoming = hosts.filter { $0.workspaceId == id && !$0.isDropdown }
         if !incoming.isEmpty {
             swapTabSets(incoming: incoming, outgoing: outgoing, fade: fade)
+        } else if controllers.contains(where: { $0.workspaceId == id }) {
+            // Only a hidden drop-down panel is live for the incoming
+            // workspace: open a fresh window for it (its panel stays a panel),
+            // and hide the outgoing windows like the resurrect path does.
+            let adoptFrame = outgoing.first?.window?.frame
+            let fresh = openNewWindow(in: id)
+            if let adoptFrame { fresh.window?.setFrame(adoptFrame, display: true) }
+            for host in outgoing { host.window?.orderOut(nil) }
         } else {
             // Resurrect path: no live tabs for this workspace exist — journal
             // rows become fresh tab models in fresh hosts; the primary host
@@ -179,7 +192,7 @@ extension MemtermAppDelegate {
             for host in outgoing { host.window?.orderOut(nil) }
             return
         }
-        let incomingWindows = hosts.filter { $0.workspaceId == incomingId }
+        let incomingWindows = hosts.filter { $0.workspaceId == incomingId && !$0.isDropdown }
             .compactMap(\.window)
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.16
@@ -302,7 +315,7 @@ extension MemtermAppDelegate {
     }
 
     func focusWindows(ofWorkspace id: String) {
-        hosts.first { $0.workspaceId == id }?.focusWindow()
+        hosts.first { $0.workspaceId == id && !$0.isDropdown }?.focusWindow()
     }
 
     /// FR-58: reassigns a live tab to another workspace, then FOLLOWS the tab
@@ -335,7 +348,7 @@ extension MemtermAppDelegate {
         // the target workspace's host, or a fresh one.
         controller.host?.detach(controller)
         controller.setWorkspace(id)
-        if let target = hosts.first(where: { $0.workspaceId == id }) {
+        if let target = hosts.first(where: { $0.workspaceId == id && !$0.isDropdown }) {
             target.attach(controller, select: true)
         } else {
             let fresh = makeHost(frame: nil)

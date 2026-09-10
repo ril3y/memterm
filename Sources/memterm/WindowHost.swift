@@ -60,19 +60,40 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     // here first if multi-pane focus targeting regresses after an OS update.
     private var firstResponderObservation: NSKeyValueObservation?
 
-    init(app: MemtermAppDelegate, frame: NSRect?) {
+    /// Quake-style drop-down (2026-09-09): a .dropdown host is the active
+    /// workspace's slide-in panel — journaled with role "dropdown", restored
+    /// hidden, placed by DropdownController, never a swap slot.
+    enum Role { case normal, dropdown }
+    let role: Role
+    var isDropdown: Bool { role == .dropdown }
+
+    init(app: MemtermAppDelegate, frame: NSRect?, role: Role = .normal) {
         self.app = app
+        self.role = role
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable,
-                                             .resizable, .fullSizeContentView]
+        // The panel has no traffic lights and is not user-movable: its place
+        // is the configured edge, and Esc-style dismissal is the hotkey.
+        let styleMask: NSWindow.StyleMask = role == .dropdown
+            ? [.titled, .fullSizeContentView]
+            : [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         // Quiet probe/smoke runs (TESTING.md §2.5) position windows offscreen
         // — ProbeQuietWindow disables AppKit's frame constraining so they
         // stay there.
-        let window = ProbeSupport.quiet
-            ? ProbeQuietWindow(contentRect: rect, styleMask: styleMask,
-                               backing: .buffered, defer: false)
-            : NSWindow(contentRect: rect, styleMask: styleMask,
-                       backing: .buffered, defer: false)
+        let window: NSWindow
+        if role == .dropdown {
+            // The panel parks fully OFF its screen edge between shows; a
+            // plain NSWindow's constrainFrameRect would clamp that back on
+            // screen (visible-probe finding, 2026-09-09) and the slide would
+            // stop short.
+            window = DropdownWindow(contentRect: rect, styleMask: styleMask,
+                                    backing: .buffered, defer: false)
+        } else if ProbeSupport.quiet {
+            window = ProbeQuietWindow(contentRect: rect, styleMask: styleMask,
+                                      backing: .buffered, defer: false)
+        } else {
+            window = NSWindow(contentRect: rect, styleMask: styleMask,
+                              backing: .buffered, defer: false)
+        }
         window.title = "memterm"
         // Custom chrome: the strip draws titles; native tabbing is OFF.
         window.titleVisibility = .hidden
@@ -86,6 +107,17 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         // the traffic lights.
         window.titlebarAppearsTransparent = true
         window.tabbingMode = .disallowed
+        if role == .dropdown {
+            window.isMovable = false
+            window.isMovableByWindowBackground = false
+            window.level = .floating
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+            window.hidesOnDeactivate = false
+            window.isExcludedFromWindowsMenu = true
+            window.standardWindowButton(.closeButton)?.isHidden = true
+            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+            window.standardWindowButton(.zoomButton)?.isHidden = true
+        }
         if let frame {
             window.setFrame(frame, display: false)
         } else {
@@ -504,6 +536,10 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         selectedTab?.noteSelected()
     }
 
+    func windowDidResignKey(_ notification: Notification) {
+        if role == .dropdown { app.dropdown.panelResignedKey(self) }
+    }
+
     func windowWillClose(_ notification: Notification) {
         firstResponderObservation = nil
         let remaining = tabs
@@ -543,4 +579,15 @@ private final class TabContentContainerView: NSView {
             sub.frame = bounds
         }
     }
+}
+
+/// The drop-down panel's window: frames are never constrained to the screen
+/// (it slides off its edge), and it can take keyboard focus without a
+/// title bar's chrome.
+final class DropdownWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }

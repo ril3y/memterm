@@ -156,7 +156,8 @@ final class MemoryEngine {
             let f = firstWindow.frame
             let frame = "\(Int(f.origin.x)),\(Int(f.origin.y)),\(Int(f.width)),\(Int(f.height))"
             return WindowSnap(id: tabs[0].id, frame: frame, focusedTab: group.focusedTabId,
-                              tabs: tabs, workspaceId: group.members[0].workspaceId)
+                              tabs: tabs, workspaceId: group.members[0].workspaceId,
+                              role: group.role)
         }
     }
 

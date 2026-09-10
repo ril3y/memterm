@@ -94,6 +94,10 @@ func buildMainMenu(for app: MemtermAppDelegate) -> NSMenu {
     // the slashed compound named neither action honestly).
     add("Close Tab", to: shellMenu, #selector(MemtermAppDelegate.closePane(_:)), "w",
         target: app)
+    shellMenu.addItem(.separator())
+    // Quake-style drop-down (2026-09-09): the global hotkey's menu twin.
+    add("Toggle Drop-down Terminal", to: shellMenu,
+        #selector(MemtermAppDelegate.toggleDropdown(_:)), "", modifiers: [], target: app)
 
     // Edit — copy:/paste:/selectAll: resolve to the focused terminal view.
     let editMenu = submenu("Edit")

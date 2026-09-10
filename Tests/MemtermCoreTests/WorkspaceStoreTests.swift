@@ -58,7 +58,7 @@ final class WorkspaceStoreTests: XCTestCase {
         sqlite3_close(raw)
 
         let store = StateStore(url: dbURL)
-        XCTAssertEqual(store.getMeta("schema_version"), "6")
+        XCTAssertEqual(store.getMeta("schema_version"), "7")
 
         let workspaces = store.listWorkspaces()
         XCTAssertEqual(workspaces.count, 1)

@@ -58,6 +58,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     var materializedWorkspaceIds: Set<String> = []
     /// Sparkle self-update (packaged app only; nil in bare/automated runs).
     var updater: UpdaterHost?
+    /// Quake-style drop-down terminal (Dropdown.swift).
+    private(set) lazy var dropdown = DropdownController(app: self)
     /// Set while park/forget tear windows down (and around a switch's
     /// hide/show transition) so those events aren't captured as topology
     /// mutations (same idea as isTerminating).
@@ -110,7 +112,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             for tab in host.tabs { claimed.insert(ObjectIdentifier(tab)) }
             groups.append(CaptureGroup(members: host.tabs,
                                        focusedTabId: host.selectedTab?.tabId
-                                           ?? host.tabs[0].tabId))
+                                           ?? host.tabs[0].tabId,
+                                       role: host.isDropdown ? WindowRestore.dropdownRole : nil))
         }
         // Safety net: a tab mid-re-homing (no host) still journals alone.
         for controller in controllers where !claimed.contains(ObjectIdentifier(controller)) {
@@ -202,6 +205,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // iTerm2-style self-update: scheduled checks against the GitHub
         // Releases appcast, packaged app only (see Updater.swift).
         if UpdaterHost.isSupported { updater = UpdaterHost() }
+
+        // Quake-style drop-down: register the global hotkey per config.
+        dropdown.applyConfig(config)
 
         // Custom-tab-chrome stage: the tab strip is OURS now — double-click
         // rename, right-click menus, hover ✕, and drag reorder are handled by
@@ -474,11 +480,19 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     func restoreWindows(_ windows: [WindowRestore], workspaceId: String,
                         adoptingFrame: NSRect? = nil) {
         var focusHost: WindowHostController?
-        for (w, win) in windows.enumerated() {
+        // The first NORMAL window adopts the switch-in frame; a drop-down
+        // panel restores HIDDEN (its frame is the config's, shown on hotkey).
+        var adoptFrame = adoptingFrame
+        for win in windows {
             guard !win.tabs.isEmpty else { continue }
-            let frame = w == 0 ? adoptingFrame ?? parseFrame(win.frame)
-                              : parseFrame(win.frame)
-            let host = makeHost(frame: frame)
+            let frame: NSRect?
+            if win.isDropdown {
+                frame = nil
+            } else {
+                frame = adoptFrame ?? parseFrame(win.frame)
+                adoptFrame = nil
+            }
+            let host = makeHost(frame: frame, role: win.isDropdown ? .dropdown : .normal)
             var focusedInHost = false
             for tab in win.tabs {
                 let controller = TerminalWindowController(app: self, workspaceId: workspaceId,
@@ -488,6 +502,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 host.attach(controller, select: focus)
                 if focus { focusedInHost = true }
             }
+            guard !win.isDropdown else { continue }
             if fadeInPending { host.window?.alphaValue = 0 }
             host.showWindow(nil)
             if focusedInHost || focusHost == nil { focusHost = host }
@@ -515,8 +530,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// Creates and registers a new (empty) window host. The caller attaches
     /// at least one tab before showing it.
     @discardableResult
-    func makeHost(frame: NSRect?) -> WindowHostController {
-        let host = WindowHostController(app: self, frame: frame)
+    func makeHost(frame: NSRect?, role: WindowHostController.Role = .normal) -> WindowHostController {
+        let host = WindowHostController(app: self, frame: frame, role: role)
         hosts.append(host)
         return host
     }
@@ -559,7 +574,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         if let last = lastFocusedHost, hosts.contains(where: { $0 === last }) {
             return last
         }
-        return hosts.first { $0.workspaceId == activeWorkspaceId } ?? hosts.first
+        // A hidden drop-down panel is never the guessed key host.
+        return hosts.first { $0.workspaceId == activeWorkspaceId && !$0.isDropdown }
+            ?? hosts.first { !$0.isDropdown } ?? hosts.first
     }
 
     func keyController() -> TerminalWindowController? {
@@ -712,7 +729,13 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // theme are per host now.
         for host in hosts { host.applyConfig(config) }
         refreshWorkspaceChips()  // workspace_bar visibility follows the config
+        dropdown.applyConfig(config)  // hotkey + placement follow the config
         config.save()
+    }
+
+    /// Shell ▸ Toggle Drop-down Terminal (the hotkey's menu twin).
+    @objc func toggleDropdown(_ sender: Any?) {
+        dropdown.toggle()
     }
 
     @objc func increaseFontSize(_ sender: Any?) { changeFontSize(by: 1) }
@@ -930,4 +953,6 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 struct CaptureGroup {
     let members: [TerminalWindowController]
     let focusedTabId: String?
+    /// WindowSnap.role: "dropdown" for the Quake panel, nil for a window.
+    var role: String? = nil
 }

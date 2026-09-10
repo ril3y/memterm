@@ -73,6 +73,28 @@ public struct Config {
     /// Founder ask 2026-09-09: the hover ✕ / Close Tab ask first; the sheet's
     /// "Don't ask me again" box writes this back as false.
     public var confirmCloseTab = true
+
+    // Quake-style drop-down terminal (founder ask 2026-09-09), the [dropdown]
+    // table. Off by default: a GLOBAL hotkey must be the user's choice.
+    public var dropdownEnabled = false
+    /// DropdownTrigger spelling: a combo ("ctrl+`", "cmd+shift+t", "f12") or
+    /// "double-tap ctrl|opt|shift|cmd|esc".
+    public var dropdownHotkey = "ctrl+`"
+    /// DropdownLayout.Edge raw value: top | left | right.
+    public var dropdownEdge = "top"
+    /// Fractions of the screen's visible frame (DropdownLayout.sizeRange).
+    public var dropdownWidth = 1.0
+    public var dropdownHeight = 0.5
+    /// DropdownLayout.Align raw value for the top edge: left | center | right.
+    public var dropdownAlign = "center"
+    public var dropdownHideOnFocusLoss = true
+    /// Which screen the panel drops on: mouse | main.
+    public var dropdownScreen = "mouse"
+    /// Slide duration; 0 = instant.
+    public var dropdownAnimationMs = 150
+
+    public static let dropdownScreens = ["mouse", "main"]
+    public static let dropdownAnimationRange = 0...600
     /// Vertical line-spacing multiplier (SwiftTerm's lineSpacing), 1.0–1.6.
     public var lineSpacing = 1.0
     /// Terminal mouse reporting (vim/htop capture the mouse). SwiftTerm's
@@ -189,6 +211,28 @@ public struct Config {
         if let b = boolean(values["serial_local_echo"]) { c.serialLocalEcho = b }
         if let b = boolean(values["confirm_quit"]) { c.confirmQuit = b }
         if let b = boolean(values["confirm_close_tab"]) { c.confirmCloseTab = b }
+        if let b = boolean(values["dropdown.enabled"]) { c.dropdownEnabled = b }
+        if let s = string(values["dropdown.hotkey"]), let trigger = DropdownTrigger.parse(s) {
+            c.dropdownHotkey = trigger.configString
+        }
+        if let s = string(values["dropdown.edge"]), DropdownLayout.Edge(rawValue: s) != nil {
+            c.dropdownEdge = s
+        }
+        if let n = number(values["dropdown.width"]) {
+            c.dropdownWidth = (DropdownLayout.clamp(n) * 100).rounded() / 100
+        }
+        if let n = number(values["dropdown.height"]) {
+            c.dropdownHeight = (DropdownLayout.clamp(n) * 100).rounded() / 100
+        }
+        if let s = string(values["dropdown.align"]), DropdownLayout.Align(rawValue: s) != nil {
+            c.dropdownAlign = s
+        }
+        if let b = boolean(values["dropdown.hide_on_focus_loss"]) { c.dropdownHideOnFocusLoss = b }
+        if let s = string(values["dropdown.screen"]), dropdownScreens.contains(s) { c.dropdownScreen = s }
+        if case .int(let n)? = values["dropdown.animation_ms"] {
+            c.dropdownAnimationMs = min(max(n, dropdownAnimationRange.lowerBound),
+                                        dropdownAnimationRange.upperBound)
+        }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
         // Numeric knobs clamp into their sane range (a hand-typed 3.0 line
@@ -298,6 +342,18 @@ public struct Config {
         lines.append("window_opacity = \(Self.twoDecimals(windowOpacity))  # 0.3–1.0 background opacity (1.0 = opaque)")
         lines.append("window_blur = \(windowBlur)  # blur what's behind a translucent window")
         lines.append("")
+        lines.append("# Quake-style drop-down terminal (Settings ▸ Appearance)")
+        lines.append("[dropdown]")
+        lines.append("enabled = \(dropdownEnabled)  # registers the global hotkey")
+        lines.append("hotkey = \"\(dropdownHotkey)\"  # ctrl+`, cmd+shift+t, f12 — or double-tap ctrl|opt|shift|cmd|esc (needs Accessibility)")
+        lines.append("edge = \"\(dropdownEdge)\"  # top | left | right — the edge it slides from")
+        lines.append("width = \(Self.twoDecimals(dropdownWidth))  # fraction of the screen, 0.2–1.0")
+        lines.append("height = \(Self.twoDecimals(dropdownHeight))  # fraction of the screen, 0.2–1.0")
+        lines.append("align = \"\(dropdownAlign)\"  # left | center | right (top edge only)")
+        lines.append("hide_on_focus_loss = \(dropdownHideOnFocusLoss)  # slide away when another window takes focus")
+        lines.append("screen = \"\(dropdownScreen)\"  # mouse | main — which screen it drops on")
+        lines.append("animation_ms = \(dropdownAnimationMs)  # slide duration, 0 = instant")
+        lines.append("")
         lines.append("[theme]")
         if let themePreset { lines.append("preset = \"\(themePreset)\"  # display label; colors below are the truth") }
         if let themeBackground { lines.append("background = \"\(Self.hex(themeBackground))\"") }
@@ -388,6 +444,19 @@ public struct Config {
         # behind-window blur while translucent.
         # window_opacity = 1.0
         # window_blur = false
+
+        # Quake-style drop-down terminal: a global hotkey slides a terminal in
+        # from a screen edge and away again. Off until you enable it.
+        # [dropdown]
+        # enabled = false
+        # hotkey = "ctrl+`"      # ctrl+`, cmd+shift+t, f12 — or "double-tap ctrl" (opt|shift|cmd|esc; needs Accessibility)
+        # edge = "top"           # top | left | right
+        # width = 1.0            # fraction of the screen, 0.2–1.0
+        # height = 0.5           # fraction of the screen, 0.2–1.0
+        # align = "center"       # left | center | right (top edge only)
+        # hide_on_focus_loss = true
+        # screen = "mouse"       # mouse | main
+        # animation_ms = 150
 
         # [theme]
         # preset = "memterm-dark"  # display label set by Settings; colors win

@@ -308,7 +308,7 @@ final class ExtensionHostRuntime: NSObject {
                                                   initialCwd: cwd?.path)
         app.registerController(controller)
         let isActive = wsId == app.activeWorkspaceId
-        if let host = app.hosts.first(where: { $0.workspaceId == wsId }) {
+        if let host = app.hosts.first(where: { $0.workspaceId == wsId && !$0.isDropdown }) {
             host.attach(controller, select: isActive)
         } else {
             let fresh = app.makeHost(frame: nil)

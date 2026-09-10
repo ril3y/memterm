@@ -103,14 +103,19 @@ public struct WindowSnap {
     /// FR-49: every tab belongs to exactly one workspace; a window (tab
     /// group) is homogeneous, so the workspace hangs off the window snap.
     public var workspaceId: String
+    /// Window role (schema v7): nil = a normal window, "dropdown" = the
+    /// workspace's Quake-style panel (restored hidden; its frame comes from
+    /// the [dropdown] config, not the journal).
+    public var role: String?
 
     public init(id: String, frame: String, focusedTab: String?, tabs: [TabSnap],
-                workspaceId: String = StateStore.defaultWorkspaceId) {
+                workspaceId: String = StateStore.defaultWorkspaceId, role: String? = nil) {
         self.id = id
         self.frame = frame
         self.focusedTab = focusedTab
         self.tabs = tabs
         self.workspaceId = workspaceId
+        self.role = role
     }
 }
 
@@ -181,12 +186,18 @@ public struct WindowRestore {
     public var frame: String?
     public var focusedTab: String?
     public var tabs: [TabRestore]
+    /// See WindowSnap.role.
+    public var role: String?
 
-    public init(frame: String?, focusedTab: String?, tabs: [TabRestore]) {
+    public init(frame: String?, focusedTab: String?, tabs: [TabRestore], role: String? = nil) {
         self.frame = frame
         self.focusedTab = focusedTab
         self.tabs = tabs
+        self.role = role
     }
+
+    public static let dropdownRole = "dropdown"
+    public var isDropdown: Bool { role == Self.dropdownRole }
 }
 
 // MARK: - Archive (schema v6, founder-amended FR-56 2026-09-02)
@@ -437,7 +448,13 @@ public final class StateStore {
             preview TEXT);
         """)
         exec("CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(session_id UNINDEXED, commands)")
-        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '6')")
+        // v6 → v7 (Quake-style drop-down, 2026-09-09): windows gain a role
+        // so the drop-down panel restores AS a panel (hidden, config-placed),
+        // never as a plain window. Additive; NULL = normal window.
+        if !columnExists("windows", "role") {
+            exec("ALTER TABLE windows ADD COLUMN role TEXT")
+        }
+        run("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '7')")
     }
 
     private func columnExists(_ table: String, _ name: String) -> Bool {
@@ -1188,9 +1205,9 @@ public final class StateStore {
                     ok = run("DELETE FROM panes") == SQLITE_OK && ok
                 }
                 for (wi, win) in windows.enumerated() {
-                    ok = run("INSERT INTO windows (id, frame, ord, focused_tab, workspace_id, updated_at) VALUES (?,?,?,?,?,?)",
+                    ok = run("INSERT INTO windows (id, frame, ord, focused_tab, workspace_id, role, updated_at) VALUES (?,?,?,?,?,?,?)",
                              [.text(win.id), .text(win.frame), .int(wi), .textOrNull(win.focusedTab),
-                              .text(win.workspaceId), .int(now)]) == SQLITE_OK && ok
+                              .text(win.workspaceId), .textOrNull(win.role), .int(now)]) == SQLITE_OK && ok
                     for (ti, tab) in win.tabs.enumerated() {
                         let tree = jsonString(tab.tree.toJSONObject()) ?? "{}"
                         ok = run("INSERT INTO tabs (id, window_id, ord, title, split_tree, workspace_id, color, updated_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -1311,15 +1328,16 @@ public final class StateStore {
 
             var windows: [WindowRestore] = []
             let (sql, binds): (String, [Bind]) = workspaceId.map {
-                ("SELECT id, frame, focused_tab FROM windows WHERE workspace_id = ? ORDER BY ord",
+                ("SELECT id, frame, focused_tab, role FROM windows WHERE workspace_id = ? ORDER BY ord",
                  [Bind.text($0)])
-            } ?? ("SELECT id, frame, focused_tab FROM windows ORDER BY ord", [])
+            } ?? ("SELECT id, frame, focused_tab, role FROM windows ORDER BY ord", [])
             query(sql, binds) { stmt in
                 guard let id = column(stmt, 0) else { return }
                 let tabs = tabsByWindow[id] ?? []
                 guard !tabs.isEmpty else { return }
                 windows.append(WindowRestore(frame: column(stmt, 1),
-                                             focusedTab: column(stmt, 2), tabs: tabs))
+                                             focusedTab: column(stmt, 2), tabs: tabs,
+                                             role: column(stmt, 3)))
             }
             return windows
         }

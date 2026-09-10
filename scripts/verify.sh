@@ -146,7 +146,8 @@ check "smoke-geometry-golden" "$LOG/smoke-verify.log" "SMOKE-GEOMETRY golden=mat
 # Founder bug 2026-09-09 (duplicate window at launch): the seed carries a
 # hidden-unparked workspace; launch must show exactly the active one and
 # leave C journaled for a lazy resurrect on switch-in.
-check "smoke-launch-visible" "$LOG/smoke-verify.log" "SMOKE-LAUNCH-VISIBLE hosts=1 visible=1 stray=0 c_restored=false"
+# hosts=2: the default window plus its hidden drop-down panel (2026-09-09).
+check "smoke-launch-visible" "$LOG/smoke-verify.log" "SMOKE-LAUNCH-VISIBLE hosts=2 visible=1 stray=0 c_restored=false"
 check "smoke-lazy-resurrect" "$LOG/smoke-verify.log" "SMOKE-LAZY-RESURRECT c_tabs=1 visible=1 stray=0 "
 
 echo "== [7/8] UI probe: fresh / restored / observe + config matrix (+1 visible pass)"
@@ -191,6 +192,12 @@ check "fresh-default-capture-cells" "$LOG/probe-fresh-default.log" "UIPROBE-CAPT
 # and "Don't ask me again" persisted false.
 check "fresh-default-close-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CLOSE-CONFIRM closed=true rows_forgotten=true setting_now=false saved_false=true"
 check "fresh-default-cmdw-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CMDW-CONFIRM sheet=true cancelled=true tab_alive=true setting_kept_on=true"
+# Quake-style drop-down (2026-09-09): shown at the configured frame, hidden
+# off-edge with its tab live, journaled with its role, per-workspace.
+check "fresh-default-dropdown-show" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN show=true role=dropdown ws_is_active=true .* expected_off=0.0 level_floating=true movable=false hotkey_registered=none"
+check "fresh-default-dropdown-switch" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN switch_hides=true per_workspace_panels=true back_same_tab=true"
+check "fresh-default-dropdown-double-tap" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN double_tap_toggles=true slow_ignored=true shortcut_ignored=true other_key_ignored=true global_tap=false"
+check "smoke-dropdown-restores" "$LOG/smoke-verify.log" "SMOKE-DROPDOWN restored_panels=1 hidden=true panel_tabs=1 "
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
 check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-contrast-rendered reason=workspace_bar=false"
 check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"
