@@ -77,7 +77,8 @@ public struct Config {
     // Quake-style drop-down terminal (founder ask 2026-09-09), the [dropdown]
     // table. Off by default: a GLOBAL hotkey must be the user's choice.
     public var dropdownEnabled = false
-    /// HotkeySpec spelling ("ctrl+`", "cmd+shift+t", "f12").
+    /// DropdownTrigger spelling: a combo ("ctrl+`", "cmd+shift+t", "f12") or
+    /// "double-tap ctrl|opt|shift|cmd|esc".
     public var dropdownHotkey = "ctrl+`"
     /// DropdownLayout.Edge raw value: top | left | right.
     public var dropdownEdge = "top"
@@ -211,8 +212,8 @@ public struct Config {
         if let b = boolean(values["confirm_quit"]) { c.confirmQuit = b }
         if let b = boolean(values["confirm_close_tab"]) { c.confirmCloseTab = b }
         if let b = boolean(values["dropdown.enabled"]) { c.dropdownEnabled = b }
-        if let s = string(values["dropdown.hotkey"]), HotkeySpec.parse(s) != nil {
-            c.dropdownHotkey = HotkeySpec.parse(s)!.configString
+        if let s = string(values["dropdown.hotkey"]), let trigger = DropdownTrigger.parse(s) {
+            c.dropdownHotkey = trigger.configString
         }
         if let s = string(values["dropdown.edge"]), DropdownLayout.Edge(rawValue: s) != nil {
             c.dropdownEdge = s
@@ -344,7 +345,7 @@ public struct Config {
         lines.append("# Quake-style drop-down terminal (Settings ▸ Appearance)")
         lines.append("[dropdown]")
         lines.append("enabled = \(dropdownEnabled)  # registers the global hotkey")
-        lines.append("hotkey = \"\(dropdownHotkey)\"  # e.g. ctrl+`, cmd+shift+t, f12, opt+space")
+        lines.append("hotkey = \"\(dropdownHotkey)\"  # ctrl+`, cmd+shift+t, f12 — or double-tap ctrl|opt|shift|cmd|esc (needs Accessibility)")
         lines.append("edge = \"\(dropdownEdge)\"  # top | left | right — the edge it slides from")
         lines.append("width = \(Self.twoDecimals(dropdownWidth))  # fraction of the screen, 0.2–1.0")
         lines.append("height = \(Self.twoDecimals(dropdownHeight))  # fraction of the screen, 0.2–1.0")
@@ -448,7 +449,7 @@ public struct Config {
         # from a screen edge and away again. Off until you enable it.
         # [dropdown]
         # enabled = false
-        # hotkey = "ctrl+`"      # e.g. ctrl+`, cmd+shift+t, f12, opt+space
+        # hotkey = "ctrl+`"      # ctrl+`, cmd+shift+t, f12 — or "double-tap ctrl" (opt|shift|cmd|esc; needs Accessibility)
         # edge = "top"           # top | left | right
         # width = 1.0            # fraction of the screen, 0.2–1.0
         # height = 0.5           # fraction of the screen, 0.2–1.0

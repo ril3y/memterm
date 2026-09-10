@@ -42,6 +42,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     // Quake-style drop-down terminal (2026-09-09).
     private let dropdownEnableCheck = NSButton(checkboxWithTitle: "Drop-down terminal (Quake style)", target: nil, action: nil)
     private let dropdownHotkey = HotkeyRecorderButton(frame: .zero)
+    private let dropdownTriggerPopUp = NSPopUpButton()
+    private let dropdownAccessibilityButton = NSButton(title: "Grant Accessibility…", target: nil, action: nil)
+    private let dropdownAccessibilityCaption = NSTextField(wrappingLabelWithString: "")
     private let dropdownEdgePopUp = NSPopUpButton()
     private let dropdownAlignPopUp = NSPopUpButton()
     private let dropdownScreenPopUp = NSPopUpButton()
@@ -123,6 +126,32 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         return row
     }
 
+    /// Combo → the recorder; double-tap → the Accessibility note (granted
+    /// or not) with the grant button while it is not.
+    private func refreshDropdownTriggerRows() {
+        let doubleTap = dropdownTriggerPopUp.indexOfSelectedItem > 0
+        dropdownHotkey.isHidden = doubleTap
+        let granted = DropdownController.accessibilityGranted
+        dropdownAccessibilityCaption.isHidden = !doubleTap
+        dropdownAccessibilityButton.isHidden = !doubleTap || granted
+        dropdownAccessibilityCaption.stringValue = granted
+            ? "Accessibility is granted: the double-tap works system-wide."
+            : "Double-tap needs Accessibility to work outside memterm (System Settings ▸ Privacy & Security ▸ Accessibility). Until then it works while memterm is frontmost."
+    }
+
+    @objc private func dropdownTriggerChanged(_ sender: Any?) {
+        refreshDropdownTriggerRows()
+        controlChanged(sender)
+    }
+
+    @objc private func grantAccessibility(_ sender: Any?) {
+        DropdownController.promptForAccessibility()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+        refreshDropdownTriggerRows()
+    }
+
     @objc private func dropdownSizeStepped(_ sender: NSStepper) {
         let field = sender === dropdownWidthStepper ? dropdownWidthField : dropdownHeightField
         field.stringValue = String(Int(sender.doubleValue))
@@ -161,6 +190,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         }
         // Drop-down terminal controls.
         for popup in [dropdownEdgePopUp, dropdownAlignPopUp, dropdownScreenPopUp] { wire(popup) }
+        dropdownTriggerPopUp.addItems(withTitles: ["Key combination"]
+            + DoubleTapKey.allCases.map { "Double-tap \($0.displayName)" })
+        dropdownTriggerPopUp.target = self
+        dropdownTriggerPopUp.action = #selector(dropdownTriggerChanged)
+        dropdownAccessibilityButton.bezelStyle = .rounded
+        dropdownAccessibilityButton.controlSize = .small
+        dropdownAccessibilityButton.target = self
+        dropdownAccessibilityButton.action = #selector(grantAccessibility)
+        dropdownAccessibilityCaption.font = NSFont.systemFont(ofSize: 11)
+        dropdownAccessibilityCaption.textColor = .secondaryLabelColor
+        dropdownAccessibilityCaption.preferredMaxLayoutWidth = 360
         dropdownEdgePopUp.addItems(withTitles: ["Top", "Left", "Right"])
         dropdownAlignPopUp.addItems(withTitles: ["Left", "Center", "Right"])
         dropdownScreenPopUp.addItems(withTitles: ["Screen with the mouse", "Main screen"])
@@ -317,7 +357,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             [NSGridCell.emptyContentView, caption("Background only — text stays opaque. Blur may reduce scrolling smoothness.")],
             [NSGridCell.emptyContentView, resetColors],
             [NSGridCell.emptyContentView, dropdownEnableCheck],
-            [label("Hotkey:"), dropdownHotkey],
+            [label("Trigger:"), NSStackView(views: [dropdownTriggerPopUp, dropdownHotkey])],
+            [NSGridCell.emptyContentView, NSStackView(views: [dropdownAccessibilityCaption, dropdownAccessibilityButton])],
             [label("Slides from:"), NSStackView(views: [dropdownEdgePopUp, label("aligned"), dropdownAlignPopUp])],
             [label("Size:"), dropdownSizeRow],
             [label("Screen:"), dropdownScreenPopUp],
@@ -505,7 +546,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         updateOpacityReadout(config.windowOpacity)
         blurCheck.state = config.windowBlur ? .on : .off
         dropdownEnableCheck.state = config.dropdownEnabled ? .on : .off
-        dropdownHotkey.spec = HotkeySpec.parse(config.dropdownHotkey)
+        switch DropdownTrigger.parse(config.dropdownHotkey) {
+        case .doubleTap(let key)?:
+            dropdownTriggerPopUp.selectItem(at: 1 + (DoubleTapKey.allCases.firstIndex(of: key) ?? 0))
+            dropdownHotkey.spec = HotkeySpec.parse("ctrl+`")
+        case .combo(let spec)?:
+            dropdownTriggerPopUp.selectItem(at: 0)
+            dropdownHotkey.spec = spec
+        case nil:
+            dropdownTriggerPopUp.selectItem(at: 0)
+            dropdownHotkey.spec = HotkeySpec.parse("ctrl+`")
+        }
+        refreshDropdownTriggerRows()
         dropdownEdgePopUp.selectItem(at: DropdownLayout.Edge.allCases.firstIndex {
             $0.rawValue == config.dropdownEdge } ?? 0)
         dropdownAlignPopUp.selectItem(at: DropdownLayout.Align.allCases.firstIndex {
@@ -604,7 +656,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         updateOpacityReadout(config.windowOpacity)
         config.windowBlur = blurCheck.state == .on
         config.dropdownEnabled = dropdownEnableCheck.state == .on
-        if let spec = dropdownHotkey.spec { config.dropdownHotkey = spec.configString }
+        let triggerIndex = dropdownTriggerPopUp.indexOfSelectedItem
+        if triggerIndex > 0 {
+            config.dropdownHotkey = DropdownTrigger.doubleTap(DoubleTapKey.allCases[triggerIndex - 1]).configString
+        } else if let spec = dropdownHotkey.spec {
+            config.dropdownHotkey = spec.configString
+        }
         config.dropdownEdge = DropdownLayout.Edge.allCases[dropdownEdgePopUp.indexOfSelectedItem].rawValue
         config.dropdownAlign = DropdownLayout.Align.allCases[dropdownAlignPopUp.indexOfSelectedItem].rawValue
         config.dropdownScreen = Config.dropdownScreens[dropdownScreenPopUp.indexOfSelectedItem]

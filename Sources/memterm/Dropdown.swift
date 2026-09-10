@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Carbon.HIToolbox
 import MemtermCore
 
@@ -16,6 +17,16 @@ final class DropdownController {
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
     private var registered: HotkeySpec?
+    /// Double-tap trigger state (DropdownTrigger.doubleTap): the watched
+    /// key, the pure detector, and whichever event source is feeding it —
+    /// a listen-only session event tap when Accessibility is granted (works
+    /// everywhere), else a local monitor (works while memterm is frontmost).
+    private var doubleTapKey: DoubleTapKey?
+    private var detector = DoubleTapDetector()
+    private var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
+    private var localMonitor: Any?
+    private var accessibilityPrompted = false
     /// The panel currently sliding away (ignored by focus-loss hiding).
     private var hiding: WindowHostController?
 
@@ -25,7 +36,10 @@ final class DropdownController {
         self.app = app
     }
 
-    deinit { unregisterHotkey() }
+    deinit {
+        unregisterHotkey()
+        stopDoubleTap()
+    }
 
     // MARK: - Config
 
@@ -33,15 +47,192 @@ final class DropdownController {
     /// and from applyConfigLive. Automated runs never register: a real
     /// system-wide hotkey from a probe would fire into the founder's session.
     func applyConfig(_ config: Config) {
-        let wanted = config.dropdownEnabled && !ProbeSupport.isUIProbe && !ProbeSupport.isSmoke
-            ? HotkeySpec.parse(config.dropdownHotkey) : nil
-        guard wanted != registered else { return }
-        unregisterHotkey()
-        if let wanted { registerHotkey(wanted) }
+        let automated = ProbeSupport.isUIProbe || ProbeSupport.isSmoke
+        let trigger = config.dropdownEnabled ? DropdownTrigger.parse(config.dropdownHotkey) : nil
+        // Combo → Carbon hotkey (never in automated runs: a real system-wide
+        // hotkey from a probe would fire into the founder's session).
+        var wantedCombo: HotkeySpec?
+        if case .combo(let spec)? = trigger, !automated { wantedCombo = spec }
+        if wantedCombo != registered {
+            unregisterHotkey()
+            if let wantedCombo { registerHotkey(wantedCombo) }
+        }
+        // Double-tap → event sources (the DETECTOR runs in automated runs so
+        // the probe can feed it synthetic taps; the event tap / monitor
+        // never start there).
+        var wantedTap: DoubleTapKey?
+        if case .doubleTap(let key)? = trigger { wantedTap = key }
+        if wantedTap != doubleTapKey {
+            stopDoubleTap()
+            doubleTapKey = wantedTap
+            detector = DoubleTapDetector()
+            if wantedTap != nil, !automated { startDoubleTap() }
+        }
         // A live change of placement re-lays the panel if it is showing.
         if let host = panelHost, host.window?.isVisible == true, hiding !== host {
             host.window?.setFrame(targetFrame(config), display: true)
         }
+    }
+
+    // MARK: - Double-tap trigger
+
+    /// Accessibility is what lets a listen-only event tap see keys while
+    /// another app is frontmost. Asked for once per launch when a
+    /// double-tap trigger is enabled without it; Settings has a button too.
+    static var accessibilityGranted: Bool { AXIsProcessTrusted() }
+
+    static func promptForAccessibility() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    /// True when a system-wide double-tap source is live (the event tap).
+    var doubleTapIsGlobal: Bool { eventTap != nil }
+
+    private func startDoubleTap() {
+        if Self.accessibilityGranted, startEventTap() { return }
+        if !accessibilityPrompted {
+            accessibilityPrompted = true
+            Self.promptForAccessibility()
+        }
+        // Fallback: memterm-frontmost coverage via a local monitor (it can
+        // at least HIDE the panel, and shows it while memterm is active).
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] event in
+            self?.feed(nsEvent: event)
+            return event
+        }
+    }
+
+    private func stopDoubleTap() {
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            if let eventTapSource {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
+            }
+        }
+        eventTap = nil
+        eventTapSource = nil
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        localMonitor = nil
+    }
+
+    private func startEventTap() -> Bool {
+        let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            guard let userInfo else { return Unmanaged.passUnretained(event) }
+            let controller = Unmanaged<DropdownController>.fromOpaque(userInfo).takeUnretainedValue()
+            controller.feed(cgType: type, event: event)
+            return Unmanaged.passUnretained(event)
+        }
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                          options: .listenOnly, eventsOfInterest: CGEventMask(mask),
+                                          callback: callback, userInfo: selfPtr) else {
+            return false
+        }
+        let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        eventTap = tap
+        eventTapSource = source
+        return true
+    }
+
+    private static let modifierKeyCodes: [Int64: DoubleTapKey] = [
+        0x3B: .control, 0x3E: .control,   // left / right control
+        0x3A: .option, 0x3D: .option,
+        0x38: .shift, 0x3C: .shift,
+        0x37: .command, 0x36: .command,
+    ]
+
+    private func feed(cgType type: CGEventType, event: CGEvent) {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
+        switch type {
+        case .flagsChanged:
+            guard let key = Self.modifierKeyCodes[code] else { return }
+            let flags = event.flags
+            let held: Bool
+            switch key {
+            case .control: held = flags.contains(.maskControl)
+            case .option: held = flags.contains(.maskAlternate)
+            case .shift: held = flags.contains(.maskShift)
+            case .command: held = flags.contains(.maskCommand)
+            case .escape: return
+            }
+            DispatchQueue.main.async { self.tap(key, pressed: held, at: now) }
+        case .keyDown:
+            let repeatFlag = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            if code == 0x35 {
+                guard !repeatFlag else { return }
+                DispatchQueue.main.async {
+                    self.tap(.escape, pressed: true, at: now)
+                    self.tap(.escape, pressed: false, at: now)
+                }
+            } else {
+                DispatchQueue.main.async { self.otherKey() }
+            }
+        default:
+            return
+        }
+    }
+
+    private func feed(nsEvent event: NSEvent) {
+        let now = event.timestamp
+        switch event.type {
+        case .flagsChanged:
+            guard let key = Self.modifierKeyCodes[Int64(event.keyCode)] else { return }
+            let flags = event.modifierFlags
+            let held: Bool
+            switch key {
+            case .control: held = flags.contains(.control)
+            case .option: held = flags.contains(.option)
+            case .shift: held = flags.contains(.shift)
+            case .command: held = flags.contains(.command)
+            case .escape: return
+            }
+            tap(key, pressed: held, at: now)
+        case .keyDown:
+            if event.keyCode == 0x35 {
+                guard !event.isARepeat else { return }
+                tap(.escape, pressed: true, at: now)
+                tap(.escape, pressed: false, at: now)
+            } else {
+                otherKey()
+            }
+        default:
+            return
+        }
+    }
+
+    /// One press or release of a candidate key; fires the toggle on a clean
+    /// double tap of THE watched key. Other watched-class keys interrupt.
+    func tap(_ key: DoubleTapKey, pressed: Bool, at time: TimeInterval) {
+        guard let watched = doubleTapKey else { return }
+        guard key == watched else {
+            if pressed { detector.interrupt() }
+            return
+        }
+        if pressed {
+            if detector.press(at: time) { toggle() }
+        } else {
+            detector.release(at: time)
+        }
+    }
+
+    func otherKey() {
+        detector.interrupt()
+    }
+
+    /// MEMTERM_UI_PROBE: the parsed trigger the controller is honoring.
+    var probeTrigger: String? {
+        if let registered { return registered.configString }
+        if let doubleTapKey { return DropdownTrigger.doubleTap(doubleTapKey).configString }
+        return nil
     }
 
     private func registerHotkey(_ spec: HotkeySpec) {

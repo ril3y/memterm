@@ -3913,6 +3913,53 @@ extension MemtermAppDelegate {
                 applyConfigLive(dropdownConfig())
             }))
 
+        // Double-tap trigger: with "double-tap ctrl", two clean quick taps
+        // fed into the controller toggle the panel; slow taps and a
+        // shortcut in between (⌃C) do not; no event tap runs in a probe.
+        probe.add(ProbeStep(
+            name: "dropdown-double-tap",
+            assert: { [self] in
+                var c = dropdownConfig()
+                c.dropdownHotkey = "double-tap ctrl"
+                applyConfigLive(c)
+                guard dropdown.probeTrigger == "double-tap ctrl", !dropdown.doubleTapIsGlobal else {
+                    throw ProbeFailure("double-tap trigger not honored (trigger=\(dropdown.probeTrigger ?? "nil") global=\(dropdown.doubleTapIsGlobal))")
+                }
+                let wasShowing = dropdown.isShowing
+                let t0: TimeInterval = 100
+                dropdown.tap(.control, pressed: true, at: t0)
+                dropdown.tap(.control, pressed: false, at: t0 + 0.05)
+                dropdown.tap(.control, pressed: true, at: t0 + 0.2)
+                dropdown.tap(.control, pressed: false, at: t0 + 0.25)
+                let toggled = dropdown.isShowing != wasShowing
+                // Slow taps: nothing.
+                let before = dropdown.isShowing
+                dropdown.tap(.control, pressed: true, at: t0 + 2)
+                dropdown.tap(.control, pressed: false, at: t0 + 2.1)
+                dropdown.tap(.control, pressed: true, at: t0 + 3)
+                dropdown.tap(.control, pressed: false, at: t0 + 3.1)
+                let slowStayed = dropdown.isShowing == before
+                // ⌃C between taps: a shortcut, not a tap.
+                dropdown.tap(.control, pressed: true, at: t0 + 5)
+                dropdown.otherKey()
+                dropdown.tap(.control, pressed: false, at: t0 + 5.1)
+                dropdown.tap(.control, pressed: true, at: t0 + 5.2)
+                dropdown.tap(.control, pressed: false, at: t0 + 5.25)
+                let shortcutStayed = dropdown.isShowing == before
+                // A different modifier's tap never counts.
+                dropdown.tap(.option, pressed: true, at: t0 + 7)
+                dropdown.tap(.option, pressed: false, at: t0 + 7.05)
+                dropdown.tap(.option, pressed: true, at: t0 + 7.1)
+                dropdown.tap(.option, pressed: false, at: t0 + 7.15)
+                let otherStayed = dropdown.isShowing == before
+                print("UIPROBE-DROPDOWN double_tap_toggles=\(toggled) slow_ignored=\(slowStayed) shortcut_ignored=\(shortcutStayed) other_key_ignored=\(otherStayed) global_tap=\(dropdown.doubleTapIsGlobal)")
+                guard toggled, slowStayed, shortcutStayed, otherStayed else {
+                    throw ProbeFailure("double-tap recognition wrong")
+                }
+                if dropdown.isShowing { dropdown.hide() }
+                applyConfigLive(dropdownConfig())
+            }))
+
         // Journal: the panel captures as a window with role "dropdown".
         probe.add(ProbeStep(
             name: "dropdown-journal-role",
