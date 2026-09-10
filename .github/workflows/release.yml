@@ -83,6 +83,8 @@ jobs:
           echo "notarized=1" >> "$GITHUB_ENV"
       - name: Build DMG
         id: dmg
+        env:
+          MEMTERM_SIGN_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
         run: echo "path=$(./scripts/make-dmg.sh)" >> "$GITHUB_OUTPUT"
       - name: Notarize DMG (Developer ID)
         if: env.notarized == '1'
