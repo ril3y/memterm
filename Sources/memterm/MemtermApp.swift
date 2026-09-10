@@ -321,7 +321,38 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// early exit — bug 4's false-green path.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         if ProbeSupport.isUIProbe || smokeMode { return false }
+        // Quake-style drop-down (founder 2026-09-09): with the hotkey enabled
+        // the app stays resident after its last window closes, so the next
+        // hotkey brings a terminal back (in the Default workspace).
+        if config.dropdownEnabled { return false }
         return controllers.isEmpty
+    }
+
+    /// The workspace a drop-down toggle lands in: the active one if it still
+    /// exists (un-parked if needed); otherwise Default — created if it is
+    /// somehow missing — which becomes active. Founder 2026-09-09: "when all
+    /// tabs are closed then a new hotkey hits it should create a new default
+    /// workspace".
+    @discardableResult
+    func workspaceForDropdown() -> String {
+        guard let store = memory?.store else { return activeWorkspaceId }
+        let list = store.listWorkspaces()
+        if let current = list.first(where: { $0.id == activeWorkspaceId }) {
+            if current.isParked { store.setWorkspaceParked(current.id, parked: false) }
+            return current.id
+        }
+        let defaultId = StateStore.defaultWorkspaceId
+        if !list.contains(where: { $0.id == defaultId }) {
+            _ = store.createWorkspace(id: defaultId, name: "Default",
+                                      color: StateStore.defaultWorkspaceColor)
+        } else if list.first(where: { $0.id == defaultId })?.isParked == true {
+            store.setWorkspaceParked(defaultId, parked: false)
+        }
+        activeWorkspaceId = defaultId
+        materializedWorkspaceIds.insert(defaultId)
+        store.setMeta("active_workspace_id", defaultId)
+        rebuildWorkspaceMenu()
+        return defaultId
     }
 
     /// Called from windowWillClose after the controller is deregistered. When

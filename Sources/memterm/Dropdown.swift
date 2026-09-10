@@ -258,24 +258,41 @@ final class DropdownController {
         return nil
     }
 
+    /// MEMTERM_DROPDOWN_TRACE=1: log registration + every hotkey delivery.
+    static let trace = ProcessInfo.processInfo.environment["MEMTERM_DROPDOWN_TRACE"] == "1"
+
     private func registerHotkey(_ spec: HotkeySpec) {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                       eventKind: UInt32(kEventHotKeyPressed))
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        let status = InstallEventHandler(GetApplicationEventTarget(), { _, _, userData -> OSStatus in
+        // The EVENT DISPATCHER target, not the application target: hot-key
+        // events are dispatched to the app's dispatcher; handlers installed
+        // on the application target only see them while the app is active
+        // (founder 2026-09-09: "have to have memterm in focus for any hotkey
+        // to work"). This is what MASShortcut / HotKey register against.
+        let status = InstallEventHandler(GetEventDispatcherTarget(), { _, event, userData -> OSStatus in
             guard let userData else { return noErr }
             let controller = Unmanaged<DropdownController>.fromOpaque(userData).takeUnretainedValue()
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+            guard hotKeyID.signature == DropdownController.hotKeySignature else { return OSStatus(eventNotHandledErr) }
+            if DropdownController.trace { NSLog("memterm dropdown: hotkey fired (app active=%d)", NSApp.isActive ? 1 : 0) }
             DispatchQueue.main.async { controller.toggle() }
             return noErr
         }, 1, &eventType, selfPtr, &handlerRef)
-        guard status == noErr else { return }
+        guard status == noErr else {
+            NSLog("memterm: could not install the drop-down hotkey handler (OSStatus %d)", status)
+            return
+        }
         let hotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: 1)
         var ref: EventHotKeyRef?
         let reg = RegisterEventHotKey(spec.keyCode, spec.modifiers.rawValue, hotKeyID,
-                                      GetApplicationEventTarget(), 0, &ref)
+                                      GetEventDispatcherTarget(), 0, &ref)
         if reg == noErr {
             hotKeyRef = ref
             registered = spec
+            NSLog("memterm dropdown: registered global hotkey %@ (code %u, mods %u)", spec.configString, spec.keyCode, spec.modifiers.rawValue)
         } else {
             NSLog("memterm: could not register drop-down hotkey %@ (OSStatus %d)", spec.configString, reg)
         }
@@ -310,6 +327,10 @@ final class DropdownController {
 
     func show() {
         let config = app.config
+        // Founder 2026-09-09: with every tab closed, the hotkey must still
+        // produce a terminal — in the Default workspace when the active one
+        // is gone (its last user close removed it).
+        _ = app.workspaceForDropdown()
         let host = panelHost ?? makePanel()
         guard let window = host.window else { return }
         hiding = nil
@@ -318,7 +339,13 @@ final class DropdownController {
                                                 edge: edge(config))
         window.setFrame(hidden, display: false)
         window.alphaValue = 1
-        if !ProbeSupport.quiet { NSApp.activate(ignoringOtherApps: true) }
+        if Self.trace { NSLog("memterm dropdown: show (app active=%d)", NSApp.isActive ? 1 : 0) }
+        if !ProbeSupport.quiet {
+            // Cooperative activation (macOS 14): ask both ways so a hotkey
+            // from another app brings keyboard focus to the panel.
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+            NSApp.activate(ignoringOtherApps: true)
+        }
         host.focusWindow()  // makeKeyAndOrderFront + the app's focused-host note
         animate(window, to: target, config: config, completion: nil)
     }
@@ -358,6 +385,7 @@ final class DropdownController {
         let host = app.makeHost(frame: nil, role: .dropdown)
         host.attach(controller, select: true)
         app.memory?.scheduleTopologySave()
+        app.refreshWorkspaceChips()
         return host
     }
 

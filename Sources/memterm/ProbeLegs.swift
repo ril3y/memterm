@@ -985,6 +985,7 @@ extension MemtermAppDelegate {
         // both refuse-real-state-dir belts hold), so nothing may run after it
         // that depends on captured state.
         addArchiveSteps(probe)
+        addDropdownAfterCloseAllSteps(probe)
 
         // Composited pixel pass (visible runs only): the window-server truth
         // cacheDisplay cannot see (§2.3's documented caveat).
@@ -4053,6 +4054,42 @@ extension MemtermAppDelegate {
                 guard same else { throw ProbeFailure("panel after switch-back is not the same tab") }
                 dropdown.hide()
                 applyConfigLive(originalConfig)
+            }))
+    }
+
+    /// Founder 2026-09-09: every tab closed (user closes), then the hotkey —
+    /// a terminal must come back, in the Default workspace. Runs LAST: it
+    /// empties the app (probe runs never auto-quit).
+    private func addDropdownAfterCloseAllSteps(_ probe: ProbeRunner) {
+        probe.addStateful(ProbeStep(
+            name: "dropdown-after-close-all", timeout: 15,
+            action: { [self] in
+                var c = config
+                c.dropdownEnabled = true
+                c.dropdownAnimationMs = 0
+                applyConfigLive(c)
+                // Make a NON-default workspace active first, so the fallback
+                // to Default is exercised (its last user close removes it).
+                if let id = createWorkspace(named: "Close-all Probe") { switchToWorkspace(id) }
+                for controller in controllers { controller.close() }
+            },
+            condition: { [self] in controllers.isEmpty && hosts.allSatisfy { $0.tabs.isEmpty } },
+            assert: { [self] in
+                let wsBefore = activeWorkspaceId
+                dropdown.toggle()
+                guard let host = dropdown.panelHost, let tab = host.selectedTab,
+                      host.window?.isVisible == true else {
+                    throw ProbeFailure("hotkey after closing everything produced no panel")
+                }
+                let list = memory?.store.listWorkspaces() ?? []
+                let inDefault = host.workspaceId == StateStore.defaultWorkspaceId
+                    && activeWorkspaceId == StateStore.defaultWorkspaceId
+                    && list.contains { $0.id == StateStore.defaultWorkspaceId && !$0.isParked }
+                let chips = keyHost()?.workspaceBar?.chipTitlesForProbe() ?? []
+                print("UIPROBE-DROPDOWN close_all_then_hotkey=true active_before=\(wsBefore == StateStore.defaultWorkspaceId ? "default" : "other") panel_in_default=\(inDefault) tab_live=\(tab.allPanes().first != nil) workspaces=\(list.map(\.name)) chips=\(chips)")
+                guard inDefault else {
+                    throw ProbeFailure("panel after close-all is not in an active Default workspace (ws=\(host.workspaceId ?? "nil") active=\(activeWorkspaceId) list=\(list.map(\.name)))")
+                }
             }))
     }
 
