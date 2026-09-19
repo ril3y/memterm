@@ -1445,6 +1445,47 @@ extension MemtermAppDelegate {
                 }
             }))
 
+        // Founder 2026-09-19: "renaming the workspace when it's editable,
+        // clicking on it goes to non-editable". Evidence leg: start a rename,
+        // then (a) force a chip-row refresh, (b) click INTO the field — the
+        // editor must survive both; Esc then cancels.
+        probe.add(ProbeStep(
+            name: "chip-rename-survives-refresh-and-click",
+            assert: { [self] in
+                guard config.workspaceBar else {
+                    probe.skipLine(step: "chip-rename-survives-refresh-and-click", reason: "workspace_bar=false")
+                    return
+                }
+                guard let host = keyHost(), let bar = host.workspaceBar, let window = host.window,
+                      let chip = bar.probeChipView(activeWorkspaceId) else {
+                    throw ProbeFailure("no active chip (rename-survives leg)")
+                }
+                chip.beginRename()
+                let started = chip.probeIsEditing
+                refreshWorkspaceChips()
+                let afterRefresh = chip.probeIsEditing && chip.window === window
+                // A click INTO the field must route to the field editor (a
+                // synthesized mouseDown would enter NSTextView's tracking
+                // loop and hang a probe, so assert the routing that a real
+                // click takes: hitTest at the field's center).
+                var afterClick = false
+                if afterRefresh, let field = chip.probeEditorField, let content = window.contentView {
+                    let center = field.convert(NSPoint(x: field.bounds.midX, y: field.bounds.midY), to: content)
+                    let hit = content.hitTest(center)
+                    afterClick = hit != nil && (hit === field || hit?.isDescendant(of: field) == true
+                                                || (hit as? NSTextView)?.delegate === field)
+                        && chip.probeIsEditing
+                }
+                print("UIPROBE-RENAME-SURVIVES started=\(started) after_refresh=\(afterRefresh) after_click=\(afterClick)")
+                // Leave the world clean: cancel the edit.
+                if chip.probeIsEditing, let editor = window.firstResponder as? NSTextView {
+                    editor.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
+                }
+                guard started, afterRefresh, afterClick else {
+                    throw ProbeFailure("inline rename died: started=\(started) survives_refresh=\(afterRefresh) survives_click=\(afterClick)")
+                }
+            }))
+
         // #10: chips sit one visual level below the tab pills (smaller type,
         // smaller pill), and the gear/+ trailing cluster is aligned.
         probe.add(ProbeStep(

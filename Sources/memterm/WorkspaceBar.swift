@@ -126,10 +126,39 @@ final class WorkspaceBarView: NSVisualEffectView {
     /// in-progress inline rename survives unrelated refreshes. `activity`:
     /// per-workspace output marks (founder UX: a hidden workspace's chip
     /// pulses while output flows, keeps an unseen ring after).
+    /// A structural rebuild requested while a rename editor was open —
+    /// replayed by editingEnded() (founder 2026-09-19: rebuilding the row
+    /// pulled the editing chip out of the window, which ends the edit).
+    private var pendingUpdate: (workspaces: [WorkspaceRow], activeId: String,
+                                activity: [String: TabActivityState])?
+
     func update(workspaces: [WorkspaceRow], activeId: String,
                 activity: [String: TabActivityState] = [:]) {
         let metrics = app.chromeMetrics
         if metrics != self.metrics { applyMetrics(metrics) }
+        // Same workspaces in the same order: reconfigure the chips IN PLACE.
+        // No view churn, so an in-progress inline rename keeps its editor
+        // (removing a view that holds the first responder ends editing).
+        let currentIds = stack.arrangedSubviews.compactMap { ($0 as? WorkspaceChipView)?.workspaceId }
+        if currentIds == workspaces.map(\.id) {
+            for workspace in workspaces {
+                guard let chip = chipsById[workspace.id] else { continue }
+                chip.apply(metrics: metrics)
+                chip.configure(name: workspace.name,
+                               color: MemtermAppDelegate.nsColor(hex: workspace.color),
+                               isActive: workspace.id == activeId,
+                               isParked: workspace.isParked,
+                               activity: activity[workspace.id] ?? .idle)
+            }
+            return
+        }
+        // The set or order changed: a rebuild is needed — but never under an
+        // open rename. Defer it until the edit ends.
+        if chipsById.values.contains(where: { $0.probeIsEditing }) {
+            pendingUpdate = (workspaces, activeId, activity)
+            return
+        }
+        pendingUpdate = nil
         for view in stack.arrangedSubviews {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -154,6 +183,13 @@ final class WorkspaceBarView: NSVisualEffectView {
 
     func beginRename(workspaceId: String) {
         chipsById[workspaceId]?.beginRename()
+    }
+
+    /// A chip's inline editor closed: apply any rebuild that was held back.
+    func editingEnded() {
+        guard let pending = pendingUpdate else { return }
+        pendingUpdate = nil
+        update(workspaces: pending.workspaces, activeId: pending.activeId, activity: pending.activity)
     }
 
     /// Appearance › Size: the bar's own text follows ChromeMetrics (chips
@@ -589,6 +625,8 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     /// the chip-click-rename-gate leg asserts a synthesized single click on
     /// the active chip leaves this false and a double click flips it true.
     var probeIsEditing: Bool { editor != nil }
+    /// MEMTERM_UI_PROBE: the live inline editor field, for click-routing legs.
+    var probeEditorField: NSTextField? { editor }
 
     /// MEMTERM_UI_PROBE diagnostics: the rename-commit focus handoff is the
     /// probe's flakiest contract — log every step of end-editing so a failed
@@ -620,6 +658,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             app.rebuildWorkspaceMenu()
         }
         renameCancelled = false
+        (superview?.superview as? WorkspaceBarView)?.editingEnded()
         // Keyboard input must return to the terminal: a focus-loss commit
         // (makeFirstResponder(nil)) parks focus on the window itself — and,
         // probe-reproduced, AppKit can also leave the DYING field's orphaned
