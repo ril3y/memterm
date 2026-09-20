@@ -45,6 +45,31 @@ test("pairing, forwarding both ways, host-drop -> offline, revocation", async ()
   }
 });
 
+// Security review L2: "that host isn't connected" and "that host never
+// allowed you" used to be distinguishable, which made the relay a
+// host-existence oracle. One reason now answers both.
+test("an unknown host and a disallowed host are refused identically", async () => {
+  const relay = await startRelay({ port: 0, webRoot: WEB });
+  try {
+    const host = await connectAuthed(relay.port, "host", { allowed: [] });
+    const dev = await connectAuthed(relay.port, "client", {});
+
+    // A host id that has never existed.
+    dev.ws.send(JSON.stringify({ type: "env", to: "aaaaaaaaaaaaaaaa", from: dev.id, payload: "AQID" }));
+    assert.equal((await next(dev.ws, "refused")).reason, "not-allowed");
+
+    // A host that is connected but has not allowed this device.
+    dev.ws.send(JSON.stringify({ type: "env", to: host.id, from: dev.id, payload: "AQID" }));
+    assert.equal((await next(dev.ws, "refused")).reason, "not-allowed");
+
+    // And the same in the host->client direction.
+    host.ws.send(JSON.stringify({ type: "env", to: "bbbbbbbbbbbbbbbb", from: host.id, payload: "AQID" }));
+    assert.equal((await next(host.ws, "refused")).reason, "not-allowed");
+  } finally {
+    await relay.close();
+  }
+});
+
 test("a forged from is dropped and the socket closed", async () => {
   const relay = await startRelay({ port: 0, webRoot: WEB });
   try {

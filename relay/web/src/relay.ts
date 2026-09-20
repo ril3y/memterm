@@ -31,7 +31,9 @@ export interface RelayEvents {
   onPairDenied?: (reason: string) => void;
   onOnline?: (hostId: string) => void;
   onOffline?: (hostId: string, lastSeenMs: number) => void;
-  /** A relay-level routing failure for an envelope we sent (not-connected / not-allowed). */
+  /** A relay-level routing failure for an envelope we sent. One reason,
+   *  `not-allowed`, covers both "not connected" and "not permitted": the
+   *  relay deliberately does not say which (security review L2). */
   onRefused?: (reason: string) => void;
   onEnvelope?: (from: string, payload: Uint8Array) => void;
   /** The socket dropped (initial connect failure or a later close); a reconnect is already scheduled. */

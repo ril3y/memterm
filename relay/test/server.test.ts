@@ -17,6 +17,31 @@ test("healthz answers ok and the web root is served", async () => {
   await relay.close();
 });
 
+// Security review M3: no CSP, no nosniff, no HSTS on any response. None of
+// it saves a client from a relay that is hostile in the first place (it
+// serves the client), but it is the only defence in depth there is.
+test("every response carries the security headers", async () => {
+  const relay = await startRelay({ port: 0, webRoot: new URL("../web", import.meta.url).pathname });
+  try {
+    for (const path of ["/healthz", "/", "/index.html", "/nope.js", "/../package.json"]) {
+      const res = await fetch(`http://127.0.0.1:${relay.port}${path}`);
+      const csp = res.headers.get("content-security-policy");
+      assert.ok(csp, `no CSP on ${path}`);
+      assert.match(csp!, /default-src 'self'/);
+      assert.match(csp!, /connect-src 'self' wss: ws:/);
+      assert.match(csp!, /img-src 'self' data:/);
+      assert.match(csp!, /style-src 'self' 'unsafe-inline'/);
+      // index.html has an inline <style> but no inline <script>, so
+      // scripts stay on the un-loosened default-src.
+      assert.doesNotMatch(csp!, /script-src/);
+      assert.equal(res.headers.get("x-content-type-options"), "nosniff", `no nosniff on ${path}`);
+      assert.equal(res.headers.get("strict-transport-security"), "max-age=31536000", `no HSTS on ${path}`);
+    }
+  } finally {
+    await relay.close();
+  }
+});
+
 function b64(bytes: Uint8Array): string { return Buffer.from(bytes).toString("base64"); }
 
 test("a host that answers the challenge with a valid signature is authed and registered", async () => {

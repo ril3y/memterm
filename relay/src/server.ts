@@ -45,6 +45,27 @@ function fromB64(s: string): Uint8Array { return new Uint8Array(Buffer.from(s, "
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".json": "application/json" };
 
 /**
+ * Sent with EVERY static response (security review M3). None of this
+ * defends against a relay that is itself hostile -- it serves the client,
+ * so it can ship whatever JavaScript it likes (C1) -- but it does keep a
+ * content-injection bug on this origin from becoming full client
+ * compromise, and it is the defence in depth C1 otherwise has none of.
+ *
+ * `style-src` keeps 'unsafe-inline' because `web/index.html` carries its
+ * whole stylesheet in a `<style>` block. Scripts do NOT: the only script
+ * is `<script type="module" src="./app.js">`, so `default-src 'self'`
+ * covers them with no inline allowance at all. `connect-src` has to admit
+ * `wss:`/`ws:` because the page's own WebSocket URL is built from
+ * `location.host` and is ws: on a loopback relay.
+ */
+const SECURITY_HEADERS: Record<string, string> = {
+  "content-security-policy":
+    "default-src 'self'; connect-src 'self' wss: ws:; img-src 'self' data:; style-src 'self' 'unsafe-inline'",
+  "x-content-type-options": "nosniff",
+  "strict-transport-security": "max-age=31536000",
+};
+
+/**
  * The peer address a connection limit counts against. Fly terminates TLS
  * and proxies, so `socket.remoteAddress` is the proxy for every real user;
  * `fly-client-ip` is the header it sets to the actual client. Taking the
@@ -66,15 +87,15 @@ function clientIp(req: http.IncomingMessage): string {
 export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://relay");
-    if (url.pathname === "/healthz") { res.writeHead(200, { "content-type": "text/plain" }); res.end("ok"); return; }
+    if (url.pathname === "/healthz") { res.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/plain" }); res.end("ok"); return; }
     const rel = url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, "");
     const file = path.normalize(path.join(opts.webRoot, rel));
-    if (!file.startsWith(path.normalize(opts.webRoot))) { res.writeHead(403); res.end(); return; }
+    if (!file.startsWith(path.normalize(opts.webRoot))) { res.writeHead(403, SECURITY_HEADERS); res.end(); return; }
     try {
       const body = await readFile(file);
-      res.writeHead(200, { "content-type": MIME[path.extname(file)] ?? "application/octet-stream" });
+      res.writeHead(200, { ...SECURITY_HEADERS, "content-type": MIME[path.extname(file)] ?? "application/octet-stream" });
       res.end(body);
-    } catch { res.writeHead(404); res.end("not found"); }
+    } catch { res.writeHead(404, SECURITY_HEADERS); res.end("not found"); }
   });
   const registry = new Registry();
   const authDeadlineMs = opts.authDeadlineMs ?? DEFAULT_AUTH_DEADLINE_MS;
@@ -317,18 +338,24 @@ function handlePeerMessage(raw: Buffer, role: "host" | "client", id: string, ws:
   }
 }
 
+/**
+ * One refusal reason for both "that peer is not connected" and "that peer
+ * never allowed you" (security review L2). Two distinct reasons made the
+ * relay a host-existence oracle: an 80-bit id space makes that useless in
+ * practice, but there is no reason to answer the question at all.
+ */
+const REFUSED = JSON.stringify({ type: "refused", reason: "not-allowed" });
+
 function handleEnvelope(msg: EnvMessage, role: "host" | "client", senderId: string, registry: Registry): void {
   if (role === "client") {
     const sender = registry.client(senderId);
     const host = registry.host(msg.to);
-    if (!host) { sender?.socket.send(JSON.stringify({ type: "refused", reason: "not-connected" })); return; }
-    if (!host.allowed.has(senderId)) { sender?.socket.send(JSON.stringify({ type: "refused", reason: "not-allowed" })); return; }
+    if (!host || !host.allowed.has(senderId)) { sender?.socket.send(REFUSED); return; }
     host.socket.send(JSON.stringify(msg));
   } else {
     const host = registry.host(senderId);
     const client = registry.client(msg.to);
-    if (!client) { host?.socket.send(JSON.stringify({ type: "refused", reason: "not-connected" })); return; }
-    if (!host?.allowed.has(msg.to)) { host?.socket.send(JSON.stringify({ type: "refused", reason: "not-allowed" })); return; }
+    if (!client || !host?.allowed.has(msg.to)) { host?.socket.send(REFUSED); return; }
     client.socket.send(JSON.stringify(msg));
   }
 }
