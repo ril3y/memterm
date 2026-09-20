@@ -194,7 +194,7 @@ probe() {  # probe <label> <mode> <configfile> <statedir(optional)> [visible]
 # leg's own loud skip instead (never a silent pass either way).
 MEMTERM_PROBE_REMOTE=1 probe "fresh-default" fresh "$CFGDIR/default.toml"
 if [ "$NODE_PRESENT" = "1" ]; then
-    check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true"
+    check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true close_prunes=true"
 else
     check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-SKIP step=remote-end-to-end reason=node not on PATH"
 fi
