@@ -348,6 +348,34 @@ final class RemoteConfigTests: XCTestCase {
                        Config().remoteRelayURL)
     }
 
+    /// `web_url` decides which origin the pairing QR points at (security
+    /// review C1): whoever serves that page can ship JavaScript into an
+    /// already-paired browser, so being able to move it off the relay is
+    /// the difference between trusting the relay operator and not.
+    ///
+    /// Unlike `relay_url`, blank is MEANINGFUL — it means "the relay serves
+    /// the page" — so a blank value must survive rather than be replaced.
+    func testWebURLDefaultsToEmptyAndKeepsABlankValue() {
+        XCTAssertEqual(Config().remoteWebURL, "")
+
+        let c = Config.parse("""
+            [remote]
+            relay_url = "wss://relay.example.test"
+            web_url = "https://pages.example.test"
+            """)
+        XCTAssertEqual(c.remoteWebURL, "https://pages.example.test")
+        XCTAssertEqual(c.remoteRelayURL, "wss://relay.example.test")
+
+        XCTAssertEqual(Config.parse("[remote]\nweb_url = \"\"\n").remoteWebURL, "")
+
+        var round = Config()
+        round.remoteWebURL = "https://pages.example.test"
+        let back = Config.parse(round.serialize())
+        XCTAssertEqual(back.remoteWebURL, "https://pages.example.test")
+        // And a serialized default still round-trips as "use the relay".
+        XCTAssertEqual(Config.parse(Config().serialize()).remoteWebURL, "")
+    }
+
     func testRoundTripsThroughSerialization() {
         var c = Config()
         c.remoteEnabled = true

@@ -5,13 +5,15 @@
 
 ## Goal
 
-From a phone or another computer on any network, see and type into the terminal sessions that are running inside memterm on the Mac mini — the same session, not a copy. tmux-attach semantics over the internet, without opening ports on the mini and without a service that can read the traffic.
+From a phone or another computer on any network, see and type into the terminal sessions that are running inside memterm on the Mac mini — the same session, not a copy. tmux-attach semantics over the internet, without opening ports on the mini and without a service that can read the envelopes.
+
+**What the relay can see (security review 2026-09-20, C1).** The record layer really is end-to-end: the relay routes opaque envelopes and holds no key. But the relay also *serves the browser client*, so for a browser device it chooses the JavaScript that does the encrypting — it can therefore read every pane and type into the Mac, and no CSP or SRI helps, because the page comes from the same origin. The honest statement is that a browser device trusts the relay operator (and whoever terminates its TLS) as much as it trusts the Mac. Self-hosting the relay, or serving the page from an origin you control via `[remote] web_url`, is what removes that trust.
 
 Non-goals for this project: moving a session to another machine (journal sync), a native iOS app, notifications, the SSH host manager, workspace locks (hooks only).
 
 ## Constraints carried from REQUIREMENTS
 
-- "No accounts, no cloud, no telemetry": remote access is **off by default**, opt-in per install, and the relay is **blind** (end-to-end encrypted) and **self-hostable** (one container, holds no secrets).
+- "No accounts, no cloud, no telemetry": remote access is **off by default**, opt-in per install, and the relay is **blind to the envelopes** (end-to-end encrypted) and **self-hostable** (one container, holds no secrets). Blind is not the same as untrusted: the relay serves the browser client, so a browser device trusts whoever operates it — see the Goal section.
 - The host is the running memterm app: the ptys are its processes. No second daemon. If memterm is not running on the mini, nothing is reachable — consistent with the disk-is-the-persistence-layer thesis.
 - Everything a remote client can do is exactly what a local keyboard can do to the same pane. No side channel that bypasses the terminal, so FR-30/31 denylist and consent rules hold remotely by construction.
 
@@ -58,7 +60,26 @@ Relay → client: `offline {lastSeen}`, `online`.
 
 ## Pairing UX (Settings ▸ Remote)
 
-On/off switch; relay URL (default: the Fly app); "Pair a device…" shows a QR code with `{relayURL, hostId, hostPublicKey, token}` — token single-use, 2-minute expiry; the host shows "Allow ‹device name›?" before adding; device list with name, last seen, Remove (revokes at the host; the relay's allow-list follows on the next announce). The host's key pair and device list live in the Keychain / state dir, not the journal.
+On/off switch; relay URL (default: the Fly app); optional `web_url` for serving the browser page yourself; "Pair a device…" shows a QR code with `{relayURL, hostId, hostPublicKey, token, secret, expiresAt}` — single-use, 2-minute expiry; the host shows "Allow ‹device name›?" before adding; device list with name, last seen, Remove (revokes at the host; the relay's allow-list follows on the next announce). The host's key pair and device list live in the Keychain / state dir, not the journal; the device list carries an HMAC under a key derived from the Keychain identity and is refused if it does not verify, so a same-user process cannot append its own key and grant itself a shell.
+
+**The split token and the pair proof (security review 2026-09-20, C2).** The 32 random bytes behind a QR code are split in half:
+
+- `token` = base64url of bytes[0..16] (22 chars). The **only** half the relay is told. It is a map key and nothing more.
+- `secret` = base64url of bytes[16..32]. Never sent anywhere; it exists in the QR code and in the host's pending pairing.
+
+The device sends `pair {token, publicKey, name, proof}` where `proof` = base64 of `HMAC-SHA256(secret, "memterm-remote-v1:pair" ‖ deviceSPKI)`. The relay additionally requires `idFromPublicKey(publicKey)` to equal the id of the socket that sent it, and forwards `pair-request {deviceId, publicKey, name, proof}`. The host recomputes the MAC over the SPKI it received, under the secret of the code currently on screen, compares it in constant time, and only then shows the prompt; a missing or wrong proof is denied with no prompt at all.
+
+Without this, `pair-request` carried nothing tying the key to whoever consumed the token, so a hostile relay could substitute its own key inside a genuine request (the real phone then just appears to hang) or mint an unsolicited request while the sheet was open — either way the user saw the prompt they expected and one click granted a permanent shell. Now the relay can neither compute a MAC for a key of its own nor mint a request at all. The browser also shows its own key id while it waits, so the prompt's `Device key:` line is something the user can actually check.
+
+## Threat model
+
+Three boundaries, and what each party can do.
+
+- **A stranger on the internet.** Nothing. They cannot address a host that has not named their device id, cannot reach past the host's own store even if the relay forwarded it, and cannot get presence for a host they are not paired with. Availability is the exception: a router can always drop traffic, and the relay's memory bounds (token shape, per-host pairing cap, per-IP connection cap) keep a flood from taking it down for everyone.
+- **A hostile relay operator (or whoever terminates its TLS).** Can deny service to any session at will. For a **browser** device, can read every pane and type into the Mac, because it serves the page (C1 above). Cannot read a non-browser client's traffic, cannot swap the host's key at pairing (the device pins what it scanned), cannot substitute or mint a pair request (C2 above), and cannot make the host believe a revoked device is still allowed — the host's store is the authority.
+- **A local process running as the user.** Has the machine already. It cannot, however, turn that into durable remote access by editing the device list: the list is MAC'd under the Keychain identity.
+
+**Traffic analysis is not covered (security review M5).** The relay sees host and device ids, the full pairing graph, online/offline timing, and the exact size and timing of every record. Keystrokes are sealed one per record with no padding and no cover traffic, which is the classic setup for inferring typed content from inter-keystroke timing — a relay operator who cannot read your terminal can still make good guesses about what you are typing into it. Padding `input` records to a fixed size and coalescing them on a short timer is the fix; it is deliberately a v2 item, because it trades latency on the one interaction the feature exists for, and because the operator it defends against can already read a browser client outright.
 
 ## Multiple viewers and size
 

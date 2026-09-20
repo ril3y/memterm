@@ -132,6 +132,16 @@ public struct Config {
     // so the URL is a plain string the user may point at their own box.
     public var remoteEnabled = false
     public var remoteRelayURL = "wss://memterm-relay.fly.dev"
+    /// Where the browser client is served from, if not the relay itself.
+    ///
+    /// Empty (the default) means "derive it from `relay_url`", which is
+    /// what the QR code has always encoded. Setting it points the QR at a
+    /// different origin — a copy of `relay/web` on a host you control —
+    /// while the relay stays the WebSocket endpoint. That matters because
+    /// whoever serves the page can ship whatever JavaScript it likes to an
+    /// already-paired browser (security review C1); moving the page moves
+    /// that trust off the relay.
+    public var remoteWebURL = ""
 
     public init() {}
 
@@ -245,6 +255,10 @@ public struct Config {
         // An empty relay_url would leave the host with nothing to dial, so it
         // keeps the default rather than producing a URL that cannot parse.
         if let s = string(values["remote.relay_url"]), !s.isEmpty { c.remoteRelayURL = s }
+        // Unlike relay_url, empty is MEANINGFUL here: it means "serve the
+        // client from the relay", so a blank value is kept rather than
+        // replaced by a default.
+        if let s = string(values["remote.web_url"]) { c.remoteWebURL = s }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
         // Numeric knobs clamp into their sane range (a hand-typed 3.0 line
@@ -371,6 +385,7 @@ public struct Config {
         lines.append("[remote]")
         lines.append("enabled = \(remoteEnabled)  # off = memterm never opens an outbound socket")
         lines.append("relay_url = \"\(remoteRelayURL)\"  # your own relay works too — it holds no secrets")
+        lines.append("web_url = \"\(remoteWebURL)\"  # blank = the relay serves the browser page; set it to serve that page yourself")
         lines.append("")
         // [theme] stays LAST: its ansi0…15 keys are bare (untabled) names, so
         // any table written after it would be swallowed into [theme] on the
@@ -479,12 +494,15 @@ public struct Config {
         # screen = "mouse"       # mouse | main
         # animation_ms = 150
 
-        # Remote attach: mirror and type into these sessions from a phone,
-        # through an end-to-end-encrypted relay that cannot read the traffic.
+        # Remote attach: mirror and type into these sessions from a phone.
+        # The relay forwards end-to-end-encrypted envelopes it cannot read,
+        # but it also serves the browser page, so it can read and inject for
+        # browser devices; self-hosting it (or web_url) removes that trust.
         # Off until you turn it on in Settings ▸ Remote and pair a device.
         # [remote]
         # enabled = false
         # relay_url = "wss://memterm-relay.fly.dev"   # or your own self-hosted relay
+        # web_url = ""                                 # blank = the relay serves the browser page
 
         # [theme]
         # preset = "memterm-dark"  # display label set by Settings; colors win

@@ -3455,6 +3455,37 @@ extension MemtermAppDelegate {
                 else {
                     throw ProbeFailure("payload.hostPublicKey does not hash to payload.hostId — SPKI header mismatch")
                 }
+                // The QR code is the only way the secret half of the token
+                // reaches a device (security review C2), so the fragment
+                // has to survive the round trip intact — a dropped field
+                // here would leave every real phone unable to prove
+                // anything, while this headless client (which is handed
+                // the payload directly) sailed on.
+                guard payload.token.count == RemotePairing.routingTokenLength,
+                      let secret = RemotePairing.data(fromBase64url: payload.secret),
+                      secret.count == 16
+                else {
+                    throw ProbeFailure("pairing payload token/secret are not the 16-byte halves")
+                }
+                guard let url = RemoteHost.pairingURL(for: payload),
+                      let fragment = URLComponents(url: url, resolvingAgainstBaseURL: false)?.fragment,
+                      fragment.hasPrefix("pair="),
+                      let json = RemotePairing.data(fromBase64url: String(fragment.dropFirst(5))),
+                      let round = try? JSONDecoder().decode(PairingPayload.self, from: json)
+                else {
+                    throw ProbeFailure("the pairing URL's fragment did not decode back to a payload")
+                }
+                guard round == payload else {
+                    throw ProbeFailure("the pairing URL's payload does not match the minted one")
+                }
+                // And `[remote] web_url` moves the page origin without
+                // touching the payload (security review C1).
+                guard let elsewhere = RemoteHost.pairingURL(for: payload, webBase: "https://pages.example.test"),
+                      elsewhere.host == "pages.example.test",
+                      elsewhere.fragment == fragment
+                else {
+                    throw ProbeFailure("web_url did not move the pairing URL's origin while keeping its payload")
+                }
                 guard remote.probeSessionCount == 1 else {
                     throw ProbeFailure("host session count \(remote.probeSessionCount) after handshake, want 1")
                 }

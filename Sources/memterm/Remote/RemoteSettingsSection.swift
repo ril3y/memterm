@@ -98,8 +98,15 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
             [NSGridCell.emptyContentView,
              caption("Off by default. Nothing leaves this Mac until you turn this on and pair a device.")],
             [label("Relay:"), relayField],
+            // Security review C1: this used to say the relay "cannot read"
+            // your traffic, full stop. That is true of the envelopes, and
+            // false of a browser device, because the relay also serves the
+            // web page — so it can ship JavaScript that reads and types for
+            // it. Saying so is the honest version, and self-hosting is the
+            // answer.
             [NSGridCell.emptyContentView,
-             caption("The relay only forwards encrypted traffic between your devices — it cannot read it. Point this at your own if you'd rather.")],
+             caption("The relay forwards encrypted envelopes it can't read — but it also serves the browser page, "
+                     + "so for a browser it can read and type. Run your own relay to remove that trust.")],
             [label("Status:"), statusLabel],
             [NSGridCell.emptyContentView, pairButton],
             [label("Devices:"), deviceScroll],
@@ -183,7 +190,7 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
         // must not be live at the relay, so nothing is announced until the
         // image exists.
         let payload = host.makePairingPayload()
-        guard let url = RemoteHost.pairingURL(for: payload),
+        guard let url = RemoteHost.pairingURL(for: payload, webBase: app.config.remoteWebURL),
               let image = Self.qrImage(for: url.absoluteString, side: 220)
         else { return }
         host.publishPairing(payload)

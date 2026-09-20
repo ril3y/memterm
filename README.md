@@ -65,7 +65,7 @@ Mirror and control your panes from a phone. Off by default: turn it on in **Sett
 
 A paired device can do exactly what a local keyboard can do to a pane: see its live output, type into it, resize it, open tabs. Nothing more.
 
-The relay only ever sees encrypted envelopes addressed by opaque routing IDs — it cannot read your terminal, and it persists nothing to disk. All the actual crypto (key agreement, encryption) happens between the app and the browser; the relay is a blind forwarder.
+The relay only ever sees encrypted envelopes addressed by opaque routing IDs — it cannot read your terminal, and it persists nothing to disk. All the actual crypto (key agreement, encryption) happens between the app and the browser; the relay is a blind forwarder. One caveat worth stating plainly: the relay also serves the browser page, so for a browser device it can ship JavaScript that reads and types on its behalf — running your own relay is what removes that trust.
 
 By default, remote attach connects through `wss://memterm-relay.fly.dev`. To self-host: `fly launch` from the `relay/` directory (it already has a `fly.toml` and `Dockerfile`), then point `relay_url` under `[remote]` in your config file at your own app. `npm test` from `relay/` runs the relay's test suite.
 
