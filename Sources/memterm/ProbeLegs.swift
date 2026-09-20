@@ -3365,13 +3365,38 @@ extension MemtermAppDelegate {
         var incomingPairName: String?
         var pane: PaneView?
 
+        // Plan-mandated teardown (review round 1, 2026-09-20): a probe
+        // failure anywhere in this leg routes straight to ProbeRunner.fail()
+        // -> exit(1), which does NOT reap a spawned child process — an
+        // orphaned `node relay/dist/src/server.js` would otherwise survive
+        // every assert throw or condition timeout except the two steps that
+        // happened to call `relay.terminate()` inline. One idempotent
+        // closure, registered as every step's `onFailure`, closes that gap:
+        // safe to call whether the relay is already dead (the deliberate
+        // mid-leg kill), never launched, or already torn down by the
+        // success path.
+        var remoteLegTornDown = false
+        let tearDownRemoteLeg: () -> Void = { [self] in
+            guard !remoteLegTornDown else { return }
+            remoteLegTornDown = true
+            client.disconnect()
+            if relay.isRunning {
+                relay.terminate()
+                relay.waitUntilExit()
+            }
+            var off = config
+            off.remoteEnabled = false
+            applyConfigLive(off)
+        }
+
         probe.add(ProbeStep(
             name: "remote-relay-start", timeout: 10,
             action: { try? relay.run() },
             condition: { Self.relayHealthy(port: port) },
             assert: {
                 guard relay.isRunning else { throw ProbeFailure("relay process exited before /healthz answered") }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-config-apply", timeout: 10,
@@ -3386,7 +3411,8 @@ extension MemtermAppDelegate {
                 guard remote.probeState == "connected" else {
                     throw ProbeFailure("host did not reach the loopback relay (state=\(remote.probeState) error=\(remote.probeLastError ?? "none"))")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-pairing", timeout: 10,
@@ -3400,8 +3426,16 @@ extension MemtermAppDelegate {
                 client.connect(relay: relayURL)
                 client.pair(payload)
             },
-            condition: { [self] in client.handshakeComplete && remote.probeSessionCount == 1 },
+            // `paired == false` (a pair-denied answer) short-circuits the
+            // wait instead of running out the clock only to report the
+            // generic "timeout waiting for condition".
+            condition: { [self] in
+                client.paired == false || (client.handshakeComplete && remote.probeSessionCount == 1)
+            },
             assert: { [self] in
+                guard client.paired != false else {
+                    throw ProbeFailure("relay answered pair-denied instead of paired")
+                }
                 guard incomingPairName == "probe-client" else {
                     throw ProbeFailure("pair-request name never arrived (got \(incomingPairName ?? "nil"))")
                 }
@@ -3414,7 +3448,8 @@ extension MemtermAppDelegate {
                 guard remote.probeSessionCount == 1 else {
                     throw ProbeFailure("host session count \(remote.probeSessionCount) after handshake, want 1")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-list", timeout: 10,
@@ -3428,7 +3463,8 @@ extension MemtermAppDelegate {
                 guard let tree = client.lastTree, Self.treeContains(tree, paneId: paneId) else {
                     throw ProbeFailure("listed tree does not contain the key host's selected pane \(paneId.prefix(8))")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-attach", timeout: 10,
@@ -3439,7 +3475,8 @@ extension MemtermAppDelegate {
                 guard screen.cols == pane.getTerminal().cols else {
                     throw ProbeFailure("attach screen cols \(screen.cols) != pane cols \(pane.getTerminal().cols)")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-echo", timeout: 10,
@@ -3452,7 +3489,8 @@ extension MemtermAppDelegate {
                 guard pane.scrollbackText(maxLines: 50).contains("remote-probe") else {
                     throw ProbeFailure("echoed bytes reached the client but never the real pty's scrollback")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-resize", timeout: 10,
@@ -3465,7 +3503,8 @@ extension MemtermAppDelegate {
                 guard let pane, pane.getTerminal().cols == 100 else {
                     throw ProbeFailure("pane terminal did not actually resize to 100 cols")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-relay-kill", timeout: 10,
@@ -3478,7 +3517,8 @@ extension MemtermAppDelegate {
                 guard remote.probeState == "offline" else {
                     throw ProbeFailure("host did not notice the relay dying (state=\(remote.probeState))")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             // Generous timeout: the host's own reconnect backoff (1s -> 30s)
@@ -3491,7 +3531,8 @@ extension MemtermAppDelegate {
                 guard remote.probeState == "connected" else {
                     throw ProbeFailure("host never reconnected after the relay restart (state=\(remote.probeState))")
                 }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-client-reauth", timeout: 15,
@@ -3499,7 +3540,8 @@ extension MemtermAppDelegate {
             condition: { client.authed },
             assert: {
                 guard client.authed else { throw ProbeFailure("client never re-authed against the restarted relay") }
-            }))
+            },
+            onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
             name: "remote-revoke", timeout: 10,
@@ -3508,16 +3550,14 @@ extension MemtermAppDelegate {
                 client.send(.list)
             },
             condition: { client.lastRefusedReason != nil },
-            assert: { [self] in
+            assert: {
                 guard client.lastRefusedReason == "not-allowed" else {
                     throw ProbeFailure("post-revoke envelope got reason=\(client.lastRefusedReason ?? "nil"), want not-allowed")
                 }
                 print("UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true")
-                var off = config
-                off.remoteEnabled = false
-                applyConfigLive(off)
-                relay.terminate()
-            }))
+                tearDownRemoteLeg()
+            },
+            onFailure: { tearDownRemoteLeg() }))
     }
 
     private static func findNode() -> String? {

@@ -28,9 +28,11 @@ final class RemoteProbeClient {
 
     // Polled by the leg's ProbeStep conditions; written only on main.
     private(set) var authed = false
+    /// `nil` while the pairing answer is still in flight, `false` on
+    /// `pair-denied` — checked by the probe leg for a clear failure message
+    /// instead of a generic handshake timeout.
     private(set) var paired: Bool?
     private(set) var handshakeComplete = false
-    private(set) var lastPairRequestName: String?
     private(set) var lastTree: RemoteTree?
     private(set) var lastScreen: (cols: Int, rows: Int, bytes: Data)?
     private(set) var receivedOutput = Data()
