@@ -119,25 +119,33 @@ final class RemotePaneStream {
     /// Resizes the emulator grid and the pty window, and reports the size the
     /// pane actually ended up at so the host can answer `.resized`.
     ///
-    /// `TerminalView.resize(cols:rows:)` resizes the emulator and, through
-    /// `LocalProcessTerminalView.sizeChanged`, sets the pty window size. The
-    /// local window's next layout pass may re-derive cols/rows from the pane's
-    /// frame and override this — that is the spec's "host window wins" rule,
-    /// and the returned size is the truth at this moment, not a promise.
+    /// Deliberately NOT `TerminalView.resize(cols:rows:)`: that packaged call
+    /// ends in `terminal.softReset()` (AppleTerminalView.swift:2838-2843),
+    /// which clears application keypad/cursor mode, origin and insert mode,
+    /// the charset and the scroll region — a remote resize would break the
+    /// arrow keys under a running vim or htop, which dragging the local window
+    /// never does. The frame-driven local path resizes the emulator with no
+    /// such reset, so this takes the same two steps by hand:
     ///
-    /// KNOWN COST (SwiftTerm 1.20.0, AppleTerminalView.swift:2838): the public
-    /// `resize(cols:rows:)` ends in `terminal.softReset()`, which clears
-    /// application keypad/cursor mode, origin and insert mode, the charset and
-    /// the scroll region. The frame-driven local path (line 395) calls
-    /// `terminal.resize` WITHOUT that reset, so a remote-driven resize
-    /// disturbs a running TUI in a way a window drag does not. Left as-is for
-    /// v1 per the Task 8 ruling; the fix, if it bites, is `terminal.resize`
-    /// plus a `sizeChanged` notify instead of the packaged call.
+    /// 1. `Terminal.resize(cols:rows:)` (Terminal.swift:6740) — reflows the
+    ///    grid, clamping to SwiftTerm's minimum and returning early when the
+    ///    size is unchanged. No reset.
+    /// 2. `LocalProcessTerminalView.sizeChanged` (MacLocalTerminalView.swift:104)
+    ///    — sets the pty winsize, which `getWindowSize()` reads back off
+    ///    `terminal.cols/rows`, so step 1 must come first. The delegate is
+    ///    notified with the grid's ACTUAL size, not the requested one, so a
+    ///    clamped request doesn't announce a size nothing is at.
+    ///
+    /// The view's own grid stays frame-derived: the local window's next layout
+    /// pass may recompute cols/rows from the pane's frame and overwrite this.
+    /// That is the spec's "host window wins" rule — the returned pair is the
+    /// truth at this moment, not a promise about the next one.
     @discardableResult
     func resize(cols: Int, rows: Int) -> (cols: Int, rows: Int) {
         let terminal = pane.getTerminal()
         guard cols > 0, rows > 0 else { return (terminal.cols, terminal.rows) }
-        pane.resize(cols: cols, rows: rows)
+        terminal.resize(cols: cols, rows: rows)
+        pane.sizeChanged(source: pane, newCols: terminal.cols, newRows: terminal.rows)
         return (terminal.cols, terminal.rows)
     }
 }
