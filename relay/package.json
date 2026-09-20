@@ -6,7 +6,7 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc && mkdir -p dist/web && cp web/index.html dist/web/",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "test": "tsc && mkdir -p dist/web && cp web/index.html dist/web/ && node --test dist/test/*.test.js",
     "web": "esbuild web/src/app.ts --bundle --outfile=web/dist/app.js --format=esm"
   },
