@@ -267,8 +267,21 @@ function leaveTerminal(): void {
   showView("tree");
 }
 
+/** Kills any live session/in-flight handshake and drops a live terminal back to the tree. */
+function dropSession(): void {
+  handshakeGen++; // invalidate any handshake still in flight
+  session = undefined;
+  pendingHandshake = undefined;
+  if (term) leaveTerminal(); // a session or handshake never outlives its terminal
+}
+
 async function startSession(): Promise<void> {
   if (!host || !relay) return;
+  // Every fresh handshake starts from the tree: a terminal left over from a
+  // previous (now-dead) session would otherwise sit there with no session to
+  // send its input through, and the "tree" handler's re-attach logic only
+  // runs when no terminal is currently open.
+  if (term) leaveTerminal();
   // Unconditionally supersedes any handshake already in flight: its Hello
   // reply, whenever it arrives, will carry a stale `gen` and be dropped.
   const gen = ++handshakeGen;
@@ -280,10 +293,7 @@ async function startSession(): Promise<void> {
 }
 
 function teardownSession(message: string): void {
-  handshakeGen++; // invalidate any handshake still in flight
-  session = undefined;
-  pendingHandshake = undefined;
-  leaveTerminal();
+  dropSession();
   showToast(message);
   updateTreeDisabled();
 }
@@ -310,6 +320,11 @@ async function handleEnvelope(from: string, payload: Uint8Array): Promise<void> 
       return;
     }
     const verified = await verifyHello(hello, host.hostPublicKey);
+    // Re-check IMMEDIATELY after every await, before any branch below that
+    // might call teardownSession() -- a superseded handshake's `verified`/
+    // `hostEphemeralRaw` are meaningless and must never tear down whatever
+    // newer handshake `startSession()` has since started.
+    if (handshake.gen !== handshakeGen) return; // superseded while verifying; drop silently
     if (!verified) {
       teardownSession("Host verification failed");
       return;
@@ -319,13 +334,13 @@ async function handleEnvelope(from: string, payload: Uint8Array): Promise<void> 
       teardownSession("The host's handshake reply was malformed");
       return;
     }
-    if (handshake.gen !== handshakeGen) return; // superseded while verifying; drop silently
     // hostId for the key schedule always comes from the STORED SPKI, never
     // from a wire field (the envelope's `from`, or a prior "paired"/"online"
     // message) -- see the task brief's binding warning.
     const hostIdForKeys = await idFromPublicKey(host.hostPublicKey);
+    if (handshake.gen !== handshakeGen) return; // superseded while computing the host id; drop silently
     const keys = await deriveKeys(handshake.ephemeralPrivate, hostEphemeralRaw, hostIdForKeys, identity.id, false);
-    if (handshake.gen !== handshakeGen) return; // superseded while deriving; drop silently
+    if (handshake.gen !== handshakeGen) return; // superseded while deriving keys; drop silently
     pendingHandshake = undefined;
     session = new SessionKeys(keys.sendKey, keys.recvKey);
     void sendMessage({ t: "list" });
@@ -513,10 +528,7 @@ async function main(): Promise<void> {
     },
     onOffline: (hostId, lastSeenMs) => {
       if (!host || hostId !== host.hostId) return;
-      handshakeGen++; // invalidate any handshake in flight; the host is gone
-      session = undefined;
-      pendingHandshake = undefined;
-      leaveTerminal(); // don't leave a dead terminal showing; keeps lastAttachedPaneId for recovery
+      dropSession(); // the host is gone; keeps lastAttachedPaneId for recovery
       hostOfflineSince = lastSeenMs;
       recomputeBanner();
       updateTreeDisabled();
@@ -525,6 +537,12 @@ async function main(): Promise<void> {
     onEnvelope: (from, payload) => void handleEnvelope(from, payload),
     onDisconnected: () => {
       relayUnreachable = true;
+      // The socket is gone, so whatever session was live over it is dead
+      // too: don't leave a live terminal pointed at it (keystrokes would
+      // silently no-op) -- onAuthed's re-handshake on reconnect will re-list
+      // and, via startSession()'s own leaveTerminal(), the tree handler's
+      // re-attach branch will pick lastAttachedPaneId back up.
+      if (term) leaveTerminal();
       recomputeBanner();
     },
   });
