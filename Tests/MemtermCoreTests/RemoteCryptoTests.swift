@@ -616,6 +616,133 @@ final class RemoteCryptoTests: XCTestCase {
             identity: identity))
     }
 
+    /// The same row shape the app stores (`PairedDevice` lives in the app
+    /// target, which has no test bundle), so the file path below is
+    /// exercised over the real field types: a base64 Data key, a Date, and
+    /// an optional Date.
+    private struct SealRow: Codable, Equatable {
+        var id: String
+        var name: String
+        var publicKeySPKI: Data
+        var pairedAt: Date
+        var lastSeen: Date?
+    }
+
+    private func sealRows() -> [SealRow] {
+        [
+            // A fractional second on purpose: `Date()` has one, and the
+            // ISO-8601 strategy writes whole seconds, so what comes back
+            // off disk is the truncated value. That is fine — and it is
+            // what makes the canonical encoding idempotent, which is the
+            // property the seal depends on.
+            SealRow(id: "aaaa", name: "iPhone",
+                    publicKeySPKI: RemoteIdentity.generate().publicKeySPKI,
+                    pairedAt: Date(timeIntervalSince1970: 1_758_000_000.25), lastSeen: nil),
+            SealRow(id: "bbbb", name: "iPad",
+                    publicKeySPKI: RemoteIdentity.generate().publicKeySPKI,
+                    pairedAt: Date(timeIntervalSince1970: 1_758_000_100),
+                    lastSeen: Date(timeIntervalSince1970: 1_758_000_200)),
+        ]
+    }
+
+    /// The rows a load legitimately returns for `rows`: the same values,
+    /// with dates at the precision the file stores.
+    private func asStored(_ rows: [SealRow]) throws -> [SealRow] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(
+            [SealRow].self, from: try XCTUnwrap(RemoteDeviceSeal.canonicalJSON(rows)))
+    }
+
+    /// The whole on-disk path, with an in-memory identity standing in for
+    /// the Keychain one: write the file, flip a byte in it, and the load
+    /// must refuse rather than trust the edit. This is the local-malware
+    /// case in M2 — a process that appends its own public key to
+    /// `remote-devices.json` and gets a shell on the next launch.
+    func testDeviceFileRefusesATamperedByte() throws {
+        let identity = RemoteIdentity.generate()
+        let rows = sealRows()
+        let data = try XCTUnwrap(RemoteDeviceSeal.encodeFile(rows, identity: identity))
+
+        guard case .rows(let loaded) = RemoteDeviceSeal.decodeFile(
+            data, identity: identity, as: SealRow.self)
+        else { return XCTFail("a freshly sealed file did not load") }
+        XCTAssertEqual(loaded, try asStored(rows))
+
+        // Every single-byte edit that still parses must be refused; one
+        // that no longer parses must be refused too, just as `unreadable`.
+        var refusals = 0
+        for index in data.indices {
+            var tampered = data
+            tampered[index] ^= 0x01
+            guard tampered != data else { continue }
+            switch RemoteDeviceSeal.decodeFile(tampered, identity: identity, as: SealRow.self) {
+            case .rows(let rows) where rows == loaded:
+                continue  // whitespace inside the pretty-printing, no value changed
+            case .rows:
+                XCTFail("a tampered byte at \(index) produced different rows that still verified")
+            case .failedIntegrity, .unreadable:
+                refusals += 1
+            }
+        }
+        XCTAssertGreaterThan(refusals, 0)
+
+        // The malware case spelled out: a row appended by hand.
+        var appended = rows
+        appended.append(SealRow(id: "evil", name: "iPhone",
+                                publicKeySPKI: RemoteIdentity.generate().publicKeySPKI,
+                                pairedAt: Date(), lastSeen: nil))
+        let forged = try XCTUnwrap(RemoteDeviceSeal.encodeFile(appended, identity: identity))
+        var spliced = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: forged) as? [String: Any])
+        spliced["mac"] = try XCTUnwrap(
+            (JSONSerialization.jsonObject(with: data) as? [String: Any])?["mac"])
+        let splicedData = try JSONSerialization.data(withJSONObject: spliced)
+        if case .rows = RemoteDeviceSeal.decodeFile(splicedData, identity: identity, as: SealRow.self) {
+            XCTFail("an appended row with the old MAC was accepted")
+        }
+
+        // A file sealed by a different host identity is somebody else's.
+        if case .rows = RemoteDeviceSeal.decodeFile(
+            try XCTUnwrap(RemoteDeviceSeal.encodeFile(rows, identity: RemoteIdentity.generate())),
+            identity: identity, as: SealRow.self) {
+            XCTFail("a file sealed under another identity was accepted")
+        }
+
+        // An unsealed list — the format before this existed, and the format
+        // a tamperer would most naturally write — is not readable.
+        let bare = try XCTUnwrap(RemoteDeviceSeal.canonicalJSON(rows))
+        if case .rows = RemoteDeviceSeal.decodeFile(bare, identity: identity, as: SealRow.self) {
+            XCTFail("an unsealed device list was accepted")
+        }
+    }
+
+    /// The load path re-derives the MAC input from the rows it decoded, so
+    /// canonical encoding has to be idempotent through a decode — otherwise
+    /// a file this app wrote would fail its own check on the next launch.
+    func testCanonicalEncodingSurvivesARoundTripAndIgnoresLayout() throws {
+        let identity = RemoteIdentity.generate()
+        let rows = sealRows()
+        let canonical = try XCTUnwrap(RemoteDeviceSeal.canonicalJSON(rows))
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode([SealRow].self, from: canonical)
+        XCTAssertEqual(RemoteDeviceSeal.canonicalJSON(decoded), canonical)
+
+        // Reformatting the file by hand (the user is meant to be able to
+        // read it) keeps the seal, because the MAC covers the canonical
+        // rows rather than the file's bytes.
+        let data = try XCTUnwrap(RemoteDeviceSeal.encodeFile(rows, identity: identity))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let reformatted = try JSONSerialization.data(withJSONObject: object)  // compact, unsorted
+        XCTAssertNotEqual(reformatted, data)
+        guard case .rows(let loaded) = RemoteDeviceSeal.decodeFile(
+            reformatted, identity: identity, as: SealRow.self)
+        else { return XCTFail("a reformatted but unmodified file was refused") }
+        XCTAssertEqual(loaded, try asStored(rows))
+    }
+
     /// The seal key must be a derivative of the identity, not the identity:
     /// two identities disagree, one identity is stable across calls, and
     /// the derived key is never the raw private key.

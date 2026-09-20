@@ -55,4 +55,65 @@ public enum RemoteDeviceSeal {
         return HMAC<SHA256>.isValidAuthenticationCode(
             candidate, authenticating: canonicalJSON, using: key(identity: identity))
     }
+
+    // MARK: - The file
+
+    /// The on-disk shape: the rows the app stores, plus the MAC. Generic
+    /// over the row type so the whole file path — canonical encoding,
+    /// sealing, verification, refusal — lives here under test, and the app
+    /// target keeps only its own `PairedDevice` and the policy around it.
+    public struct File<Row: Codable>: Codable {
+        public var devices: [Row]
+        public var mac: String
+    }
+
+    /// What a load found. The two failures are kept apart because they
+    /// deserve different log lines: one is a file we cannot read at all,
+    /// the other is a file somebody edited.
+    public enum Load<Row> {
+        case rows([Row])
+        /// Not the shape we write — an older format, or truncated.
+        case unreadable
+        /// Parsed, but the MAC does not match. Refuse and keep the file.
+        case failedIntegrity
+    }
+
+    /// The bytes the MAC covers: compact, sorted keys, ISO-8601 dates.
+    ///
+    /// Deliberately NOT the bytes on disk (which are pretty-printed for a
+    /// human reader), so reformatting the file by hand leaves the seal
+    /// intact while changing any value breaks it. Encoding is idempotent
+    /// through a decode — the date strategy has no sub-second component to
+    /// lose twice — so the load path re-derives exactly what the save path
+    /// sealed.
+    public static func canonicalJSON<Row: Encodable>(_ rows: [Row]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try? encoder.encode(rows)
+    }
+
+    /// Serializes rows into a sealed file, pretty-printed and key-sorted:
+    /// the user is meant to be able to read and diff it.
+    public static func encodeFile<Row: Codable>(_ rows: [Row], identity: RemoteIdentity) -> Data? {
+        guard let canonical = canonicalJSON(rows) else { return nil }
+        let file = File(devices: rows, mac: seal(canonicalJSON: canonical, identity: identity))
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? encoder.encode(file)
+    }
+
+    /// Reads a sealed file, returning rows ONLY if the MAC verifies.
+    public static func decodeFile<Row: Codable>(
+        _ data: Data, identity: RemoteIdentity, as rowType: Row.Type = Row.self
+    ) -> Load<Row> {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let file = try? decoder.decode(File<Row>.self, from: data) else { return .unreadable }
+        guard let canonical = canonicalJSON(file.devices),
+              verify(canonicalJSON: canonical, mac: file.mac, identity: identity)
+        else { return .failedIntegrity }
+        return .rows(file.devices)
+    }
 }

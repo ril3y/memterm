@@ -36,16 +36,6 @@ struct PairedDevice: Codable, Equatable {
     var lastSeen: Date?
 }
 
-/// The on-disk shape: the rows plus the MAC that proves this app wrote
-/// them. Pretty-printed, because the user is meant to be able to read it.
-private struct DeviceFile: Codable {
-    var devices: [PairedDevice]
-    /// base64 HMAC-SHA256 over the CANONICAL encoding of `devices` — not
-    /// over the file's bytes, so reformatting by hand is harmless while
-    /// changing any value is not.
-    var mac: String
-}
-
 final class RemoteDeviceStore {
 
     /// Keychain coordinates. `kSecClassGenericPassword` with a fixed
@@ -196,14 +186,15 @@ final class RemoteDeviceStore {
         loaded = true
         guard !ephemeral else { return }
         guard let data = try? Data(contentsOf: devicesURL) else { return }  // nothing paired yet
-        guard let file = try? JSONDecoder.remoteDeviceDecoder.decode(DeviceFile.self, from: data) else {
-            log("device list is unreadable or unsigned; starting with no paired devices")
+        let rows: [PairedDevice]
+        switch RemoteDeviceSeal.decodeFile(data, identity: loadOrCreateIdentity(),
+                                           as: PairedDevice.self) {
+        case .rows(let decoded):
+            rows = decoded
+        case .unreadable:
+            log("device list is not in a readable format; starting with no paired devices")
             return
-        }
-        guard let canonical = Self.canonicalJSON(file.devices),
-              RemoteDeviceSeal.verify(canonicalJSON: canonical, mac: file.mac,
-                                      identity: loadOrCreateIdentity())
-        else {
+        case .failedIntegrity:
             log("device list failed its integrity check; starting with no paired devices "
                 + "(the file is left in place at \(devicesURL.lastPathComponent))")
             return
@@ -217,22 +208,12 @@ final class RemoteDeviceStore {
         // This runs AFTER the MAC check, over the rows exactly as decoded,
         // so a rewritten id fails verification rather than being quietly
         // corrected into a valid file.
-        storage = file.devices.compactMap { device in
+        storage = rows.compactMap { device in
             guard Self.isValidSPKI(device.publicKeySPKI) else { return nil }
             var fixed = device
             fixed.id = RemoteIdentity.peerId(forSPKI: device.publicKeySPKI)
             return fixed
         }
-    }
-
-    /// The bytes the MAC covers: compact, sorted keys, ISO-8601 dates.
-    /// Independent of how the file itself is laid out, so the seal survives
-    /// a reformat and fails on any changed value.
-    private static func canonicalJSON(_ devices: [PairedDevice]) -> Data? {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return try? encoder.encode(devices)
     }
 
     /// Does this blob parse as the P-256 SubjectPublicKeyInfo the protocol
@@ -246,11 +227,8 @@ final class RemoteDeviceStore {
         guard !ephemeral else { return }
         try? FileManager.default.createDirectory(
             at: devicesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard let canonical = Self.canonicalJSON(storage) else { return }
-        let file = DeviceFile(
-            devices: storage,
-            mac: RemoteDeviceSeal.seal(canonicalJSON: canonical, identity: loadOrCreateIdentity()))
-        guard let data = try? JSONEncoder.remoteDeviceEncoder.encode(file) else { return }
+        guard let data = RemoteDeviceSeal.encodeFile(storage, identity: loadOrCreateIdentity())
+        else { return }
         try? data.write(to: devicesURL, options: .atomic)
     }
 
@@ -259,24 +237,5 @@ final class RemoteDeviceStore {
         // be noise there.
         guard !ProbeSupport.quiet else { return }
         print("memterm remote: \(message)")
-    }
-}
-
-private extension JSONEncoder {
-    /// ISO-8601 dates and sorted keys: the file is meant to be read (and
-    /// diffed) by the person who owns it.
-    static var remoteDeviceEncoder: JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return encoder
-    }
-}
-
-private extension JSONDecoder {
-    static var remoteDeviceDecoder: JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return decoder
     }
 }
