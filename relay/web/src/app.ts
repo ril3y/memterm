@@ -232,9 +232,24 @@ function renderTree(): void {
   for (const ws of tree.workspaces) {
     const section = document.createElement("section");
     section.className = "workspace" + (ws.parked ? " parked" : "");
+    const headingRow = document.createElement("div");
+    headingRow.className = "workspace-heading";
     const heading = document.createElement("h2");
     heading.textContent = (ws.locked ? "\u{1F512} " : "") + ws.name;
-    section.appendChild(heading);
+    headingRow.appendChild(heading);
+    // "Open tabs" (README / FR-60): a remote client can do exactly what a
+    // local keyboard can do to a workspace, including ⌘T — mirrors the
+    // host's own lock check (RemoteHost+Dispatch.newTab).
+    const newTabBtn = document.createElement("button");
+    newTabBtn.type = "button";
+    newTabBtn.className = "new-tab-btn";
+    newTabBtn.textContent = "New tab";
+    newTabBtn.disabled = ws.locked;
+    newTabBtn.addEventListener("click", () => {
+      void sendMessage({ t: "newTab", workspaceId: ws.id });
+    });
+    headingRow.appendChild(newTabBtn);
+    section.appendChild(headingRow);
     for (const win of ws.windows) {
       for (const tab of win.tabs) {
         const tabDiv = document.createElement("div");
