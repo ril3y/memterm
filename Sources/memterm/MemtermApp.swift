@@ -60,6 +60,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     var updater: UpdaterHost?
     /// Quake-style drop-down terminal (Dropdown.swift).
     private(set) lazy var dropdown = DropdownController(app: self)
+    /// Remote attach (Remote/RemoteHost.swift). Building it costs nothing and
+    /// opens nothing: the host stays inert until `applyConfig` sees
+    /// `remote.enabled`, and the Keychain identity is not read until then.
+    private(set) lazy var remote = RemoteHost(app: self)
     /// Set while park/forget tear windows down (and around a switch's
     /// hide/show transition) so those events aren't captured as topology
     /// mutations (same idea as isTerminating).
@@ -221,6 +225,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         if !ProbeSupport.quiet {
             NSApp.activate(ignoringOtherApps: true)
         }
+        // Remote attach: off by default, so this is a no-op on a fresh
+        // install. Last, because a host that connects wants the live model
+        // (workspaces, windows, panes) already standing.
+        remote.applyConfig(config)
+
         if let run = smokeRun { runSmoke(run: run, restoredAnything: restoredAnything) }
         // MEMTERM_UI_PROBE=1: harness v2 (TESTING.md §2) — gesture routing,
         // presented geometry, and rendered pixels, in fresh AND restored
@@ -778,6 +787,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         for host in hosts { host.applyConfig(config) }
         refreshWorkspaceChips()  // workspace_bar visibility follows the config
         dropdown.applyConfig(config)  // hotkey + placement follow the config
+        remote.applyConfig(config)  // connects, disconnects, or stays off
         config.save()
     }
 

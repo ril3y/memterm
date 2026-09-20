@@ -68,6 +68,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     private let serialLineEndingPopUp = NSPopUpButton()
     private let serialEchoCheck = NSButton(checkboxWithTitle: "Local echo in serial panes", target: nil, action: nil)
 
+    // Remote (Remote/RemoteSettingsSection.swift owns its own controls and
+    // writes its own two config keys).
+    private lazy var remoteSection = RemoteSettingsSection(app: app)
+
     // Memory
     private let scrollbackField = NSTextField()
     private let retentionField = NSTextField()
@@ -487,10 +491,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         scrollbackField.widthAnchor.constraint(equalToConstant: 90).isActive = true
         retentionField.widthAnchor.constraint(equalToConstant: 60).isActive = true
 
+        // -- Remote --
+        let remote = makeTab("Remote", rows: remoteSection.rows(label: label, caption: caption))
+
         tabView.addTabViewItem(general)
         tabView.addTabViewItem(appearance)
         tabView.addTabViewItem(terminal)
         tabView.addTabViewItem(memory)
+        tabView.addTabViewItem(remote)
         // ExtensionKit ui.settingsSection: each registered section hangs off
         // the same NSTabView as a small native tab (registration happens at
         // extension activation, before this window is ever built). The rows'
@@ -659,6 +667,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         // Memory
         scrollbackField.integerValue = config.scrollbackLines
         retentionField.integerValue = config.archiveRetentionDays
+
+        // Remote
+        remoteSection.loadValues()
     }
 
     /// Preset names + (a non-builtin import label when present) + Custom.
@@ -913,6 +924,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
 
     func windowWillClose(_ notification: Notification) {
         NSColorPanel.shared.close()
+        // Remote pairing prompts are this window's job: with it closed, the
+        // host denies requests instead of letting one through unseen.
+        remoteSection.detach()
     }
 }
 

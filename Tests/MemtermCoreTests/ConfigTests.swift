@@ -325,3 +325,42 @@ final class ConfirmCloseTabConfigTests: XCTestCase {
         XCTAssertFalse(Config.parse(text).confirmCloseTab)
     }
 }
+
+/// Remote attach (decision doc 2026-09-19). The default matters as much as
+/// the parse: an untouched install must never dial out, which is why
+/// `enabled` defaults to false and the host only connects on this flag.
+final class RemoteConfigTests: XCTestCase {
+    func testDefaultsOffAndParses() {
+        XCTAssertFalse(Config().remoteEnabled)
+        XCTAssertEqual(Config().remoteRelayURL, "wss://memterm-relay.fly.dev")
+
+        let c = Config.parse("""
+            [remote]
+            enabled = true
+            relay_url = "wss://relay.example.test"
+            """)
+        XCTAssertTrue(c.remoteEnabled)
+        XCTAssertEqual(c.remoteRelayURL, "wss://relay.example.test")
+
+        // A blank URL keeps the default: the host must always have something
+        // to dial rather than a string that cannot become a URL.
+        XCTAssertEqual(Config.parse("[remote]\nrelay_url = \"\"\n").remoteRelayURL,
+                       Config().remoteRelayURL)
+    }
+
+    func testRoundTripsThroughSerialization() {
+        var c = Config()
+        c.remoteEnabled = true
+        c.remoteRelayURL = "ws://127.0.0.1:8787"
+        let text = c.serialize()
+        XCTAssertTrue(text.contains("[remote]"), text)
+        XCTAssertTrue(text.contains("enabled = true"), text)
+        XCTAssertTrue(text.contains("relay_url = \"ws://127.0.0.1:8787\""), text)
+
+        let back = Config.parse(text)
+        XCTAssertTrue(back.remoteEnabled)
+        XCTAssertEqual(back.remoteRelayURL, "ws://127.0.0.1:8787")
+        // [theme] must still round-trip after [remote] joined the file.
+        XCTAssertEqual(back.dropdownAnimationMs, c.dropdownAnimationMs)
+    }
+}

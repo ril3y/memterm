@@ -125,6 +125,14 @@ public struct Config {
     public var themePreset: String?
     public var ansiColors: [ConfigRGB]?  // exactly 16 when present
 
+    // Remote attach (decision doc 2026-09-19), the [remote] table. OFF by
+    // default and opt-in per install: REQUIREMENTS' "no accounts, no cloud,
+    // no telemetry" means an untouched memterm never opens an outbound
+    // socket. The relay is blind (end-to-end encrypted) and self-hostable,
+    // so the URL is a plain string the user may point at their own box.
+    public var remoteEnabled = false
+    public var remoteRelayURL = "wss://memterm-relay.fly.dev"
+
     public init() {}
 
     // Nerd-font-first default chain: the founder's powerline prompt renders "?"
@@ -233,6 +241,10 @@ public struct Config {
             c.dropdownAnimationMs = min(max(n, dropdownAnimationRange.lowerBound),
                                         dropdownAnimationRange.upperBound)
         }
+        if let b = boolean(values["remote.enabled"]) { c.remoteEnabled = b }
+        // An empty relay_url would leave the host with nothing to dial, so it
+        // keeps the default rather than producing a URL that cannot parse.
+        if let s = string(values["remote.relay_url"]), !s.isEmpty { c.remoteRelayURL = s }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
         // Numeric knobs clamp into their sane range (a hand-typed 3.0 line
@@ -354,6 +366,15 @@ public struct Config {
         lines.append("screen = \"\(dropdownScreen)\"  # mouse | main — which screen it drops on")
         lines.append("animation_ms = \(dropdownAnimationMs)  # slide duration, 0 = instant")
         lines.append("")
+        lines.append("# Remote attach (Settings ▸ Remote): see and type into these")
+        lines.append("# sessions from a phone, through a blind relay.")
+        lines.append("[remote]")
+        lines.append("enabled = \(remoteEnabled)  # off = memterm never opens an outbound socket")
+        lines.append("relay_url = \"\(remoteRelayURL)\"  # your own relay works too — it holds no secrets")
+        lines.append("")
+        // [theme] stays LAST: its ansi0…15 keys are bare (untabled) names, so
+        // any table written after it would be swallowed into [theme] on the
+        // next parse.
         lines.append("[theme]")
         if let themePreset { lines.append("preset = \"\(themePreset)\"  # display label; colors below are the truth") }
         if let themeBackground { lines.append("background = \"\(Self.hex(themeBackground))\"") }
@@ -457,6 +478,13 @@ public struct Config {
         # hide_on_focus_loss = true
         # screen = "mouse"       # mouse | main
         # animation_ms = 150
+
+        # Remote attach: mirror and type into these sessions from a phone,
+        # through an end-to-end-encrypted relay that cannot read the traffic.
+        # Off until you turn it on in Settings ▸ Remote and pair a device.
+        # [remote]
+        # enabled = false
+        # relay_url = "wss://memterm-relay.fly.dev"   # or your own self-hosted relay
 
         # [theme]
         # preset = "memterm-dark"  # display label set by Settings; colors win
