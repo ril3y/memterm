@@ -8,6 +8,20 @@ export function fromB64(s: string): Uint8Array {
   return new Uint8Array(Buffer.from(s, "base64"));
 }
 
+/**
+ * A syntactically valid routing token: base64url of 16 bytes, 22 chars, no
+ * padding -- the only shape the relay accepts since security review H1.
+ * `seed` just makes distinct tokens readable in a failing test.
+ */
+export function routingToken(seed = 1): string {
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = (seed * 31 + i * 7) & 0xff;
+  return Buffer.from(bytes).toString("base64url");
+}
+
+/** A stand-in for the device's HMAC pair proof; the relay carries it opaque. */
+export const PROOF = b64(new Uint8Array(32).fill(7));
+
 export interface AuthedPeer { ws: WebSocket; id: string; spki: Uint8Array }
 
 /**

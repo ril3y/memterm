@@ -2,7 +2,7 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
-import { Registry } from "./registry.js";
+import { Registry, capSet, MAX_ALLOWED_DEVICES } from "./registry.js";
 import { verifyAuth, idFromPublicKey, randomNonce } from "./auth.js";
 import { parseInbound, type EnvMessage } from "./envelope.js";
 
@@ -15,6 +15,11 @@ const PAIRING_TTL_MS = 120_000;
 /// nobody is reading.
 const DEFAULT_AUTH_DEADLINE_MS = 10_000;
 const DEFAULT_PING_INTERVAL_MS = 30_000;
+/// Security review H1: there was no connection limit of any kind, so one
+/// machine could open sockets until the relay ran out of memory or file
+/// descriptors. 32 is far above a real user (one host plus a handful of
+/// browsers from one NAT) and far below what a flood needs.
+const DEFAULT_MAX_CONNECTIONS_PER_IP = 32;
 
 export interface RelayOptions {
   port: number;
@@ -28,6 +33,9 @@ export interface RelayOptions {
    *  cleanup (a host's watchers get `offline`). Tests set this to tens of
    *  ms; production uses the default. */
   pingIntervalMs?: number;
+  /** How many simultaneous WebSocket connections one client IP may hold.
+   *  Tests set this to 1 or 2; production uses the default. */
+  maxConnectionsPerIp?: number;
 }
 export interface RunningRelay { port: number; close(): Promise<void>; registry: Registry }
 
@@ -35,6 +43,25 @@ function b64(bytes: Uint8Array): string { return Buffer.from(bytes).toString("ba
 function fromB64(s: string): Uint8Array { return new Uint8Array(Buffer.from(s, "base64")); }
 
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".json": "application/json" };
+
+/**
+ * The peer address a connection limit counts against. Fly terminates TLS
+ * and proxies, so `socket.remoteAddress` is the proxy for every real user;
+ * `fly-client-ip` is the header it sets to the actual client. Taking the
+ * header only when it is present means a self-hosted relay with no proxy
+ * still counts real addresses.
+ *
+ * A header can be forged by anyone talking directly to the relay, which
+ * only lets an attacker spread their own connections across made-up
+ * buckets -- the same thing renting more IPs buys them. It is a memory
+ * bound, not an authentication decision.
+ */
+function clientIp(req: http.IncomingMessage): string {
+  const header = req.headers["fly-client-ip"];
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value === "string" && value.length > 0 && value.length <= 64) return value;
+  return req.socket.remoteAddress ?? "unknown";
+}
 
 export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   const server = http.createServer(async (req, res) => {
@@ -52,6 +79,8 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   const registry = new Registry();
   const authDeadlineMs = opts.authDeadlineMs ?? DEFAULT_AUTH_DEADLINE_MS;
   const pingIntervalMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+  const maxConnectionsPerIp = opts.maxConnectionsPerIp ?? DEFAULT_MAX_CONNECTIONS_PER_IP;
+  const connectionsPerIp = new Map<string, number>();
   // 1 MiB: generous for any real envelope (a terminal frame, a tree), and
   // small enough that a single unauthenticated peer can't buffer its way
   // to the `ws` default of 100 MiB on a 512 MB machine.
@@ -59,7 +88,27 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://relay");
     if (url.pathname !== "/host" && url.pathname !== "/client") { socket.destroy(); return; }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, url.pathname));
+    // Counted before the handshake completes, and released on close, so a
+    // flood is refused at the door rather than after it has already cost a
+    // WebSocket's worth of buffers (security review H1).
+    const ip = clientIp(req);
+    const open = connectionsPerIp.get(ip) ?? 0;
+    if (open >= maxConnectionsPerIp) { socket.destroy(); return; }
+    connectionsPerIp.set(ip, open + 1);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      const now = connectionsPerIp.get(ip) ?? 1;
+      if (now <= 1) connectionsPerIp.delete(ip); else connectionsPerIp.set(ip, now - 1);
+    };
+    // An upgrade that never becomes a WebSocket (the client hangs up mid
+    // handshake) must not leak its slot either.
+    socket.once("close", release);
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.once("close", release);
+      wss.emit("connection", ws, req, url.pathname);
+    });
   });
   wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, pathname: string) => {
     handleConnection(ws, pathname === "/host" ? "host" : "client", registry, authDeadlineMs, pingIntervalMs);
@@ -125,7 +174,10 @@ function handleConnection(
         authedId = id;
         clearTimeout(authDeadline);
         if (role === "host") {
-          const allowed = new Set<string>(Array.isArray(msg.allowed) ? msg.allowed : []);
+          // Capped: a host is authenticated, not trusted with the relay's
+          // memory (security review H1).
+          const announced = Array.isArray(msg.allowed) ? msg.allowed.filter((d: unknown) => typeof d === "string") : [];
+          const allowed = capSet(new Set<string>(announced.slice(0, MAX_ALLOWED_DEVICES)));
           registry.registerHost(id, ws, allowed, msg.publicKey);
           registry.markSeen(id, Date.now());
           ws.send(JSON.stringify({ type: "authed", id }));
@@ -216,10 +268,30 @@ function handlePeerMessage(raw: Buffer, role: "host" | "client", id: string, ws:
       return;
     case "pair": {
       if (role !== "client") return;
-      const pairing = registry.consumePairing(msg.token, Date.now());
-      const host = pairing ? registry.host(pairing.hostId) : undefined;
-      if (!host) { ws.send(JSON.stringify({ type: "pair-denied", reason: "token" })); return; }
-      host.socket.send(JSON.stringify({ type: "pair-request", deviceId: id, publicKey: msg.publicKey, name: msg.name }));
+      // The key in a pair request must be the key this socket authenticated
+      // with (security review C2). Without that, a client could present
+      // somebody else's public key -- or a hostile relay operator's -- and
+      // the host would be asked to trust a key whose owner never consumed
+      // the token. `id` was derived from the SPKI that signed the auth
+      // challenge, so comparing ids compares keys.
+      void (async () => {
+        let claimedId: string;
+        try {
+          claimedId = await idFromPublicKey(fromB64(msg.publicKey));
+        } catch {
+          ws.close(4004, "key");
+          return;
+        }
+        if (claimedId !== id) { ws.close(4004, "key"); return; }
+        const pairing = registry.consumePairing(msg.token, Date.now());
+        const host = pairing ? registry.host(pairing.hostId) : undefined;
+        if (!host) { ws.send(JSON.stringify({ type: "pair-denied", reason: "token" })); return; }
+        // `proof` travels opaque: only the host holds the secret half of
+        // the token, so only the host can check it.
+        host.socket.send(JSON.stringify({
+          type: "pair-request", deviceId: id, publicKey: msg.publicKey, name: msg.name, proof: msg.proof,
+        }));
+      })();
       return;
     }
     case "pair-answer": {
@@ -228,7 +300,7 @@ function handlePeerMessage(raw: Buffer, role: "host" | "client", id: string, ws:
       const device = registry.client(msg.deviceId);
       if (!device) return;
       if (msg.accept) {
-        host?.allowed.add(msg.deviceId);
+        if (host && host.allowed.size < MAX_ALLOWED_DEVICES) host.allowed.add(msg.deviceId);
         registry.addWatcher(id, msg.deviceId);
         device.socket.send(JSON.stringify({ type: "paired", hostId: id, hostPublicKey: host?.publicKey ?? "" }));
       } else {
@@ -239,7 +311,7 @@ function handlePeerMessage(raw: Buffer, role: "host" | "client", id: string, ws:
     case "allowed": {
       if (role !== "host") return;
       const host = registry.host(id);
-      if (host) host.allowed = new Set(msg.devices);
+      if (host) host.allowed = capSet(new Set(msg.devices.slice(0, MAX_ALLOWED_DEVICES)));
       return;
     }
   }
