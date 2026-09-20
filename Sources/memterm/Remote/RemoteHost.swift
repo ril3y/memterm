@@ -507,11 +507,24 @@ final class RemoteHost {
 
     /// One sealed inner message to one device. Sealing bumps that direction's
     /// counter, so this is the only path host→device messages take.
-    func send(_ message: RemoteMessage, to deviceId: String) {
+    ///
+    /// `completion`, when given, fires once the underlying socket send
+    /// completes (success or failure alike — a viewer's backpressure pump
+    /// needs to keep draining either way) — always hopped to main, since
+    /// `URLSessionWebSocketTask`'s own completion lands on its delegate
+    /// queue and this touches state (RemotePaneStream's per-viewer in-flight
+    /// counters) that is main-thread only. Never called synchronously: a
+    /// dropped `session` or seal failure still schedules it, so a caller
+    /// counting in-flight bytes never waits forever on a message that was
+    /// never actually sent.
+    func send(_ message: RemoteMessage, to deviceId: String, completion: (() -> Void)? = nil) {
         guard let session = sessions[deviceId],
               let record = try? session.keys.seal(message.encode())
-        else { return }
-        sendEnvelope(to: deviceId, payload: record)
+        else {
+            if let completion { DispatchQueue.main.async(execute: completion) }
+            return
+        }
+        sendEnvelope(to: deviceId, payload: record, completion: completion)
     }
 
     /// Pushes `tree-changed` to every attached device. Called from
@@ -523,10 +536,16 @@ final class RemoteHost {
         for deviceId in Array(sessions.keys) { send(.treeChanged, to: deviceId) }
     }
 
-    private func sendEnvelope(to deviceId: String, payload: Data) {
+    private func sendEnvelope(to deviceId: String, payload: Data, completion: (() -> Void)? = nil) {
         let envelope = RemoteEnvelope(to: deviceId, from: identity.id, payload: payload)
-        guard let text = String(data: envelope.encode(), encoding: .utf8) else { return }
-        task?.send(.string(text)) { _ in }
+        guard let task, let text = String(data: envelope.encode(), encoding: .utf8) else {
+            if let completion { DispatchQueue.main.async(execute: completion) }
+            return
+        }
+        task.send(.string(text)) { _ in
+            guard let completion else { return }
+            DispatchQueue.main.async(execute: completion)
+        }
     }
 
     private func sendJSON(_ object: [String: Any]) {

@@ -145,8 +145,9 @@ extension RemoteHost {
         // addViewer sends the current screen, then every chunk. The closure
         // is the ONLY thing that keeps this viewer alive, so it must not
         // retain the host: a dropped session must be able to free it.
-        stream.addViewer(session.deviceId) { [weak self] message in
-            self?.send(message, to: session.deviceId)
+        stream.addViewer(session.deviceId) { [weak self] message, completion in
+            guard let self else { completion(); return }
+            self.send(message, to: session.deviceId, completion: completion)
         }
     }
 

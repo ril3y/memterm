@@ -21,24 +21,34 @@ final class RemotePaneStream {
     /// One attached client. A class so the tap's fan-out can mutate the
     /// backlog in place without copying it back into the dictionary.
     private final class Viewer {
-        let send: (RemoteMessage) -> Void
-        var backlog: OutputBacklog
+        let send: (RemoteMessage, @escaping () -> Void) -> Void
+        let backlog: OutputBacklog
 
-        init(send: @escaping (RemoteMessage) -> Void, backlogLimit: Int) {
+        init(send: @escaping (RemoteMessage, @escaping () -> Void) -> Void,
+             backlogLimit: Int, inFlightThreshold: Int) {
             self.send = send
-            self.backlog = OutputBacklog(limit: backlogLimit)
+            self.backlog = OutputBacklog(limit: backlogLimit, inFlightThreshold: inFlightThreshold)
         }
     }
 
     private let pane: PaneView
     private let backlogLimit: Int
+    /// FR-60's other half: the socket send this class hands each viewer's
+    /// coalesced backlog to is asynchronous and its own internal queue is
+    /// invisible, so this is the most this class can ever have "in the
+    /// pipe" for one viewer before it starts holding new bytes back in the
+    /// (bounded, oldest-dropped) backlog instead. 64 KiB is generous enough
+    /// that a healthy viewer never notices it and small enough that a
+    /// stalled one can't grow the Mac's memory through it.
+    private let inFlightThreshold: Int
     private var viewers: [String: Viewer] = [:]
     /// The pane tap token, held only while at least one viewer is attached.
     private var tapId: UUID?
 
-    init(pane: PaneView, backlogLimit: Int = 262_144) {
+    init(pane: PaneView, backlogLimit: Int = 262_144, inFlightThreshold: Int = 65_536) {
         self.pane = pane
         self.backlogLimit = backlogLimit
+        self.inFlightThreshold = inFlightThreshold
     }
 
     deinit {
@@ -64,10 +74,18 @@ final class RemotePaneStream {
     /// The screen goes out BEFORE the tap is installed, which on the main
     /// thread means no chunk can slip between the snapshot and the first
     /// forwarded byte — the viewer's first frame is the local pane's frame.
-    func addViewer(_ id: String, send: @escaping (RemoteMessage) -> Void) {
-        viewers[id] = Viewer(send: send, backlogLimit: backlogLimit)
+    ///
+    /// `send`'s completion closure MUST be called exactly once, on any
+    /// thread, once the transport's send for that message has finished (or
+    /// failed) — it is the pump's only signal that a viewer's in-flight
+    /// bytes have cleared and the backlog may drain further.
+    func addViewer(_ id: String, send: @escaping (RemoteMessage, @escaping () -> Void) -> Void) {
+        viewers[id] = Viewer(send: send, backlogLimit: backlogLimit, inFlightThreshold: inFlightThreshold)
         let screen = pane.visibleScreenBytes()
-        send(.screen(cols: screen.cols, rows: screen.rows, bytes: screen.bytes))
+        // The initial screen bypasses the backlog/pump entirely: it is a
+        // one-off full frame sent once at attach time, not a stream of
+        // incremental chunks a slow reader could fall behind on.
+        send(.screen(cols: screen.cols, rows: screen.rows, bytes: screen.bytes)) {}
         installTapIfNeeded()
     }
 
@@ -93,19 +111,22 @@ final class RemotePaneStream {
         }
     }
 
-    /// v1 back-pressure: `send` is synchronous over the host's socket queue, so
-    /// the backlog is a coalescing buffer rather than a queue that outlives the
-    /// call — append, drain, send, once per chunk. It still enforces the cap:
-    /// a chunk bigger than the limit is kept whole (it is the newest data),
-    /// and anything evicted is counted in `droppedBytes`.
+    /// FR-60 backpressure (final-review Important 2): every chunk is queued
+    /// into the viewer's backlog first, then `pump(send:)` is asked to
+    /// deliver — it only starts a new send while that viewer's in-flight
+    /// bytes are under `inFlightThreshold`, so a viewer that stops reading
+    /// (a backgrounded phone, a TCP zero-window) stops growing the outbound
+    /// socket buffer and instead holds bytes here, where the 256 KiB cap and
+    /// oldest-dropped eviction are real. A healthy viewer's completion fires
+    /// fast enough that this reads as "send immediately" in practice.
     private func fanOut(_ chunk: Data) {
         // Snapshot the values: a `send` that detaches its own viewer mid-chunk
         // must not invalidate the walk.
         for viewer in Array(viewers.values) {
             viewer.backlog.append(chunk)
-            let pending = viewer.backlog.drain()
-            guard !pending.isEmpty else { continue }
-            viewer.send(.output(pending))
+            viewer.backlog.pump { [send = viewer.send] bytes, completion in
+                send(.output(bytes), completion)
+            }
         }
     }
 
