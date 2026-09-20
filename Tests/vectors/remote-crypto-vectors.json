@@ -1,0 +1,8 @@
+{
+  "clientToHostKeyHex" : "f61d151e4ae56f287d060217dece28a3525c7c849bab2d6f602841261536a591",
+  "deviceId" : "qrstuvwxyz234567",
+  "hostId" : "abcdefghijklmnop",
+  "hostToClientKeyHex" : "1d8a43e0e0195ac2a29a32081aa12cfe4fb74aa588663aa22c3e2cdd68db3fb8",
+  "record0Hex" : "000000000000000000000000e0277845056d6604ca4cd5bfb09edf73656671bc22",
+  "sharedSecretHex" : "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+}
