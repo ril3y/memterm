@@ -109,6 +109,19 @@
     gap: 8px;
     margin-bottom: 8px;
   }
+  .actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    word-break: break-all;
+  }
 </style>
 </head>
 <body>
@@ -125,8 +138,19 @@
   <p>Clearing this site's data un-pairs this browser; you'll need to scan a new code.</p>
 </section>
 
+<section id="view-confirm-pair" hidden>
+  <h2>Pair this browser?</h2>
+  <p id="confirm-pair-text"></p>
+  <div class="actions">
+    <button id="cancel-pair-btn" type="button">Cancel</button>
+    <button id="confirm-pair-btn" type="button">Pair</button>
+  </div>
+</section>
+
 <section id="view-pairing" hidden>
   <p>Waiting for the host to accept…</p>
+  <p>This device: <code id="pairing-device-id"></code></p>
+  <p>The Mac will show the same key in its “Allow?” prompt. If it shows anything else, don't allow it.</p>
 </section>
 
 <section id="view-tree" hidden>

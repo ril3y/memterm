@@ -75,8 +75,14 @@ export class RelayClient {
     this.ws = undefined;
   }
 
-  pair(token: string, name: string): void {
-    this.send({ type: "pair", token, publicKey: toBase64(this.identity.publicKeySPKI), name });
+  /**
+   * `proof` is `HMAC(secret half of the QR token, label ‖ our SPKI)` --
+   * see `crypto.ts`'s `pairProof`. The relay forwards it untouched; only
+   * the host can check it, and it refuses to prompt without one (security
+   * review C2).
+   */
+  pair(token: string, name: string, proof: string): void {
+    this.send({ type: "pair", token, publicKey: toBase64(this.identity.publicKeySPKI), name, proof });
   }
 
   sendEnvelope(to: string, payload: Uint8Array): void {

@@ -64,12 +64,50 @@ export interface Identity {
   id: string;
 }
 
-/** Generates a fresh long-lived identity key pair and its relay-facing id. */
+/**
+ * Generates a fresh long-lived identity key pair and its relay-facing id.
+ *
+ * NON-EXTRACTABLE (security review M4): the private key is generated with
+ * `extractable: false`, so `exportKey`/`wrapKey` refuse it and any script
+ * that runs on this origin can sign with the key only while it is running
+ * -- it cannot walk away with a copy and impersonate this device forever
+ * after the tab is closed and the bug fixed. Nothing is lost: the key is
+ * only ever used to sign, the CryptoKey survives IndexedDB (structured
+ * clone carries non-extractable keys), and WebCrypto always leaves the
+ * PUBLIC half of a generated pair extractable, so the SPKI export below
+ * still works.
+ */
 export async function generateIdentity(): Promise<Identity> {
-  const keyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const keyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
   const publicKeySPKI = new Uint8Array(await crypto.subtle.exportKey("spki", keyPair.publicKey));
   const id = await idFromPublicKey(publicKeySPKI);
   return { privateKey: keyPair.privateKey, publicKeySPKI, id };
+}
+
+// -- Pairing proof: this device really did scan that QR code. --
+
+/**
+ * Domain separation, identical to the Swift host's
+ * `RemotePairing.proofLabel`.
+ */
+export const PAIR_PROOF_LABEL = "memterm-remote-v1:pair";
+
+/**
+ * `HMAC-SHA256(secret, PAIR_PROOF_LABEL ‖ deviceSPKI)`, base64 (standard,
+ * like every other key/signature field on this wire).
+ *
+ * Security review C2: the QR code's token is split in two. The relay gets
+ * the routing half and uses it as a map key; `secret` is the other half,
+ * which only ever exists in the QR code and in the host's pending
+ * pairing. Sending this MAC alongside our public key proves to the host
+ * that the key it is about to trust belongs to whoever actually scanned
+ * the code -- so a hostile relay can neither substitute its own key into
+ * a genuine request nor invent a request of its own.
+ */
+export async function pairProof(secret: Uint8Array, deviceSPKI: Uint8Array): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", bs(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, bs(concatBytes(utf8(PAIR_PROOF_LABEL), deviceSPKI)));
+  return toBase64(new Uint8Array(mac));
 }
 
 /**

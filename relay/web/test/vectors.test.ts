@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { hkdfKeys, SessionKeys } from "../src/crypto.js";
+import { hkdfKeys, SessionKeys, pairProof, generateIdentity } from "../src/crypto.js";
 import { encodeMessage, decodeMessage, envelope, parseEnvelope } from "../src/codec.js";
 
 // Cross-language pin (decision doc 2026-09-19): this vectors file is
@@ -21,6 +21,9 @@ const vectors = JSON.parse(readFileSync(vectorsUrl, "utf8")) as {
   hostToClientKeyHex: string;
   clientToHostKeyHex: string;
   record0Hex: string;
+  deviceSPKIHex: string;
+  pairSecretHex: string;
+  pairProofBase64: string;
 };
 
 function fromHex(hex: string): Uint8Array {
@@ -93,6 +96,68 @@ test("open rejects malformed records (short, or bad tag) without advancing", asy
   // the receive counter.
   const plain = await session.open(record0);
   assert.equal(new TextDecoder().decode(plain), "hello");
+});
+
+// -- Pairing proof (security review C2): the browser's half of the MAC
+//    that binds this device's key to the QR code it scanned. The Swift
+//    host recomputes it over the received SPKI before it will prompt, so
+//    the two implementations are pinned to the same bytes here and in
+//    Tests/MemtermCoreTests/RemoteCryptoTests.swift. --
+
+test("pairProof reproduces the Swift-pinned pairing proof", async () => {
+  const secret = fromHex(vectors.pairSecretHex);
+  const spki = fromHex(vectors.deviceSPKIHex);
+  assert.equal(secret.length, 16);
+  assert.equal(await pairProof(secret, spki), vectors.pairProofBase64);
+});
+
+test("a pairProof is bound to one key and one secret", async () => {
+  const secret = fromHex(vectors.pairSecretHex);
+  const spki = fromHex(vectors.deviceSPKIHex);
+  const proof = await pairProof(secret, spki);
+
+  // A relay substituting its own key into a genuine request.
+  const otherSpki = new Uint8Array(spki);
+  otherSpki[otherSpki.length - 1] ^= 0xff;
+  assert.notEqual(await pairProof(secret, otherSpki), proof);
+
+  // A relay that never saw the secret half.
+  const otherSecret = new Uint8Array(secret);
+  otherSecret[0] ^= 0xff;
+  assert.notEqual(await pairProof(otherSecret, spki), proof);
+});
+
+// -- Identity key storage (security review M4). --
+
+test("the identity private key is non-extractable and still survives a structured clone", async () => {
+  const identity = await generateIdentity();
+  assert.equal(identity.privateKey.extractable, false);
+  await assert.rejects(
+    () => crypto.subtle.exportKey("pkcs8", identity.privateKey),
+    "a non-extractable key must refuse to export"
+  );
+  // The public half stays exportable, which is how the SPKI above was
+  // produced in the first place.
+  assert.equal(identity.publicKeySPKI.length, 91);
+
+  // IndexedDB stores the CryptoKey itself; that is the structured clone
+  // algorithm, which carries non-extractable keys intact. Node's
+  // structuredClone is the same algorithm, so this is the closest
+  // headless proof that storing and re-reading the key still signs.
+  const restored = structuredClone(identity);
+  assert.equal(restored.privateKey.extractable, false);
+  assert.equal(restored.id, identity.id);
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    restored.privateKey,
+    bs(new TextEncoder().encode("nonce"))
+  );
+  assert.equal(signature.byteLength, 64);
+  // And the proof path works off the restored identity's SPKI too.
+  assert.equal(
+    await pairProof(fromHex(vectors.pairSecretHex), restored.publicKeySPKI),
+    await pairProof(fromHex(vectors.pairSecretHex), identity.publicKeySPKI)
+  );
 });
 
 // -- Codec: literal JSON fixtures pin the cross-language wire format. --

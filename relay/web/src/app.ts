@@ -12,6 +12,7 @@ import {
   encodeHello,
   decodeHello,
   deriveKeys,
+  pairProof,
   SessionKeys,
 } from "./crypto.js";
 import { idFromPublicKey } from "../../src/auth.js";
@@ -87,7 +88,11 @@ interface PairingPayload {
   relay: string;
   hostId: string;
   hostPublicKey: string;
+  /** The routing half of the pairing token: the only half the relay sees. */
   token: string;
+  /** The secret half, base64url. Never sent; only ever HMAC'd over our own
+   *  public key so the host can tell we really scanned this code. */
+  secret: string;
   expiresAt: number;
 }
 
@@ -105,11 +110,19 @@ function decodePairingHash(hash: string): PairingPayload | undefined {
       typeof obj.hostId !== "string" ||
       typeof obj.hostPublicKey !== "string" ||
       typeof obj.token !== "string" ||
+      typeof obj.secret !== "string" ||
       typeof obj.expiresAt !== "number"
     ) {
       return undefined;
     }
-    return { relay: obj.relay, hostId: obj.hostId, hostPublicKey: obj.hostPublicKey, token: obj.token, expiresAt: obj.expiresAt };
+    return {
+      relay: obj.relay,
+      hostId: obj.hostId,
+      hostPublicKey: obj.hostPublicKey,
+      token: obj.token,
+      secret: obj.secret,
+      expiresAt: obj.expiresAt,
+    };
   } catch {
     return undefined;
   }
@@ -136,8 +149,18 @@ function relayWsUrl(): string {
 let db: IDBDatabase;
 let identity: Identity;
 let host: StoredHost | undefined;
+/** A pairing the user has confirmed: the `pair` message is in flight or about to be. */
 let pendingPairing: PairingPayload | undefined;
+/**
+ * A `#pair=` payload that has been parsed but NOT yet confirmed by the
+ * person holding the phone (security review L3). Opening a link used to
+ * pair on page load with no confirmation, and silently overwrite an
+ * existing host -- so a link someone sends you could re-point your browser
+ * at their terminal tree, which you might then type secrets into.
+ */
+let awaitingConfirm: PairingPayload | undefined;
 let relay: RelayClient | undefined;
+let relayAuthed = false;
 
 interface PendingHandshake {
   gen: number;
@@ -166,10 +189,12 @@ let hostOfflineSince: number | undefined;
 
 // -- View / banner / toast plumbing. --
 
-type ViewName = "not-paired" | "pairing" | "tree" | "terminal";
+type ViewName = "not-paired" | "confirm-pair" | "pairing" | "tree" | "terminal";
+
+const VIEWS = ["not-paired", "confirm-pair", "pairing", "tree", "terminal"] as const;
 
 function showView(name: ViewName): void {
-  for (const v of ["not-paired", "pairing", "tree", "terminal"] as const) {
+  for (const v of VIEWS) {
     const el = document.getElementById(`view-${v}`);
     if (el) el.hidden = v !== name;
   }
@@ -463,11 +488,83 @@ function onBackClick(): void {
 
 // -- Entry point. --
 
+/** Drops the `#pair=` fragment so a reload doesn't re-offer the same code. */
+function clearPairingHash(): void {
+  history.replaceState(null, "", location.pathname + location.search);
+}
+
+/** Back to wherever this browser belongs when a pairing is abandoned. */
+function showIdleView(): void {
+  showView(host ? "tree" : "not-paired");
+}
+
+/**
+ * The in-page confirmation (security review L3). It names the Mac the code
+ * came from, and says plainly when confirming would REPLACE the Mac this
+ * browser is already paired with -- the case that turns a link someone
+ * sent you into a terminal tree you might type secrets into.
+ */
+function showConfirmPair(payload: PairingPayload): void {
+  const text = document.getElementById("confirm-pair-text");
+  if (text) {
+    text.textContent =
+      host && host.hostId !== payload.hostId
+        ? `This code pairs this browser with the Mac ${payload.hostId}, replacing ${host.hostId}. ` +
+          `You will no longer see ${host.hostId}'s sessions here. Only continue if you are looking at that Mac's screen.`
+        : `This code pairs this browser with the Mac ${payload.hostId}. ` +
+          `It will be able to show you that Mac's terminal sessions, and what you type here goes into them. ` +
+          `Only continue if you are looking at that Mac's screen.`;
+  }
+  showView("confirm-pair");
+}
+
+/**
+ * Sends the `pair` message for a confirmed payload, with the proof that
+ * binds our public key to the QR code (security review C2). Called on
+ * confirmation, or from `onAuthed` when the socket wasn't ready yet.
+ */
+async function sendPair(): Promise<void> {
+  if (!pendingPairing || !relay) return;
+  const secret = base64urlToBytes(pendingPairing.secret);
+  if (!secret || secret.length === 0) {
+    // An old or hand-made code with no secret half cannot produce a proof,
+    // and the host would refuse it anyway. Say so instead of hanging on
+    // "Waiting for the host to accept…".
+    pendingPairing = undefined;
+    showToast("This pairing code is incomplete; show a fresh one from Settings ▸ Remote");
+    showIdleView();
+    return;
+  }
+  const proof = await pairProof(secret, identity.publicKeySPKI);
+  if (!pendingPairing) return; // cancelled while the HMAC was computing
+  relay.pair(pendingPairing.token, deviceName(), proof);
+}
+
+function onConfirmPairClick(): void {
+  if (!awaitingConfirm) return;
+  pendingPairing = awaitingConfirm;
+  awaitingConfirm = undefined;
+  clearPairingHash();
+  showView("pairing");
+  if (relayAuthed) void sendPair();
+}
+
+function onCancelPairClick(): void {
+  awaitingConfirm = undefined;
+  pendingPairing = undefined;
+  clearPairingHash();
+  showIdleView();
+}
+
 async function onPaired(hostId: string, hostPublicKeyB64: string): Promise<void> {
-  if (!pendingPairing || hostId !== pendingPairing.hostId || hostPublicKeyB64 !== pendingPairing.hostPublicKey) {
+  // Security review L4: a `paired` we did not ask for is the relay talking
+  // out of turn. It used to yank an attached client back to "not paired";
+  // now it is ignored unless a pairing is actually in flight.
+  if (!pendingPairing) return;
+  if (hostId !== pendingPairing.hostId || hostPublicKeyB64 !== pendingPairing.hostPublicKey) {
     showToast("The host's reply did not match the scanned code");
     pendingPairing = undefined;
-    showView("not-paired");
+    showIdleView();
     return;
   }
   const hostPublicKey = standardBase64ToBytes(hostPublicKeyB64);
@@ -480,13 +577,13 @@ async function onPaired(hostId: string, hostPublicKeyB64: string): Promise<void>
   host = { hostId, hostPublicKey };
   await idbPut(db, "host", host);
   pendingPairing = undefined;
-  history.replaceState(null, "", location.pathname + location.search);
+  clearPairingHash();
   showView("tree");
   void startSession();
 }
 
 function showStartupError(err: unknown): void {
-  for (const v of ["not-paired", "pairing", "tree", "terminal"] as const) {
+  for (const v of VIEWS) {
     const el = document.getElementById(`view-${v}`);
     if (el) el.hidden = true;
   }
@@ -511,16 +608,24 @@ async function main(): Promise<void> {
     return;
   }
 
+  // The Mac's "Allow ?" prompt shows the key id it is about to trust. Show
+  // ours next to the wait, so there is something to compare it against
+  // (security review C2): that check is what tells a substituted key from
+  // the real one.
+  const deviceIdEl = document.getElementById("pairing-device-id");
+  if (deviceIdEl) deviceIdEl.textContent = identity.id;
+
   const parsed = decodePairingHash(location.hash);
   if (parsed && Date.now() > parsed.expiresAt) {
     showToast("This pairing code has expired");
-    history.replaceState(null, "", location.pathname + location.search);
-  } else {
-    pendingPairing = parsed;
+    clearPairingHash();
+  } else if (parsed) {
+    // Parsed, not accepted: nothing is sent until the person confirms.
+    awaitingConfirm = parsed;
   }
 
-  if (pendingPairing) {
-    showView("pairing");
+  if (awaitingConfirm) {
+    showConfirmPair(awaitingConfirm);
   } else if (host) {
     showView("tree");
   } else {
@@ -530,19 +635,21 @@ async function main(): Promise<void> {
 
   relay = new RelayClient(relayWsUrl(), identity, {
     onAuthed: () => {
+      relayAuthed = true;
       relayUnreachable = false;
       recomputeBanner();
       if (pendingPairing) {
-        relay?.pair(pendingPairing.token, deviceName());
+        void sendPair();
       } else if (host) {
         void startSession();
       }
     },
     onPaired: (hostId, hostPublicKeyB64) => void onPaired(hostId, hostPublicKeyB64),
     onPairDenied: (reason) => {
+      if (!pendingPairing) return; // not pairing: the relay is talking out of turn
       pendingPairing = undefined;
       showToast(`Pairing was declined (${reason})`);
-      showView("not-paired");
+      showIdleView();
     },
     onOnline: (hostId) => {
       if (!host || hostId !== host.hostId) return;
@@ -561,6 +668,7 @@ async function main(): Promise<void> {
     onRefused: (reason) => showToast(reason),
     onEnvelope: (from, payload) => void handleEnvelope(from, payload),
     onDisconnected: () => {
+      relayAuthed = false;
       relayUnreachable = true;
       // The socket is gone, so whatever session was live over it is dead
       // too: don't leave a live terminal pointed at it (keystrokes would
@@ -576,5 +684,7 @@ async function main(): Promise<void> {
 
 document.getElementById("fit-btn")?.addEventListener("click", onFitClick);
 document.getElementById("back-btn")?.addEventListener("click", onBackClick);
+document.getElementById("confirm-pair-btn")?.addEventListener("click", onConfirmPairClick);
+document.getElementById("cancel-pair-btn")?.addEventListener("click", onCancelPairClick);
 
 void main();
