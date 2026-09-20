@@ -7,10 +7,12 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
+COPY web ./web
 RUN npm run build
 
 FROM node:20-alpine AS runtime
 ENV NODE_ENV=production
+ENV HOST=0.0.0.0
 WORKDIR /app
 COPY package.json package-lock.json ./
 # Only runtime deps; skips devDependencies.
