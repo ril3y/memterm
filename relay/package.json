@@ -1,0 +1,15 @@
+{
+  "name": "memterm-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc && mkdir -p dist/web && cp web/index.html dist/web/",
+    "start": "node dist/server.js",
+    "test": "tsc && mkdir -p dist/web && cp web/index.html dist/web/ && node --test dist/test/*.test.js",
+    "web": "esbuild web/src/app.ts --bundle --outfile=web/dist/app.js --format=esm"
+  },
+  "dependencies": { "ws": "^8.21.3" },
+  "devDependencies": { "typescript": "^5.6.0", "@types/node": "^20.14.0", "@types/ws": "^8.5.12", "esbuild": "^0.24.0", "@xterm/xterm": "^5.5.0", "@xterm/addon-fit": "^0.10.0" }
+}
