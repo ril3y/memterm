@@ -59,9 +59,15 @@ Requires macOS 14+ and a Swift 6 toolchain. `dist/memterm.app/Contents/MacOS/mem
 
 A global hotkey slides a terminal in from a screen edge and away again — the Quake console, the way Guake and iTerm2's hotkey window do it. Off until you enable it in **Settings ▸ Appearance**: pick the trigger — a key combination (click the recorder, press keys: ⌃`, ⌘⇧T, F12…) or a **double-tap** of Control, Option, Command, Shift, or Esc (needs Accessibility to work while another app is frontmost; Settings has a Grant button, and until then it works while memterm is frontmost) — the edge it slides from (top, left, right), alignment along the top edge, width × height as a percentage of the screen, which screen (the one under the mouse, or the main one), and whether it hides when another window takes focus. **Shell ▸ Toggle Drop-down Terminal** does the same as the hotkey. The panel belongs to the active workspace: its tabs are remembered and restored (hidden) like any others, it hides with its workspace on a switch, and every workspace gets its own on first use. The same keys live under `[dropdown]` in the config file.
 
-## Relay
+## Remote attach
 
-The `relay/` directory contains a WebSocket relay server written in Node.js + TypeScript that enables memterm clients to communicate with memterm hosts through a central relay. It handles authentication, device pairing, and message forwarding. Run `npm test` from the `relay/` directory to run the test suite. Deploy to Fly.io with `fly deploy` from the `relay/` directory using the included `fly.toml` configuration.
+Mirror and control your panes from a phone. Off by default: turn it on in **Settings ▸ Remote**, then **Pair a device…** shows a QR code. Scanning it opens the relay's web page, which asks the Mac "Allow ‹name›?" before anything is granted — a photographed QR alone is not access. Paired devices show in the same Settings tab and can be revoked at any time, which cuts them off immediately, wherever they are.
+
+A paired device can do exactly what a local keyboard can do to a pane: see its live output, type into it, resize it, open tabs. Nothing more.
+
+The relay only ever sees encrypted envelopes addressed by opaque routing IDs — it cannot read your terminal, and it persists nothing to disk. All the actual crypto (key agreement, encryption) happens between the app and the browser; the relay is a blind forwarder.
+
+By default, remote attach connects through `wss://memterm-relay.fly.dev`. To self-host: `fly launch` from the `relay/` directory (it already has a `fly.toml` and `Dockerfile`), then point `relay_url` under `[remote]` in your config file at your own app. `npm test` from `relay/` runs the relay's test suite.
 
 ## Configuration
 

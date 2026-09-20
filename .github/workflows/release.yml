@@ -119,3 +119,32 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "memterm ${GITHUB_REF_NAME#v}" --generate-notes \
             "${{ steps.dmg.outputs.path }}" dist/appcast.xml
+
+  # Deploys relay/ to Fly.io on the same tag push. Independent of `release`
+  # (no `needs:`) so a relay hiccup never blocks the app release, and a
+  # signing hiccup never blocks the relay. Skips cleanly — rather than
+  # failing — when FLY_API_TOKEN has not been set as a repo secret yet.
+  relay-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for FLY_API_TOKEN
+        id: fly-token
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          if [ -n "$FLY_API_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::FLY_API_TOKEN secret missing — skipping relay deploy"
+          fi
+      - name: Set up flyctl
+        if: steps.fly-token.outputs.has_token == 'true'
+        uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy relay
+        if: steps.fly-token.outputs.has_token == 'true'
+        working-directory: relay
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
