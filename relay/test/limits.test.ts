@@ -91,6 +91,32 @@ test("every insert sweeps expired pairings and day-old lastSeen rows", () => {
   assert.equal(r.lastSeen("stale"), undefined);
 });
 
+// H1 residual, from the re-review: `createPairing` was the only sweep
+// site, so on a relay where nobody pairs, every throwaway host id left a
+// `lastSeenAt` row behind permanently. Host auth now sweeps too — the same
+// event that adds a row.
+test("a host authenticating ages out stale entries even when nobody pairs", async () => {
+  const relay = await startRelay({ port: 0, webRoot: WEB });
+  try {
+    const stale = nthPeerId(1);
+    const recent = nthPeerId(2);
+    relay.registry.markSeen(stale, Date.now() - LAST_SEEN_TTL_MS - 1_000);
+    relay.registry.markSeen(recent, Date.now());
+    relay.registry.createPairing(stale, routingToken(1), -1_000, Date.now()); // already expired
+    assert.equal(relay.registry.pairingCount, 1);
+
+    // No pairing anywhere in this test: a host simply connects.
+    const host = await connectAuthed(relay.port, "host", { allowed: [] });
+
+    assert.equal(relay.registry.lastSeen(stale), undefined, "a day-old lastSeen row survived");
+    assert.ok(relay.registry.lastSeen(recent), "a fresh lastSeen row was swept");
+    assert.ok(relay.registry.lastSeen(host.id), "the connecting host's own row is missing");
+    assert.equal(relay.registry.pairingCount, 0, "an expired pairing survived");
+  } finally {
+    await relay.close();
+  }
+});
+
 test("an announced allow-list is capped", async () => {
   const relay = await startRelay({ port: 0, webRoot: WEB });
   try {

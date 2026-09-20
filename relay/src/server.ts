@@ -216,6 +216,14 @@ function handleConnection(
           // for the per-id length that made each entry unbounded).
           const announced = Array.isArray(msg.allowed) ? peerIds(msg.allowed) : [];
           const allowed = capSet(new Set<string>(announced.slice(0, MAX_ALLOWED_DEVICES)));
+          // Sweep on the same event that grows the map. `createPairing` was
+          // the only sweep site, so on a relay where nobody ever pairs,
+          // `lastSeenAt` aged out never while every throwaway host id added
+          // to it (security re-review, H1 residual). Host auth is the one
+          // moment an entry appears, it happens once per connection rather
+          // than once per message, and it needs no timer to keep alive or
+          // tear down.
+          registry.sweep(Date.now());
           registry.registerHost(id, ws, allowed, msg.publicKey);
           registry.markSeen(id, Date.now());
           ws.send(JSON.stringify({ type: "authed", id }));

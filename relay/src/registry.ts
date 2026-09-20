@@ -58,7 +58,11 @@ export class Registry {
    * Registers a pairing token. Every insert first sweeps expired pairings
    * and stale `lastSeenAt` rows, then holds the per-host cap by dropping
    * that host's OLDEST pairing -- so a host loops in place instead of
-   * accumulating, and a throwaway host id cannot leak an entry forever.
+   * accumulating.
+   *
+   * This is not the only sweep site: host auth sweeps too (`server.ts`),
+   * because a throwaway host id adds a `lastSeenAt` row without ever
+   * pairing.
    */
   createPairing(hostId: string, token: string, ttlMs: number, now: number) {
     this.sweep(now);
