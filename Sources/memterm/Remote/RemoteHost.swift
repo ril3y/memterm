@@ -30,9 +30,16 @@ struct PairingPayload: Codable, Equatable {
     var hostId: String
     /// DER SubjectPublicKeyInfo, base64 — what the device pins as "the host".
     var hostPublicKey: String
-    /// 32 random bytes, base64url. Single-use, and the relay forgets it after
-    /// 120 seconds.
+    /// The ROUTING half of the pairing token: 16 random bytes, base64url
+    /// (22 chars). Single-use, and the relay forgets it after 120 seconds.
+    /// This is the only half the relay is ever told.
     var token: String
+    /// The SECRET half, 16 random bytes, base64url. It never leaves this QR
+    /// code: the device HMACs its own public key under it and sends only
+    /// the MAC, which is what proves to this host that the key it is being
+    /// asked to trust belongs to whoever actually scanned the code
+    /// (security review C2).
+    var secret: String
     /// Epoch MILLISECONDS, so the browser can compare it to `Date.now()`
     /// without a format negotiation.
     var expiresAt: Int
@@ -114,6 +121,11 @@ final class RemoteHost {
     /// the window on its own with no extra timer to keep in sync with the
     /// relay's.
     private var pairingWindowDeadline: Date?
+    /// The secret half of the currently-shown QR code's token (security
+    /// review C2). Set alongside `pairingWindowDeadline` and cleared with
+    /// it, so a `pair-request` can only ever be checked against the code
+    /// the user is looking at right now. Never sent anywhere, never logged.
+    private var pairingSecret: Data?
     /// Generation counter: every connect attempt bumps it, and a callback
     /// from an older socket is ignored. Without it, a slow failure from a
     /// socket we already replaced would schedule a second reconnect loop.
@@ -179,17 +191,25 @@ final class RemoteHost {
         // A pairing token is the only thing standing between a stranger and a
         // pair REQUEST reaching the user, so it comes from the system CSPRNG
         // rather than a UUID.
-        var bytes = Data(count: 32)
+        var bytes = Data(count: RemotePairing.tokenBytes)
         bytes.withUnsafeMutableBytes { buffer in
             guard let base = buffer.baseAddress else { return }
             _ = SecRandomCopyBytes(kSecRandomDefault, buffer.count, base)
         }
+        // Split, so the relay routes on one half and can never compute the
+        // proof that the other half authenticates (security review C2).
+        // `split` only returns nil for a wrong byte count, which a fixed
+        // `Data(count:)` cannot produce; the empty fallback fails closed
+        // (no secret means no proof can ever verify) rather than pairing
+        // on predictable material.
+        let split = RemotePairing.split(bytes)
         let expiry = now.addingTimeInterval(120)
         return PairingPayload(
             relay: relayBase?.absoluteString ?? app.config.remoteRelayURL,
             hostId: hostId,
             hostPublicKey: identity.publicKeySPKI.base64EncodedString(),
-            token: Self.base64url(bytes),
+            token: split?.routingToken ?? "",
+            secret: RemotePairing.base64url(split?.secret ?? Data()),
             expiresAt: Int(expiry.timeIntervalSince1970 * 1000))
     }
 
@@ -201,6 +221,7 @@ final class RemoteHost {
     func publishPairing(_ payload: PairingPayload) {
         let expiresAt = Date(timeIntervalSince1970: Double(payload.expiresAt) / 1000)
         pendingPair = (token: payload.token, expiresAt: expiresAt)
+        pairingSecret = RemotePairing.data(fromBase64url: payload.secret)
         pairingWindowDeadline = expiresAt
         sendPairTokenIfPossible()
     }
@@ -224,6 +245,7 @@ final class RemoteHost {
     /// progress.
     func endPairing() {
         pairingWindowDeadline = nil
+        pairingSecret = nil
         pendingPair = nil
     }
 
@@ -436,8 +458,10 @@ final class RemoteHost {
         // whatever the KEY hashes to. If those disagree, the relay is lying
         // or broken, and trusting its id would pin the wrong identity.
         let deviceId = RemoteIdentity.peerId(forSPKI: spki)
-        let name = (object["name"] as? String) ?? "Device"
-        let safeName = String(name.prefix(64))
+        // Security review L1: the name is chosen by whoever is asking to be
+        // trusted and lands inside the "Allow ‹name›?" alert, so it is
+        // stripped of anything that could forge extra lines of dialog.
+        let safeName = RemotePairing.sanitizedDeviceName((object["name"] as? String) ?? "Device")
 
         let accept: (Bool) -> Void = { [weak self] allowed in
             Self.onMain {
@@ -457,6 +481,30 @@ final class RemoteHost {
             // deadline has passed) — a request against a token from an
             // earlier, dismissed pairing must not still be able to reach the
             // user.
+            accept(false)
+            return
+        }
+        // Security review C2, and the reason this check sits BEFORE any
+        // prompt: the relay chose `publicKey`, and nothing used to tie it
+        // to whoever consumed the token. A hostile relay could forward a
+        // genuine request with its own key substituted, or invent a request
+        // outright while the QR sheet was open — either way the user saw
+        // exactly the prompt they were expecting and one click handed over
+        // a shell.
+        //
+        // The MAC is recomputed over the SPKI we were actually sent, under
+        // the secret half of the code currently on screen, and compared in
+        // constant time. A relay holds only the routing half, so it can
+        // neither compute a MAC for a key of its own nor mint a request.
+        // A failure is denied without a prompt: there is no version of
+        // this the user could usefully adjudicate.
+        guard let secret = pairingSecret,
+              let proofB64 = object["proof"] as? String,
+              let proof = Data(base64Encoded: proofB64),
+              RemotePairing.isValidProof(proof, secret: secret, deviceSPKI: spki)
+        else {
+            // The device id only — never the proof, the secret, or the key.
+            log("pair proof invalid for \(deviceId)")
             accept(false)
             return
         }
@@ -622,11 +670,10 @@ final class RemoteHost {
         }
     }
 
+    /// One encoder for the QR payload's own base64url (the pairing URL's
+    /// fragment) and for the token halves, so they cannot drift apart.
     static func base64url(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        RemotePairing.base64url(data)
     }
 
     /// Hops to main unless already there. Re-entering `DispatchQueue.main.async`

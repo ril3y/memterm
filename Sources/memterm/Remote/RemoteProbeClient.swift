@@ -25,6 +25,10 @@ final class RemoteProbeClient {
     private var hostPublicKeySPKI = Data()
     private var pendingPairToken: String?
     private var pendingPairName = "probe-client"
+    /// The proof this client will send with its `pair` — normally computed
+    /// from the payload's secret half, but overridable so the leg can send
+    /// a deliberately wrong one and assert the host refuses to prompt.
+    private var pendingPairProof: String?
 
     // Polled by the leg's ProbeStep conditions; written only on main.
     private(set) var authed = false
@@ -129,18 +133,31 @@ final class RemoteProbeClient {
     /// Queues a pairing request; sent immediately if already authed, or on
     /// the next "authed" otherwise — the relay only accepts a peer's first
     /// message as its auth reply, so "pair" can never be sent ahead of it.
-    func pair(_ payload: PairingPayload, name: String = "probe-client") {
+    /// `proof` defaults to the real one: HMAC over our own SPKI under the
+    /// secret half of the scanned payload, exactly as the web client
+    /// computes it (security review C2). Passing a different one is how the
+    /// bad-proof leg proves the host refuses to prompt.
+    func pair(_ payload: PairingPayload, name: String = "probe-client", proof: String? = nil) {
         pendingPairToken = payload.token
         pendingPairName = name
+        pendingPairProof = proof ?? Self.proof(for: payload, deviceSPKI: identity.publicKeySPKI)
         sendPairIfPending()
+    }
+
+    /// The proof a device holding this payload would send.
+    static func proof(for payload: PairingPayload, deviceSPKI: Data) -> String {
+        guard let secret = RemotePairing.data(fromBase64url: payload.secret) else { return "" }
+        return RemotePairing.proof(secret: secret, deviceSPKI: deviceSPKI).base64EncodedString()
     }
 
     private func sendPairIfPending() {
         guard authed, let token = pendingPairToken else { return }
         sendJSON(["type": "pair", "token": token,
                   "publicKey": identity.publicKeySPKI.base64EncodedString(),
-                  "name": pendingPairName])
+                  "name": pendingPairName,
+                  "proof": pendingPairProof ?? ""])
         pendingPairToken = nil
+        pendingPairProof = nil
     }
 
     /// The client speaks first (mirrors RemoteHost.startSession): a fresh

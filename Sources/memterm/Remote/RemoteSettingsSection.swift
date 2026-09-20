@@ -266,6 +266,8 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
             any time in Settings ▸ Remote.
 
             Device key: \(deviceId)
+            Check that this matches the key shown on the device. If it \
+            doesn't, don't allow it.
             """
         // Deny is added FIRST, which makes it the default button: a stranger's
         // request must not be granted by a Return keystroke aimed at

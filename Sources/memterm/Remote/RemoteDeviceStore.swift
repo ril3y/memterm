@@ -14,6 +14,15 @@ import MemtermCore
 // or delete it. Neither ever touches the journal: FR-24 restore must not
 // resurrect a trust decision.
 
+// Security review 2026-09-20 (M2): the list is also MAC'd under a key
+// derived from the Keychain identity (`RemoteDeviceSeal`). Re-deriving each
+// id from its key stops a hand-edited id from redirecting trust, but it did
+// nothing about a new ROW: any process running as the user could append its
+// own public key and the next launch handed it a shell, with no Allow
+// prompt ever shown. A file that does not verify is refused (logged, start
+// empty) and left on disk untouched, so the user can still see what is in
+// it.
+
 /// One paired device, as stored on disk. `id` is derived from `publicKeySPKI`
 /// (never accepted from the wire), so the file is self-verifying: a tampered
 /// id cannot make us trust a different key.
@@ -25,6 +34,16 @@ struct PairedDevice: Codable, Equatable {
     var publicKeySPKI: Data
     var pairedAt: Date
     var lastSeen: Date?
+}
+
+/// The on-disk shape: the rows plus the MAC that proves this app wrote
+/// them. Pretty-printed, because the user is meant to be able to read it.
+private struct DeviceFile: Codable {
+    var devices: [PairedDevice]
+    /// base64 HMAC-SHA256 over the CANONICAL encoding of `devices` — not
+    /// over the file's bytes, so reformatting by hand is harmless while
+    /// changing any value is not.
+    var mac: String
 }
 
 final class RemoteDeviceStore {
@@ -42,17 +61,28 @@ final class RemoteDeviceStore {
     /// the machine. In those runs the identity is generated per launch and
     /// held in memory, and the device list starts (and stays) empty.
     private let ephemeral: Bool
-    /// The in-memory identity for automated runs, so repeated calls within a
-    /// launch still return one stable host id.
-    private var ephemeralIdentity: RemoteIdentity?
+    /// The identity for this launch, so repeated calls return one stable
+    /// host id — and, since the device list's MAC key is derived from it,
+    /// so verifying the list does not re-read the Keychain per call.
+    private var identityCache: RemoteIdentity?
 
-    private(set) var devices: [PairedDevice] = []
+    private var storage: [PairedDevice] = []
+    /// The list is loaded on FIRST USE, not in `init` (security review M2):
+    /// verifying it needs the Keychain identity, and creating the store
+    /// must not reach into the Keychain — an install with remote off never
+    /// prompts and never stores a key. A device file that does not exist
+    /// yet is simply an empty list, with no Keychain access at all.
+    private var loaded = false
+
+    var devices: [PairedDevice] {
+        loadIfNeeded()
+        return storage
+    }
 
     init(devicesURL: URL = MemoryEngine.baseDir.appendingPathComponent("remote-devices.json"),
          ephemeral: Bool = ProbeSupport.isUIProbe || ProbeSupport.isSmoke) {
         self.devicesURL = devicesURL
         self.ephemeral = ephemeral
-        if !ephemeral { devices = Self.loadDevices(from: devicesURL) }
     }
 
     // MARK: - Identity
@@ -65,17 +95,19 @@ final class RemoteDeviceStore {
     /// than trapped on. That re-pairs every device, which is the honest
     /// outcome: without the old private key we cannot prove the old host id.
     func loadOrCreateIdentity() -> RemoteIdentity {
-        if ephemeral {
-            if let identity = ephemeralIdentity { return identity }
-            let identity = RemoteIdentity.generate()
-            ephemeralIdentity = identity
-            return identity
-        }
-        if let raw = Self.keychainRead(), let identity = try? RemoteIdentity(privateKeyRaw: raw) {
+        if let identityCache { return identityCache }
+        let identity = Self.resolveIdentity(ephemeral: ephemeral)
+        identityCache = identity
+        return identity
+    }
+
+    private static func resolveIdentity(ephemeral: Bool) -> RemoteIdentity {
+        if ephemeral { return RemoteIdentity.generate() }
+        if let raw = keychainRead(), let identity = try? RemoteIdentity(privateKeyRaw: raw) {
             return identity
         }
         let identity = RemoteIdentity.generate()
-        Self.keychainWrite(identity.privateKey.rawRepresentation)
+        keychainWrite(identity.privateKey.rawRepresentation)
         return identity
     }
 
@@ -112,16 +144,18 @@ final class RemoteDeviceStore {
     // MARK: - Devices
 
     func add(_ device: PairedDevice) {
+        loadIfNeeded()
         // Re-pairing an existing device replaces its row (a browser that
         // cleared its storage comes back with a new key and the same name;
         // the same key coming back keeps one row, not two).
-        devices.removeAll { $0.id == device.id }
-        devices.append(device)
+        storage.removeAll { $0.id == device.id }
+        storage.append(device)
         save()
     }
 
     func remove(id: String) {
-        devices.removeAll { $0.id == id }
+        loadIfNeeded()
+        storage.removeAll { $0.id == id }
         save()
     }
 
@@ -130,12 +164,13 @@ final class RemoteDeviceStore {
     /// day's value actually changes — so a busy session doesn't rewrite the
     /// file per keystroke.
     func touch(id: String, at now: Date = Date()) {
-        guard let index = devices.firstIndex(where: { $0.id == id }) else { return }
-        if let last = devices[index].lastSeen, now.timeIntervalSince(last) < 60 {
-            devices[index].lastSeen = now
+        loadIfNeeded()
+        guard let index = storage.firstIndex(where: { $0.id == id }) else { return }
+        if let last = storage[index].lastSeen, now.timeIntervalSince(last) < 60 {
+            storage[index].lastSeen = now
             return
         }
-        devices[index].lastSeen = now
+        storage[index].lastSeen = now
         save()
     }
 
@@ -147,21 +182,57 @@ final class RemoteDeviceStore {
 
     // MARK: - Disk
 
-    private static func loadDevices(from url: URL) -> [PairedDevice] {
-        guard let data = try? Data(contentsOf: url),
-              let list = try? JSONDecoder.remoteDeviceDecoder.decode([PairedDevice].self, from: data)
-        else { return [] }
+    /// Reads and VERIFIES the device file, once per launch.
+    ///
+    /// A file whose MAC does not check out is refused outright: the list
+    /// starts empty and the file is left exactly where it is, so nothing a
+    /// tamperer wrote is trusted and nothing the user might want to look at
+    /// is destroyed. Regenerating the host identity has the same effect,
+    /// which is the honest failure mode — without the old private key we
+    /// cannot prove the old host id either, so every device has to re-pair
+    /// regardless.
+    private func loadIfNeeded() {
+        guard !loaded else { return }
+        loaded = true
+        guard !ephemeral else { return }
+        guard let data = try? Data(contentsOf: devicesURL) else { return }  // nothing paired yet
+        guard let file = try? JSONDecoder.remoteDeviceDecoder.decode(DeviceFile.self, from: data) else {
+            log("device list is unreadable or unsigned; starting with no paired devices")
+            return
+        }
+        guard let canonical = Self.canonicalJSON(file.devices),
+              RemoteDeviceSeal.verify(canonicalJSON: canonical, mac: file.mac,
+                                      identity: loadOrCreateIdentity())
+        else {
+            log("device list failed its integrity check; starting with no paired devices "
+                + "(the file is left in place at \(devicesURL.lastPathComponent))")
+            return
+        }
         // The file is public, so re-derive every id from its key rather than
         // trusting the stored string: a hand-edited id must not be able to
         // redirect trust onto a different key. A row whose key no longer
         // parses as a P-256 SPKI is dropped, not kept as a device that could
         // never complete a handshake anyway.
-        return list.compactMap { device in
-            guard isValidSPKI(device.publicKeySPKI) else { return nil }
+        //
+        // This runs AFTER the MAC check, over the rows exactly as decoded,
+        // so a rewritten id fails verification rather than being quietly
+        // corrected into a valid file.
+        storage = file.devices.compactMap { device in
+            guard Self.isValidSPKI(device.publicKeySPKI) else { return nil }
             var fixed = device
             fixed.id = RemoteIdentity.peerId(forSPKI: device.publicKeySPKI)
             return fixed
         }
+    }
+
+    /// The bytes the MAC covers: compact, sorted keys, ISO-8601 dates.
+    /// Independent of how the file itself is laid out, so the seal survives
+    /// a reformat and fails on any changed value.
+    private static func canonicalJSON(_ devices: [PairedDevice]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try? encoder.encode(devices)
     }
 
     /// Does this blob parse as the P-256 SubjectPublicKeyInfo the protocol
@@ -175,8 +246,19 @@ final class RemoteDeviceStore {
         guard !ephemeral else { return }
         try? FileManager.default.createDirectory(
             at: devicesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard let data = try? JSONEncoder.remoteDeviceEncoder.encode(devices) else { return }
+        guard let canonical = Self.canonicalJSON(storage) else { return }
+        let file = DeviceFile(
+            devices: storage,
+            mac: RemoteDeviceSeal.seal(canonicalJSON: canonical, identity: loadOrCreateIdentity()))
+        guard let data = try? JSONEncoder.remoteDeviceEncoder.encode(file) else { return }
         try? data.write(to: devicesURL, options: .atomic)
+    }
+
+    private func log(_ message: String) {
+        // Automated runs assert on exact probe output; remote chatter would
+        // be noise there.
+        guard !ProbeSupport.quiet else { return }
+        print("memterm remote: \(message)")
     }
 }
 

@@ -3364,6 +3364,8 @@ extension MemtermAppDelegate {
         var pairingPayload: PairingPayload?
         var incomingPairName: String?
         var pairingWindowClosedClient: RemoteProbeClient?
+        var badProofClient: RemoteProbeClient?
+        var badProofDenied = false
         var pane: PaneView?
         var closePane: PaneView?
         var closeProbeController: TerminalWindowController?
@@ -3387,6 +3389,7 @@ extension MemtermAppDelegate {
             remoteLegTornDown = true
             client.disconnect()
             pairingWindowClosedClient?.disconnect()
+            badProofClient?.disconnect()
             if relay.isRunning {
                 relay.terminate()
                 relay.waitUntilExit()
@@ -3488,6 +3491,50 @@ extension MemtermAppDelegate {
                 }
                 pairingWindowClosedClient?.disconnect()
                 pairingWindowClosedClient = nil
+            },
+            onFailure: { tearDownRemoteLeg() }))
+
+        probe.add(ProbeStep(
+            // Security review C2: the whole point of the pair proof. This
+            // is the hostile-relay move — a request arriving while the QR
+            // sheet is genuinely OPEN, carrying a key whose holder never
+            // scanned the code. The proof is the only thing that can tell
+            // it apart from the real device, so the assertion is that the
+            // "Allow ?" prompt (auto-accepting, per the pairing step) never
+            // fires and no device is added. Note the window is deliberately
+            // left open here: a denial from the closed-window check would
+            // prove nothing about the proof.
+            name: "remote-bad-proof", timeout: 10,
+            action: { [self] in
+                incomingPairName = nil
+                let payload = remote.startPairing()
+                let device = RemoteProbeClient()
+                badProofClient = device
+                device.connect(relay: relayURL)
+                // A well-formed MAC over nothing in particular: the shape
+                // is right, only the secret is missing.
+                device.pair(payload, name: "probe-client-forged",
+                            proof: Data(repeating: 0, count: 32).base64EncodedString())
+            },
+            condition: { badProofClient?.paired == false },
+            assert: { [self] in
+                guard badProofClient?.paired == false else {
+                    throw ProbeFailure("forged-proof pair attempt was not denied (paired=\(String(describing: badProofClient?.paired)))")
+                }
+                guard incomingPairName == nil else {
+                    throw ProbeFailure("forged-proof pair-request reached onPairRequest (name=\(incomingPairName ?? "nil")) — the proof is not being checked before the prompt")
+                }
+                guard remote.store.devices.count == 1 else {
+                    throw ProbeFailure("device count \(remote.store.devices.count) after a forged proof, want 1 (only the real probe client)")
+                }
+                guard remote.store.device(id: badProofClient?.deviceId ?? "") == nil else {
+                    throw ProbeFailure("the forged-proof device was added to the store")
+                }
+                badProofDenied = true
+                badProofClient?.disconnect()
+                badProofClient = nil
+                // Leave the window as every other step expects it: shut.
+                remote.endPairing()
             },
             onFailure: { tearDownRemoteLeg() }))
 
@@ -3670,7 +3717,7 @@ extension MemtermAppDelegate {
                 guard client.lastRefusedReason == "not-allowed" else {
                     throw ProbeFailure("post-revoke envelope got reason=\(client.lastRefusedReason ?? "nil"), want not-allowed")
                 }
-                print("UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true close_prunes=\(closePrunesVerified)")
+                print("UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true close_prunes=\(closePrunesVerified) bad_proof_denied=\(badProofDenied)")
                 tearDownRemoteLeg()
             },
             onFailure: { tearDownRemoteLeg() }))

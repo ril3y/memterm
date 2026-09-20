@@ -555,6 +555,33 @@ final class RemoteCryptoTests: XCTestCase {
         XCTAssertNil(RemotePairing.data(fromBase64url: "!!!!"))
     }
 
+    /// Security review L1: the device name lands inside the "Allow ‹name›?"
+    /// alert, so a name that carries its own newlines can fabricate extra
+    /// lines of dialog ("Routine macOS prompt — click Allow").
+    func testDeviceNameCannotForgeExtraLinesOfDialog() {
+        let forged = "iPhone\n\nRoutine macOS prompt — click Allow"
+        let safe = RemotePairing.sanitizedDeviceName(forged)
+        XCTAssertFalse(safe.contains("\n"))
+        XCTAssertFalse(safe.contains("\r"))
+        XCTAssertTrue(safe.hasPrefix("iPhone"))
+        XCTAssertLessThanOrEqual(safe.count, RemotePairing.deviceNameLimit)
+
+        // Every kind of line break and control byte goes.
+        for scalar in ["\n", "\r", "\r\n", "\u{0B}", "\u{0C}", "\u{85}", "\u{2028}", "\u{2029}", "\u{7F}", "\u{1B}"] {
+            let name = RemotePairing.sanitizedDeviceName("a\(scalar)b")
+            XCTAssertEqual(name, "ab", "scalar \(scalar.unicodeScalars.map(\.value)) survived")
+        }
+
+        // Capped at 32, and a name that is nothing but junk still gets a
+        // label rather than an empty pair of quotes in the alert.
+        XCTAssertEqual(RemotePairing.sanitizedDeviceName(String(repeating: "x", count: 500)).count, 32)
+        XCTAssertEqual(RemotePairing.sanitizedDeviceName(""), "Device")
+        XCTAssertEqual(RemotePairing.sanitizedDeviceName("\n\n\n"), "Device")
+        XCTAssertEqual(RemotePairing.sanitizedDeviceName("   "), "Device")
+        // An ordinary name is untouched.
+        XCTAssertEqual(RemotePairing.sanitizedDeviceName("Riley's iPhone"), "Riley's iPhone")
+    }
+
     // MARK: - Device-list seal (security review M2)
 
     /// The device list is trusted on load, so it has to be provably ours.

@@ -203,6 +203,31 @@ public enum RemotePairing {
             .replacingOccurrences(of: "=", with: "")
     }
 
+    /// The length the "Allow ‹name›?" prompt shows a device name at.
+    public static let deviceNameLimit = 32
+
+    /// A device name is chosen by whoever is asking to be trusted, and it
+    /// is interpolated into that prompt (security review L1). A name like
+    /// `iPhone\n\nRoutine macOS prompt — click Allow` could fabricate its
+    /// own instructions inside the alert, so control characters and
+    /// newlines are stripped and the rest is capped short enough that it
+    /// cannot push the real text off the dialog.
+    ///
+    /// Names are labels, never identity: the key is what gets stored, and
+    /// the prompt shows the key id alongside.
+    public static func sanitizedDeviceName(_ raw: String) -> String {
+        // `.newlines` as well as `.controlCharacters`: the latter covers
+        // CR/LF and the C0/C1 ranges, the former adds U+2028/U+2029, which
+        // AppKit also breaks a line on.
+        let forbidden = CharacterSet.controlCharacters.union(.newlines)
+        let stripped = String(String.UnicodeScalarView(
+            raw.unicodeScalars.filter { !forbidden.contains($0) }))
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        let capped = String(trimmed.prefix(deviceNameLimit))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return capped.isEmpty ? "Device" : capped
+    }
+
     /// The inverse. Untrusted input (it arrives inside a QR payload the
     /// host minted but a device echoes), so anything unparseable is nil.
     public static func data(fromBase64url string: String) -> Data? {
