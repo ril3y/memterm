@@ -124,6 +124,97 @@ public struct RemoteIdentity {
     }
 }
 
+/// Pairing-token handling: the split token and the proof that binds a
+/// device's key to the QR code the user actually showed it.
+///
+/// Security review 2026-09-20 (C2): the relay used to be handed the WHOLE
+/// pairing token, and `pair-request` carried nothing tying the device's
+/// public key to whoever consumed that token. A hostile relay could
+/// therefore substitute its own key inside a genuine request, or mint an
+/// unsolicited request while the QR sheet was open, and one Allow click
+/// gave it a shell.
+///
+/// So the 32 random bytes are split:
+///   - bytes[0..<16] → the ROUTING token, base64url, the only half the
+///     relay ever sees. It is a map key, nothing more.
+///   - bytes[16..<32] → the pair SECRET, which never leaves the QR code.
+/// The device proves it scanned the code by sending
+/// `HMAC-SHA256(secret, "memterm-remote-v1:pair" ‖ deviceSPKI)`, and the
+/// host recomputes that over the SPKI it was actually sent, before any
+/// prompt. The relay can neither compute the MAC for a key of its own nor
+/// mint a request at all.
+public enum RemotePairing {
+
+    /// Domain separation, and the reason a signature or MAC gathered
+    /// elsewhere in this protocol can never be presented as a pair proof.
+    /// The web client prepends the identical bytes.
+    public static let proofLabel = "memterm-remote-v1:pair"
+
+    /// 16 bytes of base64url with no padding. The relay rejects anything
+    /// else outright, so a token is a fixed-size string, not an arbitrary
+    /// one an attacker can grow (security review H1).
+    public static let routingTokenLength = 22
+    public static let tokenBytes = 32
+    static let halfBytes = 16
+
+    /// Splits freshly minted randomness into the half the relay routes on
+    /// and the half only the QR code carries. Anything but 32 bytes is a
+    /// programming error at the call site, so it yields nil rather than
+    /// silently pairing on a short secret.
+    public static func split(_ bytes: Data) -> (routingToken: String, secret: Data)? {
+        guard bytes.count == tokenBytes else { return nil }
+        let routing = Data(bytes.prefix(halfBytes))
+        let secret = Data(bytes.suffix(halfBytes))
+        return (base64url(routing), secret)
+    }
+
+    /// The exact bytes the MAC covers. `deviceSPKI` is the DER
+    /// SubjectPublicKeyInfo as it travels on the wire — the same bytes the
+    /// host hashes into the device id, so a proof can only ever vouch for
+    /// the one key it was computed over.
+    public static func proofPayload(deviceSPKI: Data) -> Data {
+        Data(proofLabel.utf8) + deviceSPKI
+    }
+
+    public static func proof(secret: Data, deviceSPKI: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(
+            for: proofPayload(deviceSPKI: deviceSPKI),
+            using: SymmetricKey(data: secret)))
+    }
+
+    /// Constant-time comparison (CryptoKit's own), so a hostile relay
+    /// cannot learn the expected MAC one byte at a time by timing the
+    /// host's silent denials.
+    public static func isValidProof(_ candidate: Data, secret: Data, deviceSPKI: Data) -> Bool {
+        guard !secret.isEmpty else { return false }
+        return HMAC<SHA256>.isValidAuthenticationCode(
+            candidate,
+            authenticating: proofPayload(deviceSPKI: deviceSPKI),
+            using: SymmetricKey(data: secret))
+    }
+
+    /// RFC 4648 §5 without padding — what the QR payload's `token` and
+    /// `secret` fields carry, and what the relay's token validation
+    /// expects.
+    public static func base64url(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    /// The inverse. Untrusted input (it arrives inside a QR payload the
+    /// host minted but a device echoes), so anything unparseable is nil.
+    public static func data(fromBase64url string: String) -> Data? {
+        var standard = string
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = standard.count % 4
+        if remainder != 0 { standard.append(String(repeating: "=", count: 4 - remainder)) }
+        return Data(base64Encoded: standard)
+    }
+}
+
 /// The two-message handshake. Each side offers a fresh ephemeral ECDH key
 /// signed by its long-lived identity, so forward secrecy comes from the
 /// ephemeral and authentication from the signature.

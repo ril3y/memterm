@@ -473,4 +473,137 @@ final class RemoteCryptoTests: XCTestCase {
                         "a real WebCrypto SPKI export must be accepted by x963(fromSPKI:)")
         XCTAssertEqual(RemoteIdentity.peerId(forSPKI: spki), peerId)
     }
+
+    // MARK: - Pairing proof (security review C2)
+
+    /// The wire contract for the proof that binds a device's key to the QR
+    /// code it scanned. `pairProofBase64` was produced by Node's WebCrypto
+    /// HMAC over the SAME `deviceSPKIHex` this file already pins as a real
+    /// `exportKey("spki")` output, and `relay/web/test/vectors.test.ts`
+    /// asserts the browser's own implementation against these identical
+    /// bytes — so a label, a byte order or a base64 flavour that drifts in
+    /// either stack shows up here rather than as a phone that cannot pair.
+    func testPairProofMatchesTheSharedVector() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("vectors/remote-crypto-vectors.json")
+        let expected = try JSONDecoder().decode([String: String].self, from: try Data(contentsOf: url))
+        let secret = try bytes(fromHex: try XCTUnwrap(expected["pairSecretHex"]))
+        let spki = try bytes(fromHex: try XCTUnwrap(expected["deviceSPKIHex"]))
+
+        XCTAssertEqual(secret.count, 16)
+        let proof = RemotePairing.proof(secret: secret, deviceSPKI: spki)
+        XCTAssertEqual(proof.base64EncodedString(), try XCTUnwrap(expected["pairProofBase64"]))
+        XCTAssertTrue(RemotePairing.isValidProof(proof, secret: secret, deviceSPKI: spki))
+    }
+
+    /// The two ways a hostile relay tries to use the pairing window: swap
+    /// the key inside a genuine request, or mint one with no secret at all.
+    /// Both must fail the MAC.
+    func testPairProofRejectsASubstitutedKeyOrAWrongSecret() throws {
+        let secret = Data((0..<16).map { UInt8($0) })
+        let device = RemoteIdentity.generate()
+        let attacker = RemoteIdentity.generate()
+        let proof = RemotePairing.proof(secret: secret, deviceSPKI: device.publicKeySPKI)
+
+        XCTAssertTrue(RemotePairing.isValidProof(proof, secret: secret, deviceSPKI: device.publicKeySPKI))
+        // The relay forwarded the real device's proof with its OWN key.
+        XCTAssertFalse(RemotePairing.isValidProof(proof, secret: secret, deviceSPKI: attacker.publicKeySPKI))
+        // A relay that never saw the secret half cannot mint one.
+        XCTAssertFalse(RemotePairing.isValidProof(
+            proof, secret: Data(repeating: 0xAB, count: 16), deviceSPKI: device.publicKeySPKI))
+        // A truncated or empty MAC is not a near miss, it is a refusal.
+        XCTAssertFalse(RemotePairing.isValidProof(Data(), secret: secret, deviceSPKI: device.publicKeySPKI))
+        XCTAssertFalse(RemotePairing.isValidProof(
+            Data(proof.prefix(31)), secret: secret, deviceSPKI: device.publicKeySPKI))
+        // No pending pairing means no secret: never a pass.
+        XCTAssertFalse(RemotePairing.isValidProof(proof, secret: Data(), deviceSPKI: device.publicKeySPKI))
+    }
+
+    /// The split the relay's token validation depends on: exactly 22
+    /// base64url characters out of the first 16 bytes, and a secret half
+    /// the routing token cannot be reversed into.
+    func testTokenSplitsIntoA22CharRoutingHalfAndASecretHalf() throws {
+        let bytes = Data((0..<32).map { UInt8($0) })
+        let split = try XCTUnwrap(RemotePairing.split(bytes))
+
+        XCTAssertEqual(split.routingToken.count, RemotePairing.routingTokenLength)
+        XCTAssertEqual(split.routingToken.count, 22)
+        XCTAssertFalse(split.routingToken.contains("="))
+        XCTAssertEqual(RemotePairing.data(fromBase64url: split.routingToken), Data(bytes.prefix(16)))
+        XCTAssertEqual(split.secret, Data(bytes.suffix(16)))
+        // The routing half the relay sees carries none of the secret half.
+        XCTAssertFalse(split.secret.starts(with: Data(bytes.prefix(16))))
+        // Anything but 32 bytes is refused rather than silently halved.
+        XCTAssertNil(RemotePairing.split(Data(repeating: 0, count: 31)))
+        XCTAssertNil(RemotePairing.split(Data()))
+    }
+
+    /// base64url round-trips for every byte value, including the two
+    /// characters (`-`, `_`) that distinguish it from standard base64 and
+    /// the padding it drops.
+    func testBase64urlRoundTripsAndDropsPadding() throws {
+        for length in 1...34 {
+            let data = Data((0..<length).map { _ in UInt8.random(in: 0...255) })
+            let encoded = RemotePairing.base64url(data)
+            XCTAssertFalse(encoded.contains("="))
+            XCTAssertFalse(encoded.contains("+"))
+            XCTAssertFalse(encoded.contains("/"))
+            XCTAssertEqual(RemotePairing.data(fromBase64url: encoded), data)
+        }
+        XCTAssertNil(RemotePairing.data(fromBase64url: "!!!!"))
+    }
+
+    // MARK: - Device-list seal (security review M2)
+
+    /// The device list is trusted on load, so it has to be provably ours.
+    /// An in-memory identity stands in for the Keychain one: seal, flip a
+    /// single byte anywhere in the canonical JSON, and the MAC must refuse.
+    func testDeviceSealRefusesATamperedDeviceList() throws {
+        let identity = RemoteIdentity.generate()
+        let json = Data(#"[{"id":"abc","name":"iPhone"}]"#.utf8)
+        let mac = RemoteDeviceSeal.seal(canonicalJSON: json, identity: identity)
+
+        XCTAssertTrue(RemoteDeviceSeal.verify(canonicalJSON: json, mac: mac, identity: identity))
+
+        // Local malware appending its own row — the whole point of M2.
+        let appended = Data(#"[{"id":"abc","name":"iPhone"},{"id":"evil","name":"iPhone"}]"#.utf8)
+        XCTAssertFalse(RemoteDeviceSeal.verify(canonicalJSON: appended, mac: mac, identity: identity))
+
+        // One byte, anywhere.
+        for index in json.indices {
+            var tampered = json
+            tampered[index] ^= 0x01
+            XCTAssertFalse(RemoteDeviceSeal.verify(canonicalJSON: tampered, mac: mac, identity: identity),
+                           "a flipped byte at \(index) still verified")
+        }
+
+        // A rewritten MAC, a missing MAC, and a MAC made under a different
+        // identity are all refusals.
+        XCTAssertFalse(RemoteDeviceSeal.verify(canonicalJSON: json, mac: "", identity: identity))
+        XCTAssertFalse(RemoteDeviceSeal.verify(canonicalJSON: json, mac: "not base64 !!", identity: identity))
+        XCTAssertFalse(RemoteDeviceSeal.verify(
+            canonicalJSON: json,
+            mac: RemoteDeviceSeal.seal(canonicalJSON: json, identity: RemoteIdentity.generate()),
+            identity: identity))
+    }
+
+    /// The seal key must be a derivative of the identity, not the identity:
+    /// two identities disagree, one identity is stable across calls, and
+    /// the derived key is never the raw private key.
+    func testDeviceSealKeyIsDerivedFromTheIdentityAndIsStable() throws {
+        let identity = RemoteIdentity.generate()
+        let other = RemoteIdentity.generate()
+        let json = Data("[]".utf8)
+
+        XCTAssertEqual(RemoteDeviceSeal.seal(canonicalJSON: json, identity: identity),
+                       RemoteDeviceSeal.seal(canonicalJSON: json, identity: identity))
+        XCTAssertNotEqual(RemoteDeviceSeal.seal(canonicalJSON: json, identity: identity),
+                          RemoteDeviceSeal.seal(canonicalJSON: json, identity: other))
+
+        let derived = RemoteDeviceSeal.key(identity: identity).withUnsafeBytes { Data($0) }
+        XCTAssertEqual(derived.count, 32)
+        XCTAssertNotEqual(derived, identity.privateKey.rawRepresentation)
+    }
 }
