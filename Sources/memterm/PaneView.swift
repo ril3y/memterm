@@ -207,6 +207,10 @@ class PaneView: LocalProcessTerminalView {
         super.dataReceived(slice: slice)
         syncAllowMouseReporting()
         onOutputActivity?()
+        // Remote attach (Task 8): taps run LAST, after the terminal has the
+        // bytes and the local activity hook has fired, so a remote viewer can
+        // never change what the local pane does with a chunk.
+        fanOutToOutputTaps(slice)
     }
 
     /// BEL (0x07). super consults `bellStyle` (public var, default .sound —
@@ -243,6 +247,103 @@ class PaneView: LocalProcessTerminalView {
             return
         }
         super.otherMouseDown(with: event)
+    }
+
+    // MARK: - Remote attach (Task 8)
+
+    // The seam between a live pane and the remote-attach host. Three surfaces:
+    // output taps (what the pty printed), `remoteInput` (what a remote client
+    // typed), and `visibleScreenBytes` (what a fresh viewer must be shown so
+    // its first frame matches the local one). A remote client can do nothing a
+    // local keyboard cannot: input goes down the same `send(data:)` path.
+    //
+    // THREADING: everything here is main-thread-only. LocalProcess delivers
+    // pty data on DispatchQueue.main (its default dispatchQueue), so
+    // `dataReceived` — and therefore every tap — runs on the main thread, and
+    // SwiftTerm's `send(data:)` asserts the same thread in DEBUG. A host that
+    // reads bytes off a socket queue must hop to main before calling in.
+
+    /// Output taps: called with a copy of every pty chunk AFTER the terminal
+    /// has parsed it. Keyed by the token `addOutputTap` hands back.
+    /// Main-thread only, like `dataReceived` itself.
+    private(set) var outputTaps: [UUID: (Data) -> Void] = [:]
+
+    /// Registers a tap; keep the returned token to remove it again.
+    @discardableResult
+    func addOutputTap(_ tap: @escaping (Data) -> Void) -> UUID {
+        let id = UUID()
+        outputTaps[id] = tap
+        return id
+    }
+
+    func removeOutputTap(_ id: UUID) {
+        outputTaps.removeValue(forKey: id)
+    }
+
+    /// Iterating `Array(values)` (not the live view) so a tap that removes
+    /// itself — the last remote viewer leaving mid-chunk — can't invalidate
+    /// the iteration.
+    private func fanOutToOutputTaps(_ slice: ArraySlice<UInt8>) {
+        guard !outputTaps.isEmpty else { return }
+        let chunk = Data(slice)
+        for tap in Array(outputTaps.values) { tap(chunk) }
+    }
+
+    /// Remote keystrokes. Same path the local keyboard takes
+    /// (`TerminalView.send(data:)`), so a remote client is exactly as
+    /// privileged as someone at the machine — no more.
+    func remoteInput(_ bytes: Data) {
+        guard !bytes.isEmpty else { return }
+        send(data: ArraySlice(bytes))
+    }
+
+    /// The visible grid as bytes a fresh remote viewer can feed to its own
+    /// emulator: clear + home, the `rows` on-screen lines joined by CRLF, then
+    /// a cursor-position report. Plain text, no attributes (v1).
+    ///
+    /// Row addressing: `getScrollInvariantLine` counts from the start of the
+    /// scroll buffer INCLUDING lines already trimmed out of it, while `yDisp`
+    /// indexes the live lines array — so the scroll-invariant index of the top
+    /// visible row is `totalLinesTrimmed + yDisp`. They agree until the
+    /// scrollback fills and starts trimming; after that, `yDisp` alone would
+    /// walk the wrong rows.
+    ///
+    /// Cursor: `getCursorLocation()` is the only public accessor (the buffer's
+    /// `yBase` is internal to SwiftTerm), so the reported row is right whenever
+    /// the viewport sits at the bottom — the case a live pane is in except
+    /// while someone is scrolled up reading history. It is clamped on screen
+    /// either way.
+    func visibleScreenBytes() -> (cols: Int, rows: Int, bytes: Data) {
+        let terminal = getTerminal()
+        let cols = terminal.cols
+        let rows = terminal.rows
+        let top = terminal.buffer.totalLinesTrimmed + terminal.buffer.yDisp
+
+        var lines: [String] = []
+        lines.reserveCapacity(rows)
+        for offset in 0..<rows {
+            guard let line = terminal.getScrollInvariantLine(row: top + offset) else {
+                // Off the end of the buffer (a grid taller than what has been
+                // written): a blank row keeps the frame `rows` tall.
+                lines.append("")
+                continue
+            }
+            // skipNullCellsFollowingWide + normalizeCells: same pairing as
+            // scrollbackText — drop a wide glyph's padding cell, then turn
+            // never-written cells into the spaces they are on screen.
+            lines.append(ScrollbackText.normalizeCells(
+                line.translateToString(trimRight: true,
+                                       skipNullCellsFollowingWide: true)))
+        }
+
+        let cursor = terminal.getCursorLocation()
+        let cursorRow = min(max(cursor.y, 0), max(rows - 1, 0))
+        let cursorCol = min(max(cursor.x, 0), max(cols - 1, 0))
+
+        var screen = "\u{1b}[2J\u{1b}[H"
+        screen += lines.joined(separator: "\r\n")
+        screen += "\u{1b}[\(cursorRow + 1);\(cursorCol + 1)H"
+        return (cols, rows, Data(screen.utf8))
     }
 
     func updateLocalDirectory(fromOSC7 directory: String?) {
