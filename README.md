@@ -59,6 +59,10 @@ Requires macOS 14+ and a Swift 6 toolchain. `dist/memterm.app/Contents/MacOS/mem
 
 A global hotkey slides a terminal in from a screen edge and away again — the Quake console, the way Guake and iTerm2's hotkey window do it. Off until you enable it in **Settings ▸ Appearance**: pick the trigger — a key combination (click the recorder, press keys: ⌃`, ⌘⇧T, F12…) or a **double-tap** of Control, Option, Command, Shift, or Esc (needs Accessibility to work while another app is frontmost; Settings has a Grant button, and until then it works while memterm is frontmost) — the edge it slides from (top, left, right), alignment along the top edge, width × height as a percentage of the screen, which screen (the one under the mouse, or the main one), and whether it hides when another window takes focus. **Shell ▸ Toggle Drop-down Terminal** does the same as the hotkey. The panel belongs to the active workspace: its tabs are remembered and restored (hidden) like any others, it hides with its workspace on a switch, and every workspace gets its own on first use. The same keys live under `[dropdown]` in the config file.
 
+## Relay
+
+The `relay/` directory contains a WebSocket relay server written in Node.js + TypeScript that enables memterm clients to communicate with memterm hosts through a central relay. It handles authentication, device pairing, and message forwarding. Run `npm test` from the `relay/` directory to run the test suite. Deploy to Fly.io with `fly deploy` from the `relay/` directory using the included `fly.toml` configuration.
+
 ## Configuration
 
 One file: `~/.config/memterm/config.toml` (created with commented defaults on first launch), plus a native Settings window (⌘,) that reads and writes the same file. No preference-pane sprawl.

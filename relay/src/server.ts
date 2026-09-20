@@ -39,7 +39,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, pathname: string) => {
     handleConnection(ws, pathname === "/host" ? "host" : "client", registry);
   });
-  await new Promise<void>((r) => server.listen(opts.port, "127.0.0.1", r));
+  await new Promise<void>((r) => server.listen(opts.port, process.env.HOST ?? "127.0.0.1", r));
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : opts.port;
   return {
