@@ -31,6 +31,10 @@ test("every response carries the security headers", async () => {
       assert.match(csp!, /connect-src 'self' wss: ws:/);
       assert.match(csp!, /img-src 'self' data:/);
       assert.match(csp!, /style-src 'self' 'unsafe-inline'/);
+      // Security re-review N2: header-only, and the one directive the
+      // Pages copy's <meta> cannot carry — so where the relay serves the
+      // page it must be on the wire.
+      assert.match(csp!, /frame-ancestors 'none'/);
       // index.html has an inline <style> but no inline <script>, so
       // scripts stay on the un-loosened default-src.
       assert.doesNotMatch(csp!, /script-src/);
@@ -78,6 +82,9 @@ test("the served index carries the CSP meta as well as the CSP header", async ()
 
 function b64(bytes: Uint8Array): string { return Buffer.from(bytes).toString("base64"); }
 
+/** A well-formed peer id (16 chars of lower-case base32). */
+const ALLOWED_DEVICE = "abcdefghijklmnop";
+
 test("a host that answers the challenge with a valid signature is authed and registered", async () => {
   const relay = await startRelay({ port: 0, webRoot: new URL("../web", import.meta.url).pathname });
   try {
@@ -96,13 +103,17 @@ test("a host that answers the challenge with a valid signature is authed and reg
           await webcrypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, kp.privateKey, nonce)
         );
         ws.once("message", (raw2: Buffer) => resolve(JSON.parse(raw2.toString())));
-        ws.send(JSON.stringify({ type: "auth", publicKey: b64(spki), signature: b64(signature), allowed: ["dA"] }));
+        // A real 16-character base32 device id: since the re-review's N3,
+        // an announced id that is not one is dropped from the allow-list.
+        ws.send(JSON.stringify({
+          type: "auth", publicKey: b64(spki), signature: b64(signature), allowed: [ALLOWED_DEVICE],
+        }));
       });
     });
     assert.equal(authed.type, "authed");
     assert.equal(authed.id, expectedId);
     assert.ok(relay.registry.host(expectedId));
-    assert.ok(relay.registry.host(expectedId)!.allowed.has("dA"));
+    assert.ok(relay.registry.host(expectedId)!.allowed.has(ALLOWED_DEVICE));
     ws.close();
   } finally {
     await relay.close();

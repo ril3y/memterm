@@ -1,12 +1,30 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import type http from "node:http";
 import { WebSocket } from "ws";
-import { startRelay } from "../src/server.js";
-import { parseInbound } from "../src/envelope.js";
+import { startRelay, clientIp } from "../src/server.js";
+import { parseInbound, MAX_NAME_BYTES } from "../src/envelope.js";
 import { Registry, MAX_PAIRINGS_PER_HOST, MAX_ALLOWED_DEVICES, LAST_SEEN_TTL_MS } from "../src/registry.js";
 import { connectAuthed, next, b64, routingToken, PROOF } from "./helpers.js";
 
 const WEB = new URL("../web", import.meta.url).pathname;
+
+/** A syntactically valid peer id: 16 chars of the lower-case base32 alphabet. */
+function peerId(seed: string): string {
+  return (seed + "aaaaaaaaaaaaaaaa").slice(0, 16);
+}
+
+/** A distinct valid peer id per number — base32 digits, so no collisions. */
+function nthPeerId(n: number): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  let out = "";
+  let value = n;
+  for (let i = 0; i < 16; i++) {
+    out = alphabet[value % 32] + out;
+    value = Math.floor(value / 32);
+  }
+  return out;
+}
 
 // Security review H1: authenticating as a host costs an attacker nothing,
 // and afterwards every map in the registry was unbounded -- one socket
@@ -76,7 +94,9 @@ test("every insert sweeps expired pairings and day-old lastSeen rows", () => {
 test("an announced allow-list is capped", async () => {
   const relay = await startRelay({ port: 0, webRoot: WEB });
   try {
-    const many = Array.from({ length: 5_000 }, (_, i) => `device-${i}`);
+    // Well-formed and DISTINCT ids, so only the count cap can trim them.
+    const many = Array.from({ length: 5_000 }, (_, i) => nthPeerId(i));
+    assert.equal(new Set(many).size, 5_000);
     const host = await connectAuthed(relay.port, "host", { allowed: many });
     assert.equal(relay.registry.host(host.id)!.allowed.size, MAX_ALLOWED_DEVICES);
 
@@ -84,6 +104,114 @@ test("an announced allow-list is capped", async () => {
     // Give the message a turn to land before reading the registry.
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(relay.registry.host(host.id)!.allowed.size, MAX_ALLOWED_DEVICES);
+  } finally {
+    await relay.close();
+  }
+});
+
+// Security re-review N3: entry counts were capped but each id string was
+// not, so 64 ids of ~16 KB fit inside the frame limit and were retained in
+// both `allowed` and `watchers` — roughly 2 MiB held per host socket.
+
+test("ids that are not 16 base32 characters are refused or filtered out", () => {
+  const good = peerId("abcd");
+  const other = peerId("wxyz");
+
+  assert.deepEqual(parseInbound({ type: "env", to: good, from: other, payload: "AQID" }),
+                   { type: "env", to: good, from: other, payload: "AQID" });
+  assert.deepEqual(parseInbound({ type: "pair-answer", deviceId: good, accept: true }),
+                   { type: "pair-answer", deviceId: good, accept: true });
+
+  for (const bad of [
+    "x".repeat(16 * 1024), // the flood
+    "x".repeat(17),
+    "x".repeat(15),
+    "",
+    "dA",
+    "someone-else",
+    "ABCDEFGHIJKLMNOP", // upper case is not the alphabet auth.ts emits
+    "abcdefghijklmno1", // 0/1/8/9 are not in RFC 4648's base32 alphabet
+  ]) {
+    // A single-id field has nothing left without it: the message is refused.
+    assert.equal(parseInbound({ type: "env", to: bad, from: good, payload: "AQID" }), undefined,
+                 `accepted to=${JSON.stringify(bad.slice(0, 24))}`);
+    assert.equal(parseInbound({ type: "env", to: good, from: bad, payload: "AQID" }), undefined);
+    assert.equal(parseInbound({ type: "pair-answer", deviceId: bad, accept: true }), undefined);
+
+    // A LIST is filtered instead: dropping the whole message would revoke
+    // every real device the host named alongside the bad entry.
+    assert.deepEqual(parseInbound({ type: "allowed", devices: [good, bad, other] }),
+                     { type: "allowed", devices: [good, other] });
+  }
+
+  // Non-strings in a list go the same way as malformed strings.
+  assert.deepEqual(parseInbound({ type: "allowed", devices: [good, 42, null, {}, other] }),
+                   { type: "allowed", devices: [good, other] });
+});
+
+test("a device name is capped in bytes before it is forwarded", () => {
+  const token = routingToken(7);
+  const base = { type: "pair", token, publicKey: "AA==", proof: PROOF };
+
+  const long = parseInbound({ ...base, name: "x".repeat(5_000) });
+  assert.ok(long && long.type === "pair");
+  assert.equal(Buffer.from(long.name, "utf8").length, MAX_NAME_BYTES);
+
+  // A short name is untouched, multi-byte characters and all.
+  const short = parseInbound({ ...base, name: "Riley's iPhone ☎" });
+  assert.ok(short && short.type === "pair");
+  assert.equal(short.name, "Riley's iPhone ☎");
+
+  // Cutting UTF-8 at a byte boundary must not leave half a code point.
+  const emoji = parseInbound({ ...base, name: "📱".repeat(100) });
+  assert.ok(emoji && emoji.type === "pair");
+  assert.ok(Buffer.from(emoji.name, "utf8").length <= MAX_NAME_BYTES);
+  assert.doesNotMatch(emoji.name, /�/);
+});
+
+test("the fly-client-ip header is only believed when TRUST_PROXY says so", () => {
+  const req = {
+    headers: { "fly-client-ip": "203.0.113.9" },
+    socket: { remoteAddress: "10.0.0.1" },
+  } as unknown as http.IncomingMessage;
+
+  assert.equal(clientIp(req, true), "203.0.113.9");
+  // Untrusted: a client-settable header must not choose its own bucket.
+  assert.equal(clientIp(req, false), "10.0.0.1");
+
+  const bare = { headers: {}, socket: { remoteAddress: "10.0.0.2" } } as unknown as http.IncomingMessage;
+  assert.equal(clientIp(bare, true), "10.0.0.2");
+  assert.equal(clientIp(bare, false), "10.0.0.2");
+
+  // An over-long header value is not a bucket key either.
+  const huge = {
+    headers: { "fly-client-ip": "x".repeat(4_096) },
+    socket: { remoteAddress: "10.0.0.3" },
+  } as unknown as http.IncomingMessage;
+  assert.equal(clientIp(huge, true), "10.0.0.3");
+});
+
+test("rotating fly-client-ip does not buy extra connections when the proxy is untrusted", async () => {
+  // Default (no TRUST_PROXY in the environment): the cap counts the socket
+  // address, so every forged header lands in the same bucket.
+  const relay = await startRelay({ port: 0, webRoot: WEB, maxConnectionsPerIp: 1 });
+  try {
+    const first = new WebSocket(`ws://127.0.0.1:${relay.port}/client`, {
+      headers: { "fly-client-ip": "203.0.113.1" },
+    });
+    first.once("error", () => {});
+    await new Promise<void>((resolve) => first.once("open", () => resolve()));
+
+    const second = new WebSocket(`ws://127.0.0.1:${relay.port}/client`, {
+      headers: { "fly-client-ip": "203.0.113.2" }, // a different invented bucket
+    });
+    second.once("error", () => {});
+    const outcome = await new Promise<string>((resolve) => {
+      second.once("close", () => resolve("closed"));
+      second.once("open", () => resolve("open"));
+    });
+    assert.equal(outcome, "closed", "a rotated header must not escape the per-IP cap");
+    first.close();
   } finally {
     await relay.close();
   }

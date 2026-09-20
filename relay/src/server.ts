@@ -4,7 +4,7 @@ import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { Registry, capSet, MAX_ALLOWED_DEVICES } from "./registry.js";
 import { verifyAuth, idFromPublicKey, randomNonce } from "./auth.js";
-import { parseInbound, type EnvMessage } from "./envelope.js";
+import { parseInbound, peerIds, type EnvMessage } from "./envelope.js";
 
 const PAIRING_TTL_MS = 120_000;
 /// Final-review Important 5: this is a public endpoint on a 512 MB
@@ -36,6 +36,10 @@ export interface RelayOptions {
   /** How many simultaneous WebSocket connections one client IP may hold.
    *  Tests set this to 1 or 2; production uses the default. */
   maxConnectionsPerIp?: number;
+  /** Whether to believe the `fly-client-ip` header when counting those
+   *  connections. Defaults to `TRUST_PROXY=1` in the environment, which
+   *  `fly.toml` sets for the Fly deployment and nothing else does. */
+  trustProxyHeader?: boolean;
 }
 export interface RunningRelay { port: number; close(): Promise<void>; registry: Registry }
 
@@ -59,28 +63,39 @@ const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js
  * `location.host` and is ws: on a loopback relay.
  */
 const SECURITY_HEADERS: Record<string, string> = {
+  // `frame-ancestors 'none'` (security re-review N2) is honoured only from
+  // a header, never from the `<meta>` tag the Pages copy has to rely on —
+  // which is why the page also frame-busts in script. Here the header does
+  // the job properly.
   "content-security-policy":
-    "default-src 'self'; connect-src 'self' wss: ws:; img-src 'self' data:; style-src 'self' 'unsafe-inline'",
+    "default-src 'self'; connect-src 'self' wss: ws:; img-src 'self' data:; "
+    + "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
   "x-content-type-options": "nosniff",
   "strict-transport-security": "max-age=31536000",
 };
 
 /**
- * The peer address a connection limit counts against. Fly terminates TLS
- * and proxies, so `socket.remoteAddress` is the proxy for every real user;
- * `fly-client-ip` is the header it sets to the actual client. Taking the
- * header only when it is present means a self-hosted relay with no proxy
- * still counts real addresses.
+ * The peer address a connection limit counts against.
  *
- * A header can be forged by anyone talking directly to the relay, which
- * only lets an attacker spread their own connections across made-up
- * buckets -- the same thing renting more IPs buys them. It is a memory
- * bound, not an authentication decision.
+ * Fly terminates TLS and proxies, so `socket.remoteAddress` is the proxy
+ * for every real user and `fly-client-ip` is the header it sets to the
+ * actual client. But a header is something a client can set too, and
+ * trusting it unconditionally is what DEFEATS a per-IP cap: one machine
+ * rotates the value and holds as many sockets as it likes, each in its own
+ * invented bucket (security re-review N3).
+ *
+ * So it is trusted only where something is known to be overwriting it —
+ * `TRUST_PROXY=1`, set in `fly.toml`'s `[env]` for the Fly deployment.
+ * Everywhere else (a self-hosted relay, a loopback relay, a test) the
+ * socket's own address is the only thing counted, which is exactly right
+ * when nothing sits in front.
  */
-function clientIp(req: http.IncomingMessage): string {
-  const header = req.headers["fly-client-ip"];
-  const value = Array.isArray(header) ? header[0] : header;
-  if (typeof value === "string" && value.length > 0 && value.length <= 64) return value;
+export function clientIp(req: http.IncomingMessage, trustProxy: boolean): string {
+  if (trustProxy) {
+    const header = req.headers["fly-client-ip"];
+    const value = Array.isArray(header) ? header[0] : header;
+    if (typeof value === "string" && value.length > 0 && value.length <= 64) return value;
+  }
   return req.socket.remoteAddress ?? "unknown";
 }
 
@@ -101,6 +116,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   const authDeadlineMs = opts.authDeadlineMs ?? DEFAULT_AUTH_DEADLINE_MS;
   const pingIntervalMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
   const maxConnectionsPerIp = opts.maxConnectionsPerIp ?? DEFAULT_MAX_CONNECTIONS_PER_IP;
+  const trustProxyHeader = opts.trustProxyHeader ?? process.env.TRUST_PROXY === "1";
   const connectionsPerIp = new Map<string, number>();
   // 1 MiB: generous for any real envelope (a terminal frame, a tree), and
   // small enough that a single unauthenticated peer can't buffer its way
@@ -112,7 +128,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     // Counted before the handshake completes, and released on close, so a
     // flood is refused at the door rather than after it has already cost a
     // WebSocket's worth of buffers (security review H1).
-    const ip = clientIp(req);
+    const ip = clientIp(req, trustProxyHeader);
     const open = connectionsPerIp.get(ip) ?? 0;
     if (open >= maxConnectionsPerIp) { socket.destroy(); return; }
     connectionsPerIp.set(ip, open + 1);
@@ -195,9 +211,10 @@ function handleConnection(
         authedId = id;
         clearTimeout(authDeadline);
         if (role === "host") {
-          // Capped: a host is authenticated, not trusted with the relay's
-          // memory (security review H1).
-          const announced = Array.isArray(msg.allowed) ? msg.allowed.filter((d: unknown) => typeof d === "string") : [];
+          // Capped in count AND in shape: a host is authenticated, not
+          // trusted with the relay's memory (security review H1, and N3
+          // for the per-id length that made each entry unbounded).
+          const announced = Array.isArray(msg.allowed) ? peerIds(msg.allowed) : [];
           const allowed = capSet(new Set<string>(announced.slice(0, MAX_ALLOWED_DEVICES)));
           registry.registerHost(id, ws, allowed, msg.publicKey);
           registry.markSeen(id, Date.now());

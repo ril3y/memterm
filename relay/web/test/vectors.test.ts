@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { hkdfKeys, SessionKeys, pairProof, generateIdentity } from "../src/crypto.js";
+import { embedVerdict, EMBED_BLOCKED_MESSAGE } from "../src/embed.js";
 import { encodeMessage, decodeMessage, envelope, parseEnvelope } from "../src/codec.js";
 
 // Cross-language pin (decision doc 2026-09-19): this vectors file is
@@ -158,6 +159,24 @@ test("the identity private key is non-extractable and still survives a structure
     await pairProof(fromHex(vectors.pairSecretHex), restored.publicKeySPKI),
     await pairProof(fromHex(vectors.pairSecretHex), identity.publicKeySPKI)
   );
+});
+
+// -- Embedding (security re-review N2). --
+
+test("the embed guard blocks a framed window and allows a top-level one", () => {
+  const top = { self: {} } as { self: unknown; top: unknown };
+  top.top = top.self; // a top-level document: window.top IS window.self
+  assert.equal(embedVerdict(top), "ok");
+
+  // Framed: `top` is the embedder's window, a different object.
+  assert.equal(embedVerdict({ top: { embedder: true }, self: { page: true } }), "blocked");
+  // Including the shapes a hostile embedder might hope pass: null, undefined
+  // and a proxy that merely looks similar.
+  assert.equal(embedVerdict({ top: null, self: { page: true } }), "blocked");
+  assert.equal(embedVerdict({ top: undefined, self: { page: true } }), "blocked");
+  assert.equal(embedVerdict({ top: { a: 1 }, self: { a: 1 } }), "blocked");
+
+  assert.match(EMBED_BLOCKED_MESSAGE, /must not be embedded/);
 });
 
 // -- Codec: literal JSON fixtures pin the cross-language wire format. --

@@ -126,6 +126,9 @@ final class RemoteHost {
     /// it, so a `pair-request` can only ever be checked against the code
     /// the user is looking at right now. Never sent anywhere, never logged.
     private var pairingSecret: Data?
+    /// The last `web_url` complaint printed, so a live config apply does
+    /// not repeat it on every keystroke in Settings.
+    private var lastWebURLWarning: String?
     /// Generation counter: every connect attempt bumps it, and a callback
     /// from an older socket is ignored. Without it, a slow failure from a
     /// socket we already replaced would schedule a second reconnect loop.
@@ -159,6 +162,14 @@ final class RemoteHost {
     /// end-to-end leg starts on 127.0.0.1 — so the probe drives the real
     /// code path without leaving the machine.
     func applyConfig(_ config: Config) {
+        // Security re-review N1: a `web_url` the parser refused is not a
+        // typo the user should have to discover by watching a phone open
+        // the wrong page. Logged once per distinct reason, since this runs
+        // on every live config apply.
+        if let warning = config.remoteWebURLWarning, warning != lastWebURLWarning {
+            lastWebURLWarning = warning
+            log(warning)
+        }
         let url = URL(string: config.remoteRelayURL)
         let relayHost = url?.host ?? ""
         let loopback = relayHost == "127.0.0.1" || relayHost == "localhost"

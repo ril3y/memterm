@@ -5,6 +5,13 @@ primary_region = 'iad'
 [env]
   PORT = '8787'
   HOST = '0.0.0.0'
+  # Fly terminates TLS and proxies, and overwrites `fly-client-ip` with the
+  # real client address — so here, and only here, the per-IP connection cap
+  # can count that header instead of the proxy's own address. Anywhere the
+  # relay is reached directly the header is client-settable, and trusting
+  # it would let one machine hold unlimited sockets in invented buckets
+  # (security re-review N3).
+  TRUST_PROXY = '1'
 [http_service]
   internal_port = 8787
   force_https = true

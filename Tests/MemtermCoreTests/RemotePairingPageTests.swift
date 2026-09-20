@@ -89,4 +89,93 @@ final class RemotePairingPageTests: XCTestCase {
         // And an unusable relay with no web_url to rescue it.
         XCTAssertNil(RemotePairingPage.url(relay: "", webBase: "", fragment: fragment))
     }
+
+    // MARK: - Validation (security re-review N1)
+
+    /// `web_url` decides which origin a scanned code opens, and that page
+    /// is handed the pairing secret. A local process that writes a
+    /// plaintext or credential-bearing origin into config.toml must not be
+    /// able to redirect the next phone there.
+    func testCheckRejectsOriginsThatAreNeverADeliberateChoice() {
+        // Plaintext: the page, and therefore the pairing secret, is
+        // readable and rewritable by anything on the path.
+        for bad in ["http://evil.example/", "http://192.168.1.10/memterm/",
+                    "http://ril3y.github.io/memterm/"] {
+            guard case .rejected(let reason) = RemotePairingPage.check(webURL: bad) else {
+                return XCTFail("accepted \(bad)")
+            }
+            XCTAssertTrue(reason.contains("https"), reason)
+        }
+
+        // Credentials exist here mainly to make a displayed origin read as
+        // somewhere it is not.
+        for bad in ["https://ril3y.github.io@evil.example/",
+                    "https://user:pw@evil.example/"] {
+            guard case .rejected(let reason) = RemotePairingPage.check(webURL: bad) else {
+                return XCTFail("accepted \(bad)")
+            }
+            XCTAssertTrue(reason.contains("credentials"), reason)
+        }
+
+        // Neither a URL nor a host.
+        for bad in ["not a url", "/just/a/path", "ril3y.github.io/memterm/",
+                    "javascript:alert(1)", "file:///Users/me/evil.html", "data:text/html,x"] {
+            guard case .rejected = RemotePairingPage.check(webURL: bad) else {
+                return XCTFail("accepted \(bad)")
+            }
+        }
+    }
+
+    /// What must keep working: the shipped default, any https origin the
+    /// user chooses, blank (the relay serves the page), and http on
+    /// loopback, where there is no network to intercept.
+    func testCheckAcceptsHTTPSBlankAndLoopback() {
+        for good in [Config.defaultRemoteWebURL, "https://pages.example.test/client/",
+                     "HTTPS://pages.example.test/", "", "   ",
+                     "http://127.0.0.1:8787/", "http://localhost:8787/"] {
+            XCTAssertEqual(RemotePairingPage.check(webURL: good), .accepted, "rejected \(good)")
+        }
+    }
+
+    /// A rejected origin never reaches a QR code, whatever put it in the
+    /// config: validation at parse decides the value, and the URL builder
+    /// refuses independently.
+    func testARejectedOriginMintsNoCodeAndIsDroppedAtParse() {
+        XCTAssertNil(RemotePairingPage.url(relay: "wss://relay.example.test",
+                                           webBase: "http://evil.example/",
+                                           fragment: fragment))
+        XCTAssertNil(RemotePairingPage.url(relay: "wss://relay.example.test",
+                                           webBase: "https://good.example@evil.example/",
+                                           fragment: fragment))
+
+        // Config drops it in favour of the default, and says why.
+        let c = Config.parse("[remote]\nweb_url = \"http://evil.example/\"\n")
+        XCTAssertEqual(c.remoteWebURL, Config.defaultRemoteWebURL)
+        let warning = c.remoteWebURLWarning ?? ""
+        XCTAssertTrue(warning.contains("http://evil.example/"), warning)
+        XCTAssertTrue(warning.contains("ignored"), warning)
+
+        // A value that is fine passes through with nothing to report, and
+        // so does the blank self-hosted case.
+        let ok = Config.parse("[remote]\nweb_url = \"https://pages.example.test/\"\n")
+        XCTAssertEqual(ok.remoteWebURL, "https://pages.example.test/")
+        XCTAssertNil(ok.remoteWebURLWarning)
+        let blank = Config.parse("[remote]\nweb_url = \"\"\n")
+        XCTAssertEqual(blank.remoteWebURL, "")
+        XCTAssertNil(blank.remoteWebURLWarning)
+    }
+
+    /// The Settings line states the origin a code would OPEN, not what the
+    /// config file says — a blank `web_url` means the relay serves it.
+    func testDisplayOriginFollowsTheCodeRatherThanTheConfigText() {
+        XCTAssertEqual(
+            RemotePairingPage.displayOrigin(relay: "wss://memterm-relay.fly.dev",
+                                            webBase: Config.defaultRemoteWebURL),
+            "https://ril3y.github.io/memterm/")
+        XCTAssertEqual(
+            RemotePairingPage.displayOrigin(relay: "wss://relay.example.test", webBase: ""),
+            "https://relay.example.test/")
+        XCTAssertNil(RemotePairingPage.displayOrigin(relay: "wss://relay.example.test",
+                                                     webBase: "http://evil.example/"))
+    }
 }

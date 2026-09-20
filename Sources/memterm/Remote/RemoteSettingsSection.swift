@@ -21,6 +21,11 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
         target: nil, action: nil)
     private let relayField = NSTextField()
     private let statusLabel = NSTextField(labelWithString: "")
+    /// The origin a QR code would actually open (security re-review N1).
+    /// Read-only and selectable: there is nothing to edit here — `web_url`
+    /// lives in config.toml — but there is something to CHECK, and it is
+    /// the single most consequential value in this pane.
+    private let pageLabel = NSTextField(labelWithString: "")
     private let pairButton = NSButton(title: "Pair a device…", target: nil, action: nil)
     private let deviceTable = NSTableView()
     private let deviceScroll = NSScrollView()
@@ -47,6 +52,13 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
         pairButton.action = #selector(pairAction)
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
+        pageLabel.font = NSFont.systemFont(ofSize: 11)
+        pageLabel.textColor = .secondaryLabelColor
+        // Selectable so the user can copy it somewhere and compare, and
+        // truncating in the middle so a long path never hides the HOST,
+        // which is the part that matters.
+        pageLabel.isSelectable = true
+        pageLabel.lineBreakMode = .byTruncatingMiddle
         buildDeviceTable()
         attach()
     }
@@ -104,10 +116,18 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
             // JavaScript that encrypts for it. The page now comes from this
             // project's GitHub Pages site rather than the relay, so the
             // caption names the party that is actually trusted.
+            //
+            // Re-review N1: the caption no longer ASSERTS where the page
+            // comes from — it used to state the default as fact while the
+            // UI read nothing, so a `web_url` written into config.toml by
+            // another process redirected every future pairing with the
+            // Settings window still claiming GitHub. The line below states
+            // the value actually in force.
             [NSGridCell.emptyContentView,
-             caption("The relay forwards encrypted envelopes it can't read. The browser page comes from this "
-                     + "project's GitHub Pages site — whoever serves that page can read and type for a browser, "
-                     + "so set web_url to move that trust.")],
+             caption("The relay forwards encrypted envelopes it can't read. Whoever serves the browser page "
+                     + "can read and type for a browser device, so that origin — set by web_url — is who you "
+                     + "trust.")],
+            [NSGridCell.emptyContentView, pageLabel],
             [label("Status:"), statusLabel],
             [NSGridCell.emptyContentView, pairButton],
             [label("Devices:"), deviceScroll],
@@ -151,8 +171,26 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
         statusLabel.stringValue = Self.statusText(state: host.probeState,
                                                   error: host.probeLastError,
                                                   hostId: config.remoteEnabled ? host.hostId : nil)
+        pageLabel.stringValue = Self.pageText(relay: config.remoteRelayURL,
+                                              webURL: config.remoteWebURL)
         devices = host.store.devices
         deviceTable.reloadData()
+    }
+
+    /// The "Pairing page:" line (security re-review N1), as its own function
+    /// so the probe and tests can read it without an NSWindow.
+    ///
+    /// It states the origin a code would OPEN, derived the same way the QR
+    /// is, rather than repeating what the config file says — a blank
+    /// `web_url` means the relay serves the page, and that is what the user
+    /// needs to see. When no usable origin exists, "Pair a device…" mints no
+    /// code either, so the line says that instead of naming a default that
+    /// is not in force.
+    static func pageText(relay: String, webURL: String) -> String {
+        guard let origin = RemotePairingPage.displayOrigin(relay: relay, webBase: webURL) else {
+            return "Pairing page: unusable web_url — no pairing code can be shown"
+        }
+        return "Pairing page: \(origin)"
     }
 
     /// The status line, as its own function so the probe and tests can read
@@ -204,8 +242,12 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
 
         let title = NSTextField(labelWithString: "Scan this with the device you want to pair")
         title.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        // Re-review N1: the sheet used to show the image and nothing else,
+        // so the one thing worth checking before scanning — which site the
+        // code opens — was invisible at the moment it mattered.
         let caption = NSTextField(wrappingLabelWithString:
-            "Your Mac will ask before the device is allowed in. The code works once.")
+            "Your Mac will ask before the device is allowed in. The code works once.\n"
+            + "It opens \(RemotePairingPage.displayOrigin(relay: payload.relay, webBase: app.config.remoteWebURL) ?? "")")
         caption.font = NSFont.systemFont(ofSize: 11)
         caption.textColor = .secondaryLabelColor
         caption.preferredMaxLayoutWidth = 300

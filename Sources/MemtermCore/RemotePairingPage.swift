@@ -18,6 +18,74 @@ import Foundation
 /// host.
 public enum RemotePairingPage {
 
+    /// Whether a configured `web_url` may be used.
+    public enum Verdict: Equatable {
+        /// Usable as written. Blank is accepted and means the self-hosted
+        /// case: the relay serves the page as well.
+        case accepted
+        /// Ignore it and fall back to the default Pages origin. The string
+        /// says why, for a log line the user can act on.
+        case rejected(String)
+    }
+
+    /// Validates `[remote] web_url` (security re-review N1).
+    ///
+    /// This key decides which origin a scanned QR code opens, and that page
+    /// receives the pairing secret in its own fragment — so a process
+    /// running as the user that writes `web_url = "http://evil.example/"`
+    /// would point the next phone at attacker-controlled JavaScript, which
+    /// pairs legitimately and holds a shell. That is the same local
+    /// escalation the device-list seal closes, arriving through a different
+    /// door.
+    ///
+    /// Validation cannot decide whether an origin is trustworthy — only the
+    /// user can, and the effective value is shown in Settings for exactly
+    /// that reason. What it can do is refuse the shapes that are never a
+    /// deliberate choice: a plaintext origin whose page (and therefore the
+    /// pairing secret) is readable and rewritable by anything on the path,
+    /// and a URL carrying credentials, which exists mainly to make the
+    /// displayed origin read as somewhere it is not.
+    ///
+    /// `http` is allowed for loopback alone, where there is no network to
+    /// intercept, because that is how a self-hosted relay is developed
+    /// against.
+    public static func check(webURL raw: String) -> Verdict {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        // Blank is a configuration choice, not a mistake: it selects the
+        // relay's own copy of the page.
+        if trimmed.isEmpty { return .accepted }
+        guard let url = URL(string: trimmed), let host = url.host, !host.isEmpty else {
+            return .rejected("not a URL with a host")
+        }
+        guard url.user == nil, url.password == nil else {
+            return .rejected("must not carry credentials")
+        }
+        switch url.scheme?.lowercased() {
+        case "https":
+            return .accepted
+        case "http":
+            guard loopbackHosts.contains(host.lowercased()) else {
+                return .rejected("must be https (http is allowed only for \(loopbackHosts.joined(separator: " and ")))")
+            }
+            return .accepted
+        case let scheme?:
+            return .rejected("scheme \(scheme): must be https")
+        case nil:
+            return .rejected("has no scheme: must be https")
+        }
+    }
+
+    /// Where an http page is as safe as an https one, because the bytes
+    /// never touch a network.
+    static let loopbackHosts = ["127.0.0.1", "localhost"]
+
+    /// The origin a QR code would open right now, for display in Settings.
+    /// Nil when neither `web_url` nor the relay yields a usable page URL —
+    /// which is also exactly when "Pair a device…" mints no code.
+    public static func displayOrigin(relay: String, webBase: String) -> String? {
+        components(relay: relay, webBase: webBase)?.url?.absoluteString
+    }
+
     /// The page URL for a pairing code.
     ///
     /// - Parameters:
@@ -38,6 +106,12 @@ public enum RemotePairingPage {
     static func components(relay: String, webBase: String) -> URLComponents? {
         let trimmed = webBase.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty {
+            // Fails closed on anything `check` would reject (N1). Config
+            // substitutes the default long before a value reaches here, so
+            // in practice this never fires — but a QR code is the one place
+            // a bad origin becomes a phone opening it, and no code at all
+            // is the right answer if it ever does.
+            guard case .accepted = check(webURL: trimmed) else { return nil }
             guard let url = URL(string: trimmed), url.host != nil,
                   var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
             else { return nil }

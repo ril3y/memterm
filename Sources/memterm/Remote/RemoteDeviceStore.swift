@@ -192,7 +192,15 @@ final class RemoteDeviceStore {
         case .rows(let decoded):
             rows = decoded
         case .unreadable:
-            log("device list is not in a readable format; starting with no paired devices")
+            // Security re-review N5: the commonest way to land here is an
+            // UNSIGNED list written before the seal existed, which decodes
+            // as the wrong shape. Refusing it is correct — an
+            // unauthenticated file must not be trusted — but the user's
+            // devices have just silently vanished from Settings, so the
+            // line names the file and says what to do about it.
+            log("device list at \(devicesURL.path) is not in a readable format — it may predate "
+                + "the signed format added in the 2026-09-20 security fixes. Starting with no "
+                + "paired devices; pair them again from Settings ▸ Remote. The file is left in place.")
             return
         case .failedIntegrity:
             log("device list failed its integrity check; starting with no paired devices "

@@ -34,6 +34,58 @@ export function isRoutingToken(v: unknown): v is string {
 }
 
 /**
+ * A peer id is `base32(SHA-256(spki))[0..16]` in the lower-case RFC 4648
+ * alphabet (`auth.ts`), so it is always exactly 16 characters of
+ * `[a-z2-7]`. The relay computes every id it TRUSTS that way; these are
+ * the ones it merely carries.
+ *
+ * Bounding them is the second half of the memory fix (security re-review
+ * N3): entry COUNTS were capped at 64 but each string was unbounded, so
+ * inside the 1 MiB frame limit a host could announce 64 ids of ~16 KB and
+ * have them retained in both `allowed` and `watchers` — roughly 2 MiB held
+ * per host socket, with nothing to stop a fleet of them.
+ *
+ * A non-conforming id can never match a real authenticated peer anyway, so
+ * refusing it costs nothing real.
+ */
+const PEER_ID = /^[a-z2-7]{16}$/;
+
+export function isPeerId(v: unknown): v is string {
+  return typeof v === "string" && PEER_ID.test(v);
+}
+
+/**
+ * Keeps only well-formed ids from a list a peer announced.
+ *
+ * Lists are FILTERED where single-id fields are rejected outright: an
+ * allow-list is a host's whole set of devices, and dropping the entire
+ * message (closing the socket) over one malformed entry would revoke every
+ * real device it named. Filtering loses nothing, because an id that is not
+ * 16 base32 characters cannot be any peer's id.
+ */
+export function peerIds(values: unknown[]): string[] {
+  return values.filter(isPeerId);
+}
+
+/** The longest device name the relay will carry, in BYTES of UTF-8. */
+export const MAX_NAME_BYTES = 64;
+
+/**
+ * Caps a device name before it is forwarded (security re-review N3). The
+ * host sanitizes and shortens it again to 32 characters for the prompt;
+ * this is purely so the relay never holds or forwards a megabyte of it.
+ *
+ * Cutting UTF-8 at a byte boundary can split a code point, which decodes
+ * to a trailing replacement character — trimmed here so a truncated name
+ * does not end in visible garbage.
+ */
+export function capName(name: string): string {
+  const bytes = Buffer.from(name, "utf8");
+  if (bytes.length <= MAX_NAME_BYTES) return name;
+  return bytes.subarray(0, MAX_NAME_BYTES).toString("utf8").replace(/�+$/, "");
+}
+
+/**
  * Validates a parsed JSON value against the relay's post-auth message shapes.
  * Returns undefined for anything that doesn't match exactly one of them,
  * including an unrecognized `type` or a known `type` with malformed fields.
@@ -44,7 +96,10 @@ export function parseInbound(value: unknown): InboundMessage | undefined {
 
   switch (msg.type) {
     case "env":
-      if (isString(msg.to) && isString(msg.from) && isString(msg.payload)) {
+      // `to` and `from` address peers, so they must be peer ids. A single
+      // malformed one is refused rather than filtered: there is nothing
+      // left of the message without it.
+      if (isPeerId(msg.to) && isPeerId(msg.from) && isString(msg.payload)) {
         return { type: "env", to: msg.to, from: msg.from, payload: msg.payload };
       }
       return undefined;
@@ -59,17 +114,20 @@ export function parseInbound(value: unknown): InboundMessage | undefined {
       // checks it -- it cannot, it has no secret -- it only refuses to
       // carry a request that is missing one.
       if (isRoutingToken(msg.token) && isString(msg.publicKey) && isString(msg.name) && isString(msg.proof)) {
-        return { type: "pair", token: msg.token, publicKey: msg.publicKey, name: msg.name, proof: msg.proof };
+        return {
+          type: "pair", token: msg.token, publicKey: msg.publicKey,
+          name: capName(msg.name), proof: msg.proof,
+        };
       }
       return undefined;
     case "pair-answer":
-      if (isString(msg.deviceId) && typeof msg.accept === "boolean") {
+      if (isPeerId(msg.deviceId) && typeof msg.accept === "boolean") {
         return { type: "pair-answer", deviceId: msg.deviceId, accept: msg.accept };
       }
       return undefined;
     case "allowed":
-      if (Array.isArray(msg.devices) && msg.devices.every(isString)) {
-        return { type: "allowed", devices: msg.devices };
+      if (Array.isArray(msg.devices)) {
+        return { type: "allowed", devices: peerIds(msg.devices) };
       }
       return undefined;
     default:

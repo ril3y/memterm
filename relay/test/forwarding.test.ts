@@ -77,7 +77,10 @@ test("a forged from is dropped and the socket closed", async () => {
     const dev = await connectAuthed(relay.port, "client", {});
 
     const closeCode = new Promise<number>((resolve) => dev.ws.once("close", resolve));
-    dev.ws.send(JSON.stringify({ type: "env", to: host.id, from: "someone-else", payload: "AQID" }));
+    // A well-formed peer id that is simply not this socket's, so the 4003
+    // `from` check is what rejects it rather than the id-shape check
+    // (which answers 4002, and has its own test in limits.test.ts).
+    dev.ws.send(JSON.stringify({ type: "env", to: host.id, from: "zzzzzzzzzzzzzzzz", payload: "AQID" }));
     assert.equal(await closeCode, 4003);
   } finally {
     await relay.close();

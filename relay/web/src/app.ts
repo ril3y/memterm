@@ -16,6 +16,7 @@ import {
   SessionKeys,
 } from "./crypto.js";
 import { idFromPublicKey } from "../../src/auth.js";
+import { embedVerdict, EMBED_BLOCKED_MESSAGE } from "./embed.js";
 import { type RemoteMessage, type RemoteTree, encodeMessage, decodeMessage } from "./codec.js";
 import { RelayClient } from "./relay.js";
 
@@ -845,9 +846,32 @@ async function main(): Promise<void> {
   connectRelay();
 }
 
-document.getElementById("fit-btn")?.addEventListener("click", onFitClick);
-document.getElementById("back-btn")?.addEventListener("click", onBackClick);
-document.getElementById("confirm-pair-btn")?.addEventListener("click", onConfirmPairClick);
-document.getElementById("cancel-pair-btn")?.addEventListener("click", onCancelPairClick);
+/**
+ * Security re-review N2. Nothing below runs when this page is framed: no
+ * identity key is created, no pairing payload is parsed, no relay socket
+ * is opened, and the Pair button has no handler to click through. The
+ * document is replaced with a plain sentence, set as text rather than
+ * markup.
+ *
+ * A cross-origin read of `window.top` does not throw, but a throw here is
+ * treated as "framed" anyway — a gate whose only job is to refuse should
+ * fail closed.
+ */
+function embedded(): boolean {
+  try {
+    return embedVerdict({ top: window.top, self: window.self }) === "blocked";
+  } catch {
+    return true;
+  }
+}
 
-void main();
+if (embedded()) {
+  document.body.textContent = EMBED_BLOCKED_MESSAGE;
+} else {
+  document.getElementById("fit-btn")?.addEventListener("click", onFitClick);
+  document.getElementById("back-btn")?.addEventListener("click", onBackClick);
+  document.getElementById("confirm-pair-btn")?.addEventListener("click", onConfirmPairClick);
+  document.getElementById("cancel-pair-btn")?.addEventListener("click", onCancelPairClick);
+
+  void main();
+}

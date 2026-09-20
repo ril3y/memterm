@@ -18,8 +18,11 @@
 
   When both apply (the relay serving this file) the browser enforces the
   intersection, and the two agree: every source this meta allows is one the
-  header allows too. `X-Content-Type-Options` and HSTS stay header-only —
-  neither has a meta form that browsers honour.
+  header allows too. `X-Content-Type-Options`, HSTS and `frame-ancestors`
+  stay header-only — none has a meta form that browsers honour, which is
+  why `src/embed.ts` refuses to run this page inside a frame at all
+  (security re-review N2). The relay's header adds `frame-ancestors 'none'`
+  on top of that.
 -->
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'self'; connect-src wss: ws:; img-src 'self' data:; style-src 'self' 'unsafe-inline'">

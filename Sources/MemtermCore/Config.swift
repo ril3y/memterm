@@ -147,6 +147,12 @@ public struct Config {
     /// any other static host holding a copy of `relay/web`.
     public static let defaultRemoteWebURL = "https://ril3y.github.io/memterm/"
     public var remoteWebURL = Config.defaultRemoteWebURL
+    /// Why a `web_url` in the file was ignored, if one was (security
+    /// re-review N1). Set by `parse`, never written back to the file, and
+    /// logged once by the remote host — the parser stays pure, and the user
+    /// still finds out rather than silently pairing against the default
+    /// while their config says otherwise.
+    public var remoteWebURLWarning: String?
 
     public init() {}
 
@@ -263,7 +269,21 @@ public struct Config {
         // Unlike relay_url, empty is MEANINGFUL here: it means "the relay
         // serves the page as well", the self-hosted case — so a blank value
         // is kept rather than replaced by the Pages default.
-        if let s = string(values["remote.web_url"]) { c.remoteWebURL = s }
+        //
+        // Anything else is validated (security re-review N1): this key
+        // decides which origin a scanned QR opens, and that page is handed
+        // the pairing secret, so a plaintext or credential-bearing origin
+        // is ignored in favour of the default rather than honoured.
+        if let s = string(values["remote.web_url"]) {
+            switch RemotePairingPage.check(webURL: s) {
+            case .accepted:
+                c.remoteWebURL = s
+            case .rejected(let reason):
+                c.remoteWebURL = defaultRemoteWebURL
+                c.remoteWebURLWarning =
+                    "[remote] web_url \"\(s)\" ignored — \(reason). Using \(defaultRemoteWebURL)"
+            }
+        }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
         // Numeric knobs clamp into their sane range (a hand-typed 3.0 line
