@@ -185,14 +185,18 @@ probe() {  # probe <label> <mode> <configfile> <statedir(optional)> [visible]
 # fresh world, default config (quiet). The serial legs inside every probe
 # pass run against a pty pair (never /dev/cu.*) — the MEMTERM_SERIAL_PROBE_PTY
 # stand-in convention's harness-owned twin.
-probe "fresh-default" fresh "$CFGDIR/default.toml"
 # Task 12: real local relay + headless Swift device client, end to end.
-# Strict on a node-having machine; a node-less one gets the leg's own loud
-# skip instead (never a silent pass either way).
+# The leg is opt-in by environment (controller ruling, 2026-09-20): its own
+# relay-spin-up + pair/attach/echo/resize/kill/restart/revoke cycle is real
+# per-invocation weight, so MEMTERM_PROBE_REMOTE=1 is set for exactly ONE
+# fresh-mode probe invocation — this one — never for the config-matrix
+# variants below. Strict on a node-having machine; a node-less one gets the
+# leg's own loud skip instead (never a silent pass either way).
+MEMTERM_PROBE_REMOTE=1 probe "fresh-default" fresh "$CFGDIR/default.toml"
 if [ "$NODE_PRESENT" = "1" ]; then
     check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true"
 else
-    check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-SKIP step=remote-end-to-end reason="
+    check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-SKIP step=remote-end-to-end reason=node not on PATH"
 fi
 
 # restored world: seeded from a REAL --smoke=save capture, restored through
@@ -239,8 +243,17 @@ check "matrix-nobar-skips-chipclick" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP
 check "matrix-nobar-skips-hierarchy" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-pill-hierarchy reason=workspace_bar=false"
 # Appearance › Size scales the chrome (founder bug 2026-09-09): the leg
 # must MEASURE a grown pill, never pass vacuously.
-check "fresh-default-chrome-scales" "$LOG/probe-fresh-default.log" "UIPROBE-CHROME-SCALE size=20 tab_font=11.0->17.0 "
+# Controller ruling (2026-09-20, Task 12): `bigSize` is a Double, so the
+# probe prints "size=20.0", not "size=20" — this sentinel has been wrong
+# since the 2026-09-09 ChromeMetrics commit (CI never runs verify.sh, so
+# nothing caught it). Fixed to match the probe's real output, per ruling —
+# the Swift print itself is untouched.
+check "fresh-default-chrome-scales" "$LOG/probe-fresh-default.log" "UIPROBE-CHROME-SCALE size=20.0 tab_font=11.0->17.0 "
 probe "matrix-light"   fresh "$CFGDIR/light.toml"
+# The opt-in gate itself, measured: every OTHER fresh-mode probe leaves
+# MEMTERM_PROBE_REMOTE unset and must self-skip rather than repeat the
+# fresh-default leg's relay cycle.
+check "matrix-light-remote-skips" "$LOG/probe-matrix-light.log" "UIPROBE-SKIP step=remote-end-to-end reason=MEMTERM_PROBE_REMOTE=unset"
 probe "matrix-dark"    fresh "$CFGDIR/dark.toml"
 
 # ONE visible pixel pass (founder-like config): on-screen windows, real

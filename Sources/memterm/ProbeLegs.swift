@@ -980,7 +980,11 @@ extension MemtermAppDelegate {
         // Task 12: real local relay + a headless Swift device client end to
         // end. Fresh-mode only — it dials a loopback relay of its own and
         // tears remote back off when it's done, which a restored/observe
-        // world's shared manifest has no business repeating.
+        // world's shared manifest has no business repeating. Further
+        // gated on MEMTERM_PROBE_REMOTE=1 inside addRemoteSteps itself so
+        // the leg's own real weight (a spawned relay, a live pairing, an
+        // echo round trip) runs once per verify.sh pass, not once per
+        // fresh-mode config variant.
         if mode == "fresh" { addRemoteSteps(probe) }
         // Quake-style drop-down legs: before the archive legs (which wipe
         // the probe state dir last by design).
@@ -3309,6 +3313,17 @@ extension MemtermAppDelegate {
     // machine without Node still gets a green run rather than a false one.
 
     private func addRemoteSteps(_ probe: ProbeRunner) {
+        // Opt-in by environment (controller ruling, 2026-09-20): every
+        // fresh-mode probe invocation shares this same buildProbeSteps
+        // call, and this leg's own full relay+client cycle is real
+        // per-invocation weight (a spawned node process, a live pairing,
+        // an echo round trip) that only needs to run once per verify.sh
+        // pass, not once per config variant. verify.sh sets this only on
+        // the fresh-default invocation.
+        guard ProcessInfo.processInfo.environment["MEMTERM_PROBE_REMOTE"] == "1" else {
+            probe.skipLine(step: "remote-end-to-end", reason: "MEMTERM_PROBE_REMOTE=unset")
+            return
+        }
         guard let nodePath = Self.findNode() else {
             probe.skipLine(step: "remote-end-to-end", reason: "node not on PATH")
             return
