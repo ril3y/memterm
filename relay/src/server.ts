@@ -7,8 +7,28 @@ import { verifyAuth, idFromPublicKey, randomNonce } from "./auth.js";
 import { parseInbound, type EnvMessage } from "./envelope.js";
 
 const PAIRING_TTL_MS = 120_000;
+/// Final-review Important 5: this is a public endpoint on a 512 MB
+/// shared-cpu-1x Fly machine, so an unauthenticated socket must not be able
+/// to sit forever, and a peer whose TCP connection died silently (the mini
+/// asleep, a phone backgrounded) must eventually be noticed and its
+/// watchers told `offline` rather than kept "online" against a socket
+/// nobody is reading.
+const DEFAULT_AUTH_DEADLINE_MS = 10_000;
+const DEFAULT_PING_INTERVAL_MS = 30_000;
 
-export interface RelayOptions { port: number; webRoot: string }
+export interface RelayOptions {
+  port: number;
+  webRoot: string;
+  /** A socket that hasn't completed the auth handshake within this many ms
+   *  is terminated. Tests set this to tens of ms; production uses the
+   *  default. */
+  authDeadlineMs?: number;
+  /** How often an authenticated peer is pinged; a peer that misses two
+   *  consecutive pongs is terminated, which fires the normal close-handler
+   *  cleanup (a host's watchers get `offline`). Tests set this to tens of
+   *  ms; production uses the default. */
+  pingIntervalMs?: number;
+}
 export interface RunningRelay { port: number; close(): Promise<void>; registry: Registry }
 
 function b64(bytes: Uint8Array): string { return Buffer.from(bytes).toString("base64"); }
@@ -30,14 +50,19 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     } catch { res.writeHead(404); res.end("not found"); }
   });
   const registry = new Registry();
-  const wss = new WebSocketServer({ noServer: true });
+  const authDeadlineMs = opts.authDeadlineMs ?? DEFAULT_AUTH_DEADLINE_MS;
+  const pingIntervalMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+  // 1 MiB: generous for any real envelope (a terminal frame, a tree), and
+  // small enough that a single unauthenticated peer can't buffer its way
+  // to the `ws` default of 100 MiB on a 512 MB machine.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://relay");
     if (url.pathname !== "/host" && url.pathname !== "/client") { socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, url.pathname));
   });
   wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, pathname: string) => {
-    handleConnection(ws, pathname === "/host" ? "host" : "client", registry);
+    handleConnection(ws, pathname === "/host" ? "host" : "client", registry, authDeadlineMs, pingIntervalMs);
   });
   await new Promise<void>((r) => server.listen(opts.port, process.env.HOST ?? "127.0.0.1", r));
   const address = server.address();
@@ -57,10 +82,32 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   };
 }
 
-function handleConnection(ws: WebSocket, role: "host" | "client", registry: Registry): void {
+function handleConnection(
+  ws: WebSocket,
+  role: "host" | "client",
+  registry: Registry,
+  authDeadlineMs: number,
+  pingIntervalMs: number
+): void {
   const nonce = randomNonce();
   let authedId: string | undefined;
+  // A protocol-level error (a frame over maxPayload, a malformed frame) is
+  // an `error` event on the socket; `ws` already closes the connection with
+  // the appropriate code on its own (1009 for maxPayload) — the listener's
+  // only job is to exist, since Node re-throws an `error` event with no
+  // listener as an uncaught exception, which is what turns "the socket
+  // closes" into "the whole relay process crashes" the moment maxPayload is
+  // enforced against a hostile peer.
+  ws.on("error", () => {});
   ws.send(JSON.stringify({ type: "challenge", nonce: b64(nonce) }));
+
+  // A socket that never answers the challenge (or never connects at all
+  // past the TCP handshake) would otherwise sit here forever — the relay
+  // sent a challenge and is waiting, with nothing else timing it out.
+  const authDeadline = setTimeout(() => {
+    if (!authedId) ws.terminate();
+  }, authDeadlineMs);
+  let stopHeartbeat: (() => void) | undefined;
 
   ws.once("message", (raw: Buffer) => {
     void (async () => {
@@ -76,6 +123,7 @@ function handleConnection(ws: WebSocket, role: "host" | "client", registry: Regi
         if (!ok) { ws.close(4001, "auth"); return; }
         const id = await idFromPublicKey(spki);
         authedId = id;
+        clearTimeout(authDeadline);
         if (role === "host") {
           const allowed = new Set<string>(Array.isArray(msg.allowed) ? msg.allowed : []);
           registry.registerHost(id, ws, allowed, msg.publicKey);
@@ -88,6 +136,7 @@ function handleConnection(ws: WebSocket, role: "host" | "client", registry: Regi
           registry.registerClient(id, ws);
           ws.send(JSON.stringify({ type: "authed", id }));
         }
+        stopHeartbeat = startHeartbeat(ws, pingIntervalMs);
         ws.on("message", (raw2: Buffer) => handlePeerMessage(raw2, role, id, ws, registry));
       } catch {
         ws.close(4001, "auth");
@@ -96,6 +145,8 @@ function handleConnection(ws: WebSocket, role: "host" | "client", registry: Regi
   });
 
   ws.once("close", () => {
+    clearTimeout(authDeadline);
+    stopHeartbeat?.();
     if (!authedId) return;
     if (role === "host") {
       const lastSeen = registry.lastSeen(authedId) ?? Date.now();
@@ -108,6 +159,34 @@ function handleConnection(ws: WebSocket, role: "host" | "client", registry: Regi
       registry.unregisterClient(authedId);
     }
   });
+}
+
+/**
+ * Standard `ws` heartbeat: pings every `pingIntervalMs` and expects a pong
+ * before the NEXT ping goes out. Two consecutive unanswered pings (the
+ * connection has been silent for roughly two full intervals) terminate the
+ * socket, which fires the normal `close` handler above — a dead host's
+ * watchers get `offline` instead of the relay holding it "online" against a
+ * TCP connection nobody is reading (the mini asleep, a phone backgrounded).
+ * Returns a function that stops the heartbeat (called on `close`).
+ */
+function startHeartbeat(ws: WebSocket, pingIntervalMs: number): () => void {
+  let unanswered = 0;
+  const onPong = () => { unanswered = 0; };
+  ws.on("pong", onPong);
+  const timer = setInterval(() => {
+    if (unanswered >= 2) {
+      clearInterval(timer);
+      ws.terminate();
+      return;
+    }
+    unanswered++;
+    try { ws.ping(); } catch { /* socket already closing */ }
+  }, pingIntervalMs);
+  return () => {
+    clearInterval(timer);
+    ws.off("pong", onPong);
+  };
 }
 
 function handlePeerMessage(raw: Buffer, role: "host" | "client", id: string, ws: WebSocket, registry: Registry): void {
