@@ -3364,6 +3364,11 @@ extension MemtermAppDelegate {
         var pairingPayload: PairingPayload?
         var incomingPairName: String?
         var pane: PaneView?
+        var closePane: PaneView?
+        var closeProbeController: TerminalWindowController?
+        var screenCountBeforeCloseAttach = 0
+        var treeChangedCountBeforeClose = 0
+        var closePrunesVerified = false
 
         // Plan-mandated teardown (review round 1, 2026-09-20): a probe
         // failure anywhere in this leg routes straight to ProbeRunner.fail()
@@ -3507,6 +3512,77 @@ extension MemtermAppDelegate {
             onFailure: { tearDownRemoteLeg() }))
 
         probe.add(ProbeStep(
+            // Final-review Important 1: split off a THROWAWAY pane (never
+            // touching the shared tab `pane` points at, which later legs —
+            // dropdown, forget-everything — still need intact) so the close
+            // test below exercises the real split-pane close(pane:) path.
+            name: "remote-close-split", timeout: 8,
+            action: { [self] in
+                guard let controller = keyHost()?.selectedTab else { return }
+                closeProbeController = controller
+                let before = controller.allPanes()
+                controller.splitCurrentPane(vertical: false)
+                let after = controller.allPanes()
+                closePane = after.first { p in !before.contains { $0 === p } }
+            },
+            condition: { closePane?.process?.running == true },
+            assert: {
+                guard closePane != nil else { throw ProbeFailure("split for remote-close leg produced no new pane") }
+            },
+            onFailure: { tearDownRemoteLeg() }))
+
+        probe.add(ProbeStep(
+            name: "remote-close-attach", timeout: 10,
+            action: {
+                guard let closePane else { return }
+                screenCountBeforeCloseAttach = client.screenCount
+                client.send(.attach(paneId: closePane.paneId))
+            },
+            condition: { client.screenCount > screenCountBeforeCloseAttach },
+            assert: {
+                guard client.screenCount > screenCountBeforeCloseAttach else {
+                    throw ProbeFailure("client never got a screen for the throwaway split pane")
+                }
+            },
+            onFailure: { tearDownRemoteLeg() }))
+
+        probe.add(ProbeStep(
+            // Closing the attached pane LOCALLY (the way a user's ✕ or ⌘W
+            // would) must reach the phone as a tree-changed —
+            // TerminalWindowController.close(pane:) and
+            // MemtermAppDelegate.controllerClosed now both call
+            // app.refreshWorkspaceChips(), which broadcasts and prunes.
+            name: "remote-close-prunes", timeout: 10,
+            action: {
+                guard let target = closePane, let controller = closeProbeController else { return }
+                treeChangedCountBeforeClose = client.treeChangedCount
+                controller.close(pane: target)
+            },
+            condition: { client.treeChangedCount > treeChangedCountBeforeClose },
+            assert: {
+                guard client.treeChangedCount > treeChangedCountBeforeClose else {
+                    throw ProbeFailure("closing the attached pane locally never produced a tree-changed for the client")
+                }
+                // pruneClosedPanes() (run from broadcastTreeChanged) should
+                // have cleared this session's attachedPaneId; the next input
+                // must come back refused, not vanish into a dead pty.
+                client.send(.input(Data("after-close\r".utf8)))
+            },
+            onFailure: { tearDownRemoteLeg() }))
+
+        probe.add(ProbeStep(
+            name: "remote-close-refuses-input", timeout: 10,
+            action: {},
+            condition: { client.lastRefusedReason != nil },
+            assert: {
+                guard client.lastRefusedReason == "unknown-pane" else {
+                    throw ProbeFailure("post-close input got reason=\(client.lastRefusedReason ?? "nil"), want unknown-pane")
+                }
+                closePrunesVerified = true
+            },
+            onFailure: { tearDownRemoteLeg() }))
+
+        probe.add(ProbeStep(
             name: "remote-relay-kill", timeout: 10,
             action: {
                 relay.terminate()
@@ -3554,7 +3630,7 @@ extension MemtermAppDelegate {
                 guard client.lastRefusedReason == "not-allowed" else {
                     throw ProbeFailure("post-revoke envelope got reason=\(client.lastRefusedReason ?? "nil"), want not-allowed")
                 }
-                print("UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true")
+                print("UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true close_prunes=\(closePrunesVerified)")
                 tearDownRemoteLeg()
             },
             onFailure: { tearDownRemoteLeg() }))

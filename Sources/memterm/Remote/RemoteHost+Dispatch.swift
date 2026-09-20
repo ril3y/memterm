@@ -36,7 +36,16 @@ extension RemoteHost {
             detach(session: session)
 
         case .input(let bytes):
-            guard let paneId = session.attachedPaneId else { return }
+            // Remote attach (final-review Important 1): a pane that was
+            // pruned out from under this session (closed locally, then
+            // pruneClosedPanes() cleared attachedPaneId on the next
+            // broadcastTreeChanged()) must tell the device so, not just go
+            // quiet — the client already saw tree-changed and a still-firing
+            // input deserves an explicit answer rather than silence.
+            guard let paneId = session.attachedPaneId else {
+                send(.refused(reason: "unknown-pane"), to: session.deviceId)
+                return
+            }
             streams[paneId]?.input(bytes)
 
         case .resize(let cols, let rows):

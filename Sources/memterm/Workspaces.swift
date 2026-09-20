@@ -696,10 +696,13 @@ extension MemtermAppDelegate {
             host.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId,
                                     activity: activity)
         }
-        // Remote attach: this already runs on every topology change the local
-        // chrome reacts to (new tab, close, park, switch, rename), so it is
-        // the one place a remote viewer's tree can be kept honest without a
-        // second set of hooks. No-op when nothing is attached.
+        // Remote attach: this runs on every topology change the local chrome
+        // reacts to (new tab, park, switch, rename, and — since final-review
+        // Important 1 — close, via TerminalWindowController.close(pane:) and
+        // MemtermAppDelegate.controllerClosed calling refreshWorkspaceChips()
+        // directly), so it is the one place a remote viewer's tree can be
+        // kept honest without a second set of hooks. No-op when nothing is
+        // attached.
         remote.broadcastTreeChanged()
     }
 

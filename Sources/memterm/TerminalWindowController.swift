@@ -915,6 +915,11 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             next.needsDisplay = true
         }
         app.memory?.scheduleTopologySave()
+        // Remote attach (final-review Important 1): a split-pane close never
+        // goes through controllerClosed, so it needs its own tree refresh —
+        // otherwise a phone attached to the closed pane never sees
+        // tree-changed and pruneClosedPanes() never runs.
+        app.refreshWorkspaceChips()
     }
 
     private func replace(_ old: NSView, with new: NSView) {

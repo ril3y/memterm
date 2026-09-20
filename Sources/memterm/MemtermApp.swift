@@ -608,6 +608,10 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 
     func controllerClosed(_ controller: TerminalWindowController) {
         controllers.removeAll { $0 === controller }
+        // Remote attach (final-review Important 1): a whole-tab/window close
+        // exits here without ever touching refreshWorkspaceChips(), so a
+        // remote viewer's tree goes stale and pruneClosedPanes() never runs.
+        refreshWorkspaceChips()
     }
 
     /// Registers an externally-constructed tab (probe fixtures — e.g. the

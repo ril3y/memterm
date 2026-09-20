@@ -38,6 +38,14 @@ final class RemoteProbeClient {
     private(set) var receivedOutput = Data()
     private(set) var lastResized: (cols: Int, rows: Int)?
     private(set) var lastRefusedReason: String?
+    /// Bumped on every `treeChanged` envelope; the remote-close-prunes probe
+    /// step snapshots this before closing a pane and polls for it to move.
+    private(set) var treeChangedCount = 0
+    /// Bumped on every `screen` envelope (a fresh attach's initial frame) —
+    /// a monotonic signal the remote-close-prunes leg can wait on instead of
+    /// comparing screen dimensions, which a second pane could coincidentally
+    /// share with the first.
+    private(set) var screenCount = 0
 
     // MARK: - Connection
 
@@ -157,10 +165,13 @@ final class RemoteProbeClient {
         else { return }
         switch message {
         case .tree(let tree): lastTree = tree
-        case .screen(let cols, let rows, let bytes): lastScreen = (cols, rows, bytes)
+        case .screen(let cols, let rows, let bytes):
+            lastScreen = (cols, rows, bytes)
+            screenCount += 1
         case .output(let bytes): receivedOutput.append(bytes)
         case .resized(let cols, let rows): lastResized = (cols, rows)
         case .refused(let reason): lastRefusedReason = reason
+        case .treeChanged: treeChangedCount += 1
         default: break
         }
     }
