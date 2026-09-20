@@ -42,6 +42,40 @@ test("every response carries the security headers", async () => {
   }
 });
 
+// Security review C1: the browser page is served from GitHub Pages by
+// default now, and Pages cannot set response headers — so the policy also
+// travels inside the document. The relay still serves the same file for
+// self-hosters, which means both apply at once. Both being present is
+// correct: the browser enforces the intersection, and every source the meta
+// admits is one the header admits too, so nothing the page needs is lost.
+test("the served index carries the CSP meta as well as the CSP header", async () => {
+  const relay = await startRelay({ port: 0, webRoot: new URL("../web", import.meta.url).pathname });
+  try {
+    const res = await fetch(`http://127.0.0.1:${relay.port}/`);
+    const header = res.headers.get("content-security-policy");
+    assert.ok(header, "no CSP header on the served index");
+    const html = await res.text();
+    const meta = /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"/.exec(html);
+    assert.ok(meta, "no CSP meta in the served index");
+    const policy = meta![1];
+    assert.match(policy, /default-src 'self'/);
+    // Scheme-based, not 'self': the relay origin is unknown when the page is
+    // built, and on Pages it is not the page's own origin either way.
+    assert.match(policy, /connect-src wss: ws:/);
+    assert.match(policy, /img-src 'self' data:/);
+    assert.match(policy, /style-src 'self' 'unsafe-inline'/);
+    // nosniff and HSTS have no meta form browsers honour; they stay headers.
+    assert.doesNotMatch(html, /http-equiv="X-Content-Type-Options"/i);
+    assert.doesNotMatch(html, /http-equiv="Strict-Transport-Security"/i);
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    // The two policies must not contradict: everything the meta allows for
+    // connect-src is inside what the header allows.
+    assert.match(header!, /connect-src 'self' wss: ws:/);
+  } finally {
+    await relay.close();
+  }
+});
+
 function b64(bytes: Uint8Array): string { return Buffer.from(bytes).toString("base64"); }
 
 test("a host that answers the challenge with a valid signature is authed and registered", async () => {

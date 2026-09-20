@@ -3,6 +3,26 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!--
+  The relay sends this same policy as a header (relay/src/server.ts), but
+  GitHub Pages — which is where this page is served from by default
+  (security review C1) — cannot set response headers at all, so the policy
+  has to travel inside the document.
+
+  It is the relay's header policy minus `'self'` on `connect-src`: the page
+  origin is no longer the relay's, and the relay's origin is not known when
+  this file is built, so the WebSocket endpoint is admitted by SCHEME.
+  `ws:` stays for a self-hosted relay reached over loopback http — from an
+  https page a ws: connection is blocked as mixed content regardless, so it
+  buys an attacker nothing here.
+
+  When both apply (the relay serving this file) the browser enforces the
+  intersection, and the two agree: every source this meta allows is one the
+  header allows too. `X-Content-Type-Options` and HSTS stay header-only —
+  neither has a meta form that browsers honour.
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src wss: ws:; img-src 'self' data:; style-src 'self' 'unsafe-inline'">
 <title>memterm remote</title>
 <link rel="stylesheet" href="./xterm.css">
 <style>
@@ -148,9 +168,12 @@
 </section>
 
 <section id="view-pairing" hidden>
-  <p>Waiting for the host to accept…</p>
-  <p>This device: <code id="pairing-device-id"></code></p>
-  <p>The Mac will show the same key in its “Allow?” prompt. If it shows anything else, don't allow it.</p>
+  <div id="pairing-wait">
+    <p>Waiting for the host to accept…</p>
+    <p>This device: <code id="pairing-device-id"></code></p>
+    <p>The Mac will show the same key in its “Allow?” prompt. If it shows anything else, don't allow it.</p>
+  </div>
+  <p id="pairing-refusal" hidden></p>
 </section>
 
 <section id="view-tree" hidden>

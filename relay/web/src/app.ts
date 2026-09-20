@@ -27,6 +27,14 @@ const STORE_NAME = "keys";
 interface StoredHost {
   hostId: string;
   hostPublicKey: Uint8Array;
+  /**
+   * The relay URL the pairing QR named, so a reload dials the same relay
+   * instead of guessing from the page origin. Absent on a browser paired
+   * before the page moved off the relay (security review C1) -- and such a
+   * browser was, by construction, served BY its relay, which is exactly the
+   * case where the page-origin derivation is the right answer.
+   */
+  relay?: string;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -139,9 +147,49 @@ function deviceName(): string {
   return "Browser";
 }
 
+/**
+ * The relay derived from this page's own origin -- what this client used
+ * before the page moved to GitHub Pages. Only a fallback now; see
+ * `desiredRelayUrl`.
+ */
 function relayWsUrl(): string {
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   return `${scheme}//${location.host}`;
+}
+
+/**
+ * The relay a pairing payload names, normalized -- or undefined when it is
+ * not a URL this page may dial.
+ *
+ * The page is no longer served by the relay (GitHub Pages by default,
+ * security review C1), so the QR's `relay` field is the only thing that
+ * says where to connect. That makes it attacker-reachable input: a link can
+ * name any URL at all. `wss:` is therefore required, so the transport is
+ * always encrypted and authenticated by a public CA. `ws:` is admitted only
+ * when this page is itself http -- a self-hosted relay on loopback during
+ * development -- and never from an https page, where the browser would
+ * refuse it as mixed content anyway.
+ */
+function validRelayUrl(raw: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return undefined;
+  }
+  if (!url.host) return undefined;
+  if (url.protocol === "wss:") return url.toString();
+  if (url.protocol === "ws:" && location.protocol !== "https:") return url.toString();
+  return undefined;
+}
+
+/** The host:port a relay URL names, for the confirmation text. */
+function relayHostLabel(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
 }
 
 // -- Module state. One page, one connection, one attached pane at a time. --
@@ -160,6 +208,8 @@ let pendingPairing: PairingPayload | undefined;
  */
 let awaitingConfirm: PairingPayload | undefined;
 let relay: RelayClient | undefined;
+/** The URL `relay` was constructed with, so a changed target is noticed. */
+let relayUrl: string | undefined;
 let relayAuthed = false;
 
 interface PendingHandshake {
@@ -197,6 +247,29 @@ function showView(name: ViewName): void {
   for (const v of VIEWS) {
     const el = document.getElementById(`view-${v}`);
     if (el) el.hidden = v !== name;
+  }
+  // The pairing view has two faces -- waiting, and a refusal. Anything that
+  // is not `showPairingRefusal` gets the waiting one.
+  const wait = document.getElementById("pairing-wait");
+  const refusal = document.getElementById("pairing-refusal");
+  if (wait) wait.hidden = false;
+  if (refusal) refusal.hidden = true;
+}
+
+/**
+ * The pairing view, saying why this code was not acted on. Used when the
+ * code names a relay this page will not dial: the page no longer lives on
+ * the relay, so `relay` is now attacker-reachable input and a refusal has
+ * to be visible rather than a socket that silently never connects.
+ */
+function showPairingRefusal(text: string): void {
+  showView("pairing");
+  const wait = document.getElementById("pairing-wait");
+  const refusal = document.getElementById("pairing-refusal");
+  if (wait) wait.hidden = true;
+  if (refusal) {
+    refusal.textContent = text;
+    refusal.hidden = false;
   }
 }
 
@@ -504,16 +577,21 @@ function showIdleView(): void {
  * browser is already paired with -- the case that turns a link someone
  * sent you into a terminal tree you might type secrets into.
  */
-function showConfirmPair(payload: PairingPayload): void {
+function showConfirmPair(payload: PairingPayload, relayTarget: string): void {
   const text = document.getElementById("confirm-pair-text");
   if (text) {
+    // The relay host is named here because the page no longer comes from
+    // the relay: the code now decides what this browser dials, so what it
+    // decided has to be on screen before anything is sent.
+    const through = `This browser will connect through the relay ${relayHostLabel(relayTarget)}.`;
     text.textContent =
       host && host.hostId !== payload.hostId
         ? `This code pairs this browser with the Mac ${payload.hostId}, replacing ${host.hostId}. ` +
-          `You will no longer see ${host.hostId}'s sessions here. Only continue if you are looking at that Mac's screen.`
+          `You will no longer see ${host.hostId}'s sessions here. ${through} ` +
+          `Only continue if you are looking at that Mac's screen.`
         : `This code pairs this browser with the Mac ${payload.hostId}. ` +
           `It will be able to show you that Mac's terminal sessions, and what you type here goes into them. ` +
-          `Only continue if you are looking at that Mac's screen.`;
+          `${through} Only continue if you are looking at that Mac's screen.`;
   }
   showView("confirm-pair");
 }
@@ -546,6 +624,10 @@ function onConfirmPairClick(): void {
   awaitingConfirm = undefined;
   clearPairingHash();
   showView("pairing");
+  // The code may name a different relay from the one we are on (a first
+  // pairing on the Pages site connects to nothing until now, and a re-pair
+  // can move this browser to another relay entirely).
+  connectRelay();
   if (relayAuthed) void sendPair();
 }
 
@@ -554,6 +636,8 @@ function onCancelPairClick(): void {
   pendingPairing = undefined;
   clearPairingHash();
   showIdleView();
+  // Back to the stored host's relay if the abandoned code had moved us.
+  connectRelay();
 }
 
 async function onPaired(hostId: string, hostPublicKeyB64: string): Promise<void> {
@@ -574,7 +658,10 @@ async function onPaired(hostId: string, hostPublicKeyB64: string): Promise<void>
     showView("not-paired");
     return;
   }
-  host = { hostId, hostPublicKey };
+  // `relayUrl` is the relay this pairing actually happened over, which is
+  // the payload's own (validated) `relay` -- store it so a reload dials the
+  // same one rather than the page origin, which is GitHub Pages now.
+  host = { hostId, hostPublicKey, relay: relayUrl };
   await idbPut(db, "host", host);
   pendingPairing = undefined;
   clearPairingHash();
@@ -598,6 +685,115 @@ function showStartupError(err: unknown): void {
   console.error("memterm remote: startup failed", err);
 }
 
+/**
+ * Which relay this page should be talking to right now.
+ *
+ * A pairing in hand wins: its payload is the only thing that knows where
+ * the Mac that minted the code is connected. Otherwise the relay stored
+ * with the paired host. The page-origin derivation is the last resort, and
+ * only reachable for a host stored before this client learned to remember
+ * a relay -- a browser that was, necessarily, served by that very relay.
+ * Undefined means there is nothing to dial yet (an unpaired browser on a
+ * static host), and no socket is opened at all.
+ */
+function desiredRelayUrl(): string | undefined {
+  // Deliberately `pendingPairing`, not `awaitingConfirm`: a code that has
+  // only been opened, not confirmed, must not get this browser to announce
+  // itself to the relay it names. Nothing reaches that relay until the
+  // person has read the confirmation and pressed Pair.
+  if (pendingPairing) {
+    const fromPayload = validRelayUrl(pendingPairing.relay);
+    if (fromPayload) return fromPayload;
+  }
+  if (host?.relay) return host.relay;
+  if (host) return relayWsUrl();
+  return undefined;
+}
+
+/**
+ * Opens (or re-points) the relay socket to `desiredRelayUrl()`. A no-op
+ * when the live client is already on the right URL, so the reconnect logic
+ * inside `RelayClient` is never disturbed for nothing.
+ */
+function connectRelay(): void {
+  const want = desiredRelayUrl();
+  if (want === undefined || (relay !== undefined && relayUrl === want)) return;
+
+  if (relay) {
+    // Moving to another relay: everything derived from the old socket --
+    // the session keys, the auth state, a live terminal -- belongs to it.
+    const old = relay;
+    relay = undefined;
+    old.close();
+  }
+  relayAuthed = false;
+  dropSession();
+  relayUrl = want;
+
+  const client: RelayClient = new RelayClient(want, identity, {
+    onAuthed: () => {
+      if (relay !== client) return; // a superseded socket still winding down
+      relayAuthed = true;
+      relayUnreachable = false;
+      recomputeBanner();
+      if (pendingPairing) {
+        void sendPair();
+      } else if (host) {
+        void startSession();
+      }
+    },
+    onPaired: (hostId, hostPublicKeyB64) => {
+      if (relay !== client) return;
+      void onPaired(hostId, hostPublicKeyB64);
+    },
+    onPairDenied: (reason) => {
+      if (relay !== client) return;
+      if (!pendingPairing) return; // not pairing: the relay is talking out of turn
+      pendingPairing = undefined;
+      showToast(`Pairing was declined (${reason})`);
+      showIdleView();
+    },
+    onOnline: (hostId) => {
+      if (relay !== client) return;
+      if (!host || hostId !== host.hostId) return;
+      hostOfflineSince = undefined;
+      recomputeBanner();
+      updateTreeDisabled();
+      void startSession();
+    },
+    onOffline: (hostId, lastSeenMs) => {
+      if (relay !== client) return;
+      if (!host || hostId !== host.hostId) return;
+      dropSession(); // the host is gone; keeps lastAttachedPaneId for recovery
+      hostOfflineSince = lastSeenMs;
+      recomputeBanner();
+      updateTreeDisabled();
+    },
+    onRefused: (reason) => {
+      if (relay !== client) return;
+      showToast(reason);
+    },
+    onEnvelope: (from, payload) => {
+      if (relay !== client) return;
+      void handleEnvelope(from, payload);
+    },
+    onDisconnected: () => {
+      if (relay !== client) return; // we closed it on purpose; not an outage
+      relayAuthed = false;
+      relayUnreachable = true;
+      // The socket is gone, so whatever session was live over it is dead
+      // too: don't leave a live terminal pointed at it (keystrokes would
+      // silently no-op) -- onAuthed's re-handshake on reconnect will re-list
+      // and, via startSession()'s own leaveTerminal(), the tree handler's
+      // re-attach branch will pick lastAttachedPaneId back up.
+      if (term) leaveTerminal();
+      recomputeBanner();
+    },
+  });
+  relay = client;
+  client.connect();
+}
+
 async function main(): Promise<void> {
   try {
     db = await openDb();
@@ -616,16 +812,29 @@ async function main(): Promise<void> {
   if (deviceIdEl) deviceIdEl.textContent = identity.id;
 
   const parsed = decodePairingHash(location.hash);
+  let refusedRelay: string | undefined;
   if (parsed && Date.now() > parsed.expiresAt) {
     showToast("This pairing code has expired");
+    clearPairingHash();
+  } else if (parsed && !validRelayUrl(parsed.relay)) {
+    // The code decides what this browser connects to now, so a code naming
+    // something this page will not dial is refused visibly instead of
+    // leaving a socket that quietly never opens.
+    refusedRelay = parsed.relay;
     clearPairingHash();
   } else if (parsed) {
     // Parsed, not accepted: nothing is sent until the person confirms.
     awaitingConfirm = parsed;
   }
 
-  if (awaitingConfirm) {
-    showConfirmPair(awaitingConfirm);
+  const offered = awaitingConfirm ? validRelayUrl(awaitingConfirm.relay) : undefined;
+  if (refusedRelay !== undefined) {
+    showPairingRefusal(
+      `This pairing code points at ${refusedRelay}, which isn't an encrypted relay address (wss://). ` +
+        "Nothing was sent. Show a fresh code from Settings ▸ Remote on the Mac."
+    );
+  } else if (awaitingConfirm && offered !== undefined) {
+    showConfirmPair(awaitingConfirm, offered);
   } else if (host) {
     showView("tree");
   } else {
@@ -633,53 +842,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  relay = new RelayClient(relayWsUrl(), identity, {
-    onAuthed: () => {
-      relayAuthed = true;
-      relayUnreachable = false;
-      recomputeBanner();
-      if (pendingPairing) {
-        void sendPair();
-      } else if (host) {
-        void startSession();
-      }
-    },
-    onPaired: (hostId, hostPublicKeyB64) => void onPaired(hostId, hostPublicKeyB64),
-    onPairDenied: (reason) => {
-      if (!pendingPairing) return; // not pairing: the relay is talking out of turn
-      pendingPairing = undefined;
-      showToast(`Pairing was declined (${reason})`);
-      showIdleView();
-    },
-    onOnline: (hostId) => {
-      if (!host || hostId !== host.hostId) return;
-      hostOfflineSince = undefined;
-      recomputeBanner();
-      updateTreeDisabled();
-      void startSession();
-    },
-    onOffline: (hostId, lastSeenMs) => {
-      if (!host || hostId !== host.hostId) return;
-      dropSession(); // the host is gone; keeps lastAttachedPaneId for recovery
-      hostOfflineSince = lastSeenMs;
-      recomputeBanner();
-      updateTreeDisabled();
-    },
-    onRefused: (reason) => showToast(reason),
-    onEnvelope: (from, payload) => void handleEnvelope(from, payload),
-    onDisconnected: () => {
-      relayAuthed = false;
-      relayUnreachable = true;
-      // The socket is gone, so whatever session was live over it is dead
-      // too: don't leave a live terminal pointed at it (keystrokes would
-      // silently no-op) -- onAuthed's re-handshake on reconnect will re-list
-      // and, via startSession()'s own leaveTerminal(), the tree handler's
-      // re-attach branch will pick lastAttachedPaneId back up.
-      if (term) leaveTerminal();
-      recomputeBanner();
-    },
-  });
-  relay.connect();
+  connectRelay();
 }
 
 document.getElementById("fit-btn")?.addEventListener("click", onFitClick);
