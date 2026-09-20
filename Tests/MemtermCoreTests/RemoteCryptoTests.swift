@@ -1,4 +1,5 @@
 import CryptoKit
+import Dispatch
 import XCTest
 @testable import MemtermCore
 
@@ -79,6 +80,20 @@ final class RemoteCryptoTests: XCTestCase {
         XCTAssertEqual(identity.id.count, 16)
         let alphabet = Set("abcdefghijklmnopqrstuvwxyz234567")
         XCTAssertTrue(identity.id.allSatisfy { alphabet.contains($0) }, identity.id)
+    }
+
+    /// The test above only proves the encoder agrees with a copy of itself,
+    /// which would survive both of them being wrong together. This pins one
+    /// fixed SPKI to an id derived outside Swift entirely, by the relay's own
+    /// compiled `idFromPublicKey` (see the fix report for the command).
+    func testIdMatchesAnIdDerivedByTheRelayItself() throws {
+        let spki = try bytes(fromHex:
+            "3059301306072a8648ce3d020106082a8648ce3d030107034200047b227b6b61532f"
+            + "83988b02db73424f176bea1f5fbf96bac36cca97ba4e477dd6637c36f6838d1c3801"
+            + "6fe913863ae22871185e355e216d295b0bd44d7ce389e9"
+        )
+        XCTAssertEqual(spki.count, 91)
+        XCTAssertEqual(RemoteIdentity.peerId(forSPKI: spki), "dvao5erntvklo753")
     }
 
     func testDistinctIdentitiesGetDistinctIds() {
@@ -181,6 +196,40 @@ final class RemoteCryptoTests: XCTestCase {
         XCTAssertFalse(RemoteHandshake.verifyHello(hello, peerSPKI: Data()))
     }
 
+    /// Domain separation. The identity key also signs bare auth nonces at the
+    /// relay, so a Hello must not be a bare byte string: the signature covers
+    /// a labelled payload, and a signature over the naked point — exactly
+    /// what an attacker could harvest from an unlabelled protocol — must no
+    /// longer verify.
+    func testHelloSignatureIsDomainSeparated() throws {
+        XCTAssertEqual(RemoteHandshake.helloSigningLabel, "memterm-remote-v1:hello")
+
+        let identity = RemoteIdentity.generate()
+        let (hello, _) = RemoteHandshake.makeHello(identity: identity)
+
+        let payload = RemoteHandshake.helloSigningPayload(ephemeralRaw: hello.ephemeralRaw)
+        XCTAssertEqual(payload, Data("memterm-remote-v1:hello".utf8) + hello.ephemeralRaw)
+
+        let publicKey = try P256.Signing.PublicKey(
+            x963Representation: identity.privateKey.publicKey.x963Representation
+        )
+        let parsed = try P256.Signing.ECDSASignature(rawRepresentation: hello.signature)
+        XCTAssertTrue(publicKey.isValidSignature(parsed, for: payload))
+        XCTAssertFalse(
+            publicKey.isValidSignature(parsed, for: hello.ephemeralRaw),
+            "the signature must not be over the bare point"
+        )
+
+        let unlabelled = RemoteHandshake.Hello(
+            ephemeralRaw: hello.ephemeralRaw,
+            signature: identity.sign(hello.ephemeralRaw)
+        )
+        XCTAssertFalse(
+            RemoteHandshake.verifyHello(unlabelled, peerSPKI: identity.publicKeySPKI),
+            "an unlabelled signature must be refused"
+        )
+    }
+
     func testDeriveKeysRejectsMalformedPeerPoint() {
         let identity = RemoteIdentity.generate()
         let (_, ephemeral) = RemoteHandshake.makeHello(identity: identity)
@@ -281,6 +330,57 @@ final class RemoteCryptoTests: XCTestCase {
         let slice = padded.dropFirst(7)
         XCTAssertNotEqual(slice.startIndex, 0, "the fixture must actually be offset")
         XCTAssertEqual(try clientKeys.open(slice), Data("sliced".utf8))
+    }
+
+    // MARK: - Concurrency
+
+    /// Nonce reuse under one AES-GCM key leaks the XOR of the two plaintexts
+    /// AND the GHASH key, which lets an attacker forge records — so a
+    /// read-modify-write race on the send counter is a break, not a glitch.
+    /// The host really does seal from more than one thread: a PTY reader
+    /// thread streams output while the UI can send a control message.
+    func testConcurrentSealsNeverReuseANonce() throws {
+        let secret = Data((1...32).map(UInt8.init))
+        let hostKeys = RemoteHandshake.deriveKeys(sharedSecret: secret, hostId: "h", deviceId: "d", iAmHost: true)
+        let clientKeys = RemoteHandshake.deriveKeys(sharedSecret: secret, hostId: "h", deviceId: "d", iAmHost: false)
+
+        let count = 1_000
+        let collector = NSLock()
+        var records: [Data] = []
+        records.reserveCapacity(count)
+
+        DispatchQueue.concurrentPerform(iterations: count) { index in
+            guard let record = try? hostKeys.seal(Data("msg \(index)".utf8)) else {
+                return XCTFail("seal failed at \(index)")
+            }
+            collector.lock()
+            records.append(record)
+            collector.unlock()
+        }
+
+        XCTAssertEqual(records.count, count)
+        let nonces = Set(records.map { Data($0.prefix(12)) })
+        XCTAssertEqual(nonces.count, count, "every concurrent seal must get its own nonce")
+
+        // The counters must also be exactly 0..<count with no gaps, so no
+        // seal silently skipped one.
+        let counters = records.map { counter(ofRecord: $0) }.sorted()
+        XCTAssertEqual(counters, (0..<UInt64(count)).map { $0 })
+
+        // The receiver, which accepts only strictly increasing counters,
+        // opens every record once they are ordered — and recovers exactly
+        // the set of plaintexts that went in.
+        let ordered = records.sorted { counter(ofRecord: $0) < counter(ofRecord: $1) }
+        var opened: Set<Data> = []
+        for record in ordered {
+            opened.insert(try clientKeys.open(record))
+        }
+        XCTAssertEqual(opened, Set((0..<count).map { Data("msg \($0)".utf8) }))
+    }
+
+    /// The last 8 bytes of the 12-byte nonce, big-endian.
+    private func counter(ofRecord record: Data) -> UInt64 {
+        record.prefix(12).suffix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
     }
 
     // MARK: - (e) Shared vectors

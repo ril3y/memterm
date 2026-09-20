@@ -40,7 +40,7 @@ public struct RemoteIdentity {
     /// from the same SPKI bytes with the same encoder, so the two must agree
     /// exactly or the phone cannot reach this host.
     public var id: String {
-        Self.id(forSPKI: publicKeySPKI)
+        Self.peerId(forSPKI: publicKeySPKI)
     }
 
     public init(privateKey: P256.Signing.PrivateKey) {
@@ -97,7 +97,11 @@ public struct RemoteIdentity {
 
     /// base32(sha256(spki))[0..<16], lower-case RFC 4648 alphabet, unpadded —
     /// byte-for-byte what `relay/src/auth.ts` computes.
-    static func id(forSPKI spki: Data) -> String {
+    ///
+    /// Public because callers MUST be able to name a peer by its *verified*
+    /// key rather than by anything the peer claims: see the warning on
+    /// `RemoteHandshake.deriveKeys`.
+    public static func peerId(forSPKI spki: Data) -> String {
         String(base32(Data(SHA256.hash(data: spki))).prefix(16))
     }
 
@@ -128,7 +132,8 @@ public enum RemoteHandshake {
     public struct Hello: Equatable {
         /// The ephemeral P-256 public key, x9.63 uncompressed (65 bytes).
         public var ephemeralRaw: Data
-        /// Raw r‖s over `ephemeralRaw`, by the sender's identity key.
+        /// Raw r‖s over `helloSigningLabel ‖ ephemeralRaw`, by the sender's
+        /// identity key.
         public var signature: Data
 
         public init(ephemeralRaw: Data, signature: Data) {
@@ -137,10 +142,24 @@ public enum RemoteHandshake {
         }
     }
 
+    /// Domain separation for the identity signature. Without a prefix, the
+    /// same identity key signs bare byte strings in two protocols at once —
+    /// here a 65-byte point, and at the relay a 32-byte auth nonce — so a
+    /// signature gathered in one could be presented as the other. Prefixing
+    /// makes the two input spaces disjoint. The web client must prepend the
+    /// identical bytes, which is why this is public.
+    public static let helloSigningLabel = "memterm-remote-v1:hello"
+
+    /// The exact bytes an identity signs for a `Hello`.
+    public static func helloSigningPayload(ephemeralRaw: Data) -> Data {
+        Data(helloSigningLabel.utf8) + ephemeralRaw
+    }
+
     public static func makeHello(identity: RemoteIdentity) -> (Hello, P256.KeyAgreement.PrivateKey) {
         let ephemeral = P256.KeyAgreement.PrivateKey()
         let raw = ephemeral.publicKey.x963Representation
-        return (Hello(ephemeralRaw: raw, signature: identity.sign(raw)), ephemeral)
+        let signature = identity.sign(helloSigningPayload(ephemeralRaw: raw))
+        return (Hello(ephemeralRaw: raw, signature: signature), ephemeral)
     }
 
     /// Both arguments come off the wire, so every parse failure is just
@@ -151,9 +170,18 @@ public enum RemoteHandshake {
             let peerKey = try? P256.Signing.PublicKey(x963Representation: peerRaw),
             let signature = try? P256.Signing.ECDSASignature(rawRepresentation: hello.signature)
         else { return false }
-        return peerKey.isValidSignature(signature, for: hello.ephemeralRaw)
+        return peerKey.isValidSignature(signature, for: helloSigningPayload(ephemeralRaw: hello.ephemeralRaw))
     }
 
+    /// - Warning: `hostId` and `deviceId` bind the session to two named
+    ///   identities, which is what stops an unknown-key-share: an attacker
+    ///   who relays our ephemeral cannot make both sides agree on who they
+    ///   are talking to. That only holds if the caller computes BOTH ids
+    ///   with `RemoteIdentity.peerId(forSPKI:)` over identity keys it has
+    ///   already verified — its own, and the peer's, the same SPKI that just
+    ///   passed `verifyHello`. Never take either id from a field on the
+    ///   wire: a self-declared id is a value the attacker chooses, and
+    ///   feeding it here silently removes the binding.
     public static func deriveKeys(
         myEphemeral: P256.KeyAgreement.PrivateKey,
         peerEphemeralRaw: Data,
@@ -204,9 +232,22 @@ public enum RemoteHandshake {
 /// One direction-split AES-256-GCM session. Stateful by design — the
 /// counters are the replay defence — so it is a class, owned by whatever
 /// owns the connection.
-public final class RemoteSessionKeys {
+///
+/// Thread safety: safe to call `seal` and `open` from any thread, including
+/// concurrently. Both take an internal lock covering the whole operation,
+/// not just the counter bump. That is a correctness requirement, not a
+/// convenience: a read-modify-write race on `sendCounter` would hand the
+/// same nonce to two records under one AES-GCM key, which leaks the XOR of
+/// the two plaintexts and the GHASH authentication key, letting an attacker
+/// forge records. The host writes PTY output from a reader thread while the
+/// UI can seal a control message, so this is a real interleaving.
+///
+/// The lock also serialises records against their own counters, so the
+/// nonce a record carries is always the one its sealing incremented past.
+public final class RemoteSessionKeys: @unchecked Sendable {
     private let sendKey: SymmetricKey
     private let receiveKey: SymmetricKey
+    private let lock = NSLock()
     private var sendCounter: UInt64 = 0
     private var receiveCounter: UInt64 = 0
 
@@ -228,7 +269,13 @@ public final class RemoteSessionKeys {
     }
 
     /// Record = nonce (12) ‖ ciphertext ‖ tag (16), i.e. GCM's combined box.
+    ///
+    /// The lock spans the seal, not just the counter bump: reading the
+    /// counter and consuming it must be one atomic step or two threads
+    /// reuse a nonce.
     public func seal(_ plaintext: Data) throws -> Data {
+        lock.lock()
+        defer { lock.unlock() }
         guard
             let nonce = try? AES.GCM.Nonce(data: Self.nonceBytes(counter: sendCounter)),
             let box = try? AES.GCM.seal(plaintext, using: sendKey, nonce: nonce),
@@ -243,6 +290,8 @@ public final class RemoteSessionKeys {
     /// truncated record is `.malformed`. Neither failure advances the
     /// counter, so the genuine next record still opens afterwards.
     public func open(_ record: Data) throws -> Data {
+        lock.lock()
+        defer { lock.unlock() }
         guard record.count >= 12 + 16 else { throw RemoteCryptoError.malformed }
         guard Data(record.prefix(12)) == Self.nonceBytes(counter: receiveCounter) else {
             throw RemoteCryptoError.replay
