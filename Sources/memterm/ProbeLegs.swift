@@ -977,6 +977,11 @@ extension MemtermAppDelegate {
         addWorkspaceCloseSteps(probe, probeWorkspaceId: { probeWorkspaceId })
         addTabGestureSteps(probe)
         addClaudeBrowserSteps(probe)
+        // Task 12: real local relay + a headless Swift device client end to
+        // end. Fresh-mode only — it dials a loopback relay of its own and
+        // tears remote back off when it's done, which a restored/observe
+        // world's shared manifest has no business repeating.
+        if mode == "fresh" { addRemoteSteps(probe) }
         // Quake-style drop-down legs: before the archive legs (which wipe
         // the probe state dir last by design).
         addDropdownSteps(probe)
@@ -3295,6 +3300,277 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("badge states wrong: attn=\(attn) work=\(work) done=\(done) cleared=\(cleared) (want unseen/active/idle/idle)")
                 }
             }))
+    }
+
+    // MARK: - Remote end-to-end (Task 12): a real local relay + a headless
+    // Swift device client (RemoteProbeClient) driving the actual RemoteHost
+    // over the actual wire protocol — nothing here is mocked. Skips loudly
+    // (never a pass) when node or the built relay isn't available, so a
+    // machine without Node still gets a green run rather than a false one.
+
+    private func addRemoteSteps(_ probe: ProbeRunner) {
+        guard let nodePath = Self.findNode() else {
+            probe.skipLine(step: "remote-end-to-end", reason: "node not on PATH")
+            return
+        }
+        let relayRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("relay", isDirectory: true)
+        let serverScript = relayRoot.appendingPathComponent("dist/src/server.js")
+        guard FileManager.default.fileExists(atPath: relayRoot.appendingPathComponent("node_modules").path)
+        else {
+            probe.skipLine(step: "remote-end-to-end", reason: "relay/node_modules missing — run npm --prefix relay ci")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: serverScript.path) else {
+            probe.skipLine(step: "remote-end-to-end", reason: "relay/dist missing — run npm --prefix relay run build")
+            return
+        }
+        guard let port = Self.freeLoopbackPort() else {
+            probe.skipLine(step: "remote-end-to-end", reason: "could not allocate a free loopback port")
+            return
+        }
+        let relayURL = URL(string: "ws://127.0.0.1:\(port)")!
+
+        func spawnRelay() -> Process {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: nodePath)
+            process.arguments = [serverScript.path]
+            var env = ProcessInfo.processInfo.environment
+            env["HOST"] = "127.0.0.1"
+            env["PORT"] = String(port)
+            process.environment = env
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            return process
+        }
+
+        var relay = spawnRelay()
+        let client = RemoteProbeClient()
+        var pairingPayload: PairingPayload?
+        var incomingPairName: String?
+        var pane: PaneView?
+
+        probe.add(ProbeStep(
+            name: "remote-relay-start", timeout: 10,
+            action: { try? relay.run() },
+            condition: { Self.relayHealthy(port: port) },
+            assert: {
+                guard relay.isRunning else { throw ProbeFailure("relay process exited before /healthz answered") }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-config-apply", timeout: 10,
+            action: { [self] in
+                var c = config
+                c.remoteEnabled = true
+                c.remoteRelayURL = relayURL.absoluteString
+                applyConfigLive(c)
+            },
+            condition: { [self] in remote.probeState == "connected" },
+            assert: { [self] in
+                guard remote.probeState == "connected" else {
+                    throw ProbeFailure("host did not reach the loopback relay (state=\(remote.probeState) error=\(remote.probeLastError ?? "none"))")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-pairing", timeout: 10,
+            action: { [self] in
+                remote.onPairRequest = { name, _, _, accept in
+                    incomingPairName = name
+                    accept(true)
+                }
+                let payload = remote.startPairing()
+                pairingPayload = payload
+                client.connect(relay: relayURL)
+                client.pair(payload)
+            },
+            condition: { [self] in client.handshakeComplete && remote.probeSessionCount == 1 },
+            assert: { [self] in
+                guard incomingPairName == "probe-client" else {
+                    throw ProbeFailure("pair-request name never arrived (got \(incomingPairName ?? "nil"))")
+                }
+                guard let payload = pairingPayload,
+                      let hostSPKI = Data(base64Encoded: payload.hostPublicKey),
+                      RemoteIdentity.peerId(forSPKI: hostSPKI) == payload.hostId
+                else {
+                    throw ProbeFailure("payload.hostPublicKey does not hash to payload.hostId — SPKI header mismatch")
+                }
+                guard remote.probeSessionCount == 1 else {
+                    throw ProbeFailure("host session count \(remote.probeSessionCount) after handshake, want 1")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-list", timeout: 10,
+            action: { [self] in
+                pane = keyHost()?.selectedTab?.currentPane()
+                client.send(.list)
+            },
+            condition: { client.lastTree != nil },
+            assert: {
+                guard let paneId = pane?.paneId else { throw ProbeFailure("no selected pane to list (remote leg)") }
+                guard let tree = client.lastTree, Self.treeContains(tree, paneId: paneId) else {
+                    throw ProbeFailure("listed tree does not contain the key host's selected pane \(paneId.prefix(8))")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-attach", timeout: 10,
+            action: { guard let paneId = pane?.paneId else { return }; client.send(.attach(paneId: paneId)) },
+            condition: { client.lastScreen != nil },
+            assert: {
+                guard let pane, let screen = client.lastScreen else { throw ProbeFailure("no screen after attach") }
+                guard screen.cols == pane.getTerminal().cols else {
+                    throw ProbeFailure("attach screen cols \(screen.cols) != pane cols \(pane.getTerminal().cols)")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-echo", timeout: 10,
+            action: { client.send(.input(Data("echo remote-probe\r".utf8))) },
+            condition: {
+                String(decoding: client.receivedOutput, as: UTF8.self).contains("remote-probe")
+            },
+            assert: {
+                guard let pane else { throw ProbeFailure("no pane (remote-echo leg)") }
+                guard pane.scrollbackText(maxLines: 50).contains("remote-probe") else {
+                    throw ProbeFailure("echoed bytes reached the client but never the real pty's scrollback")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-resize", timeout: 10,
+            action: { client.send(.resize(cols: 100, rows: 30)) },
+            condition: { client.lastResized != nil },
+            assert: {
+                guard let resized = client.lastResized, resized.cols == 100, resized.rows == 30 else {
+                    throw ProbeFailure("resized answer was \(String(describing: client.lastResized)), want 100x30")
+                }
+                guard let pane, pane.getTerminal().cols == 100 else {
+                    throw ProbeFailure("pane terminal did not actually resize to 100 cols")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-relay-kill", timeout: 10,
+            action: {
+                relay.terminate()
+                relay.waitUntilExit()
+            },
+            condition: { [self] in remote.probeState == "offline" },
+            assert: { [self] in
+                guard remote.probeState == "offline" else {
+                    throw ProbeFailure("host did not notice the relay dying (state=\(remote.probeState))")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            // Generous timeout: the host's own reconnect backoff (1s -> 30s)
+            // means this can legitimately take a while, and a fixed sleep
+            // would either race it or waste everyone's time either way.
+            name: "remote-relay-restart", timeout: 45,
+            action: { relay = spawnRelay(); try? relay.run() },
+            condition: { [self] in remote.probeState == "connected" },
+            assert: { [self] in
+                guard remote.probeState == "connected" else {
+                    throw ProbeFailure("host never reconnected after the relay restart (state=\(remote.probeState))")
+                }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-client-reauth", timeout: 15,
+            action: { client.connect(relay: relayURL) },
+            condition: { client.authed },
+            assert: {
+                guard client.authed else { throw ProbeFailure("client never re-authed against the restarted relay") }
+            }))
+
+        probe.add(ProbeStep(
+            name: "remote-revoke", timeout: 10,
+            action: { [self] in
+                remote.revoke(deviceId: client.deviceId)
+                client.send(.list)
+            },
+            condition: { client.lastRefusedReason != nil },
+            assert: { [self] in
+                guard client.lastRefusedReason == "not-allowed" else {
+                    throw ProbeFailure("post-revoke envelope got reason=\(client.lastRefusedReason ?? "nil"), want not-allowed")
+                }
+                print("UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true")
+                var off = config
+                off.remoteEnabled = false
+                applyConfigLive(off)
+                relay.terminate()
+            }))
+    }
+
+    private static func findNode() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["which", "node"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let path = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (path?.isEmpty == false) ? path : nil
+    }
+
+    /// Binds port 0 on loopback to let the kernel pick a free port, then
+    /// closes it — PORT=0 passed straight to the relay can't be read back,
+    /// so this is how the leg gets a port number to hand it instead.
+    private static func freeLoopbackPort() -> Int? {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { return nil }
+        var actual = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let got = withUnsafeMutablePointer(to: &actual) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &len)
+            }
+        }
+        guard got == 0 else { return nil }
+        return Int(UInt16(bigEndian: actual.sin_port))
+    }
+
+    private static func relayHealthy(port: Int) -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/healthz") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 0.3
+        let semaphore = DispatchSemaphore(value: 0)
+        var ok = false
+        let task = URLSession.shared.dataTask(with: request) { _, response, _ in
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 { ok = true }
+            semaphore.signal()
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 0.35)
+        return ok
+    }
+
+    private static func treeContains(_ tree: RemoteTree, paneId: String) -> Bool {
+        tree.workspaces.contains { workspace in
+            workspace.windows.contains { window in
+                window.tabs.contains { tab in
+                    tab.panes.contains { $0.id == paneId }
+                }
+            }
+        }
     }
 
     // MARK: - Archive legs (founder-amended FR-56, schema v6: close =

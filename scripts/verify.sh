@@ -150,6 +150,28 @@ check "smoke-geometry-golden" "$LOG/smoke-verify.log" "SMOKE-GEOMETRY golden=mat
 check "smoke-launch-visible" "$LOG/smoke-verify.log" "SMOKE-LAUNCH-VISIBLE hosts=2 visible=1 stray=0 c_restored=false"
 check "smoke-lazy-resurrect" "$LOG/smoke-verify.log" "SMOKE-LAZY-RESURRECT c_tabs=1 visible=1 stray=0 "
 
+# ------------------------------------------------------- relay preflight
+# Task 12's remote-end-to-end probe leg dials a REAL local relay; it needs
+# relay/dist built to do that. Build it when node is on PATH — the leg
+# itself accepts a loud skip when it is not, so this preflight never fails
+# a node-less machine, only a node-having one whose build breaks.
+NODE_PRESENT=0
+if command -v node > /dev/null 2>&1; then
+    NODE_PRESENT=1
+    if [ ! -d "$REPO_ROOT/relay/node_modules" ]; then
+        npm --prefix "$REPO_ROOT/relay" ci > "$LOG/relay-npm-ci.log" 2>&1
+    fi
+    if npm --prefix "$REPO_ROOT/relay" run build > "$LOG/relay-build.log" 2>&1; then
+        note "GATE PASS relay-build — relay/dist built for the remote-end-to-end probe leg"
+    else
+        note "GATE FAIL relay-build"
+        OVERALL=1
+        tail -20 "$LOG/relay-build.log" | sed 's/^/    /'
+    fi
+else
+    note "relay-build skipped — node not on PATH (remote-end-to-end leg self-skips)"
+fi
+
 echo "== [7/8] UI probe: fresh / restored / observe + config matrix (+1 visible pass)"
 probe() {  # probe <label> <mode> <configfile> <statedir(optional)> [visible]
     local label="$1" pmode="$2" cfg="$3" sdir="${4:-}" vis="${5:-}"
@@ -164,6 +186,14 @@ probe() {  # probe <label> <mode> <configfile> <statedir(optional)> [visible]
 # pass run against a pty pair (never /dev/cu.*) — the MEMTERM_SERIAL_PROBE_PTY
 # stand-in convention's harness-owned twin.
 probe "fresh-default" fresh "$CFGDIR/default.toml"
+# Task 12: real local relay + headless Swift device client, end to end.
+# Strict on a node-having machine; a node-less one gets the leg's own loud
+# skip instead (never a silent pass either way).
+if [ "$NODE_PRESENT" = "1" ]; then
+    check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true"
+else
+    check "fresh-default-remote" "$LOG/probe-fresh-default.log" "UIPROBE-SKIP step=remote-end-to-end reason="
+fi
 
 # restored world: seeded from a REAL --smoke=save capture, restored through
 # the REAL restoreWindows() pipeline. Bugs 1 and 3's permanent gate.
