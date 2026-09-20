@@ -61,11 +61,13 @@ A global hotkey slides a terminal in from a screen edge and away again — the Q
 
 ## Remote attach
 
-Mirror and control your panes from a phone. Off by default: turn it on in **Settings ▸ Remote**, then **Pair a device…** shows a QR code. Scanning it opens the relay's web page, which asks the Mac "Allow ‹name›?" before anything is granted — a photographed QR alone is not access. Paired devices show in the same Settings tab and can be revoked at any time, which cuts them off immediately, wherever they are.
+Mirror and control your panes from a phone. Off by default: turn it on in **Settings ▸ Remote**, then **Pair a device…** shows a QR code. Scanning it opens the web page, which asks the Mac "Allow ‹name›?" before anything is granted — a photographed QR alone is not access. Paired devices show in the same Settings tab and can be revoked at any time, which cuts them off immediately, wherever they are.
 
 A paired device can do exactly what a local keyboard can do to a pane: see its live output, type into it, resize it, open tabs. Nothing more.
 
-The relay only ever sees encrypted envelopes addressed by opaque routing IDs — it cannot read your terminal, and it persists nothing to disk. All the actual crypto (key agreement, encryption) happens between the app and the browser; the relay is a blind forwarder. One caveat worth stating plainly: the relay also serves the browser page, so for a browser device it can ship JavaScript that reads and types on its behalf — running your own relay is what removes that trust.
+The relay only ever sees encrypted envelopes addressed by opaque routing IDs — it cannot read your terminal, and it persists nothing to disk. All the actual crypto (key agreement, encryption) happens between the app and the browser; the relay forwards bytes and nothing else.
+
+The browser page itself is served from GitHub Pages, built by this repository's CI from `relay/web`, so the code your phone runs is the code in this repo rather than whatever the relay chose to send. That matters because whoever serves that page can read your panes and type into them on a browser device's behalf. Point `web_url` under `[remote]` somewhere else — your own relay, or any static host with a copy of `relay/web` — to move that trust wherever you like; blank means your relay serves the page too.
 
 By default, remote attach connects through `wss://memterm-relay.fly.dev`. To self-host: `fly launch` from the `relay/` directory (it already has a `fly.toml` and `Dockerfile`), then point `relay_url` under `[remote]` in your config file at your own app. `npm test` from `relay/` runs the relay's test suite.
 

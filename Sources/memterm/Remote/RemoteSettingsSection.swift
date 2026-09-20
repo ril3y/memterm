@@ -100,13 +100,14 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
             [label("Relay:"), relayField],
             // Security review C1: this used to say the relay "cannot read"
             // your traffic, full stop. That is true of the envelopes, and
-            // false of a browser device, because the relay also serves the
-            // web page — so it can ship JavaScript that reads and types for
-            // it. Saying so is the honest version, and self-hosting is the
-            // answer.
+            // false of whoever serves the browser page, which chooses the
+            // JavaScript that encrypts for it. The page now comes from this
+            // project's GitHub Pages site rather than the relay, so the
+            // caption names the party that is actually trusted.
             [NSGridCell.emptyContentView,
-             caption("The relay forwards encrypted envelopes it can't read — but it also serves the browser page, "
-                     + "so for a browser it can read and type. Run your own relay to remove that trust.")],
+             caption("The relay forwards encrypted envelopes it can't read. The browser page comes from this "
+                     + "project's GitHub Pages site — whoever serves that page can read and type for a browser, "
+                     + "so set web_url to move that trust.")],
             [label("Status:"), statusLabel],
             [NSGridCell.emptyContentView, pairButton],
             [label("Devices:"), deviceScroll],
