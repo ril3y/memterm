@@ -97,9 +97,13 @@ final class RemoteHost {
     private var reconnectDelay: TimeInterval = 1
     private var reconnectWork: DispatchWorkItem?
     private var pingWork: DispatchWorkItem?
-    /// A token minted by `startPairing()` while the socket was down, or
-    /// before the relay had authed us; sent as soon as we are authed.
-    private var pendingPairToken: String?
+    /// A token minted while the socket was down, or before the relay had
+    /// authed us, with the deadline the USER was shown counting down. It is
+    /// sent when we next reach `connected`, and dropped once that deadline has
+    /// passed — the relay's own 120 s starts when it RECEIVES the token, so
+    /// without this a code the user watched expire would go live again, for a
+    /// fresh two minutes, the moment the relay came back.
+    private var pendingPair: (token: String, expiresAt: Date)?
     /// Generation counter: every connect attempt bumps it, and a callback
     /// from an older socket is ignored. Without it, a slow failure from a
     /// socket we already replaced would schedule a second reconnect loop.
@@ -157,11 +161,11 @@ final class RemoteHost {
 
     // MARK: - Pairing
 
-    /// Mints a single-use pairing token and registers it with the relay.
-    /// The caller turns the returned payload into the QR code; the relay
-    /// forgets the token after 120 seconds or one use, whichever comes first.
-    @discardableResult
-    func startPairing(now: Date = Date()) -> PairingPayload {
+    /// Mints a single-use pairing payload WITHOUT registering it. Nothing has
+    /// been promised to anyone until `publishPairing` is called, so a caller
+    /// that fails to produce a QR (no Core Image filter, an unusable relay
+    /// URL) leaves no live token behind at the relay.
+    func makePairingPayload(now: Date = Date()) -> PairingPayload {
         // A pairing token is the only thing standing between a stranger and a
         // pair REQUEST reaching the user, so it comes from the system CSPRNG
         // rather than a UUID.
@@ -170,16 +174,31 @@ final class RemoteHost {
             guard let base = buffer.baseAddress else { return }
             _ = SecRandomCopyBytes(kSecRandomDefault, buffer.count, base)
         }
-        let token = Self.base64url(bytes)
-        pendingPairToken = token
-        sendPairTokenIfPossible()
         let expiry = now.addingTimeInterval(120)
         return PairingPayload(
             relay: relayBase?.absoluteString ?? app.config.remoteRelayURL,
             hostId: hostId,
             hostPublicKey: identity.publicKeySPKI.base64EncodedString(),
-            token: token,
+            token: Self.base64url(bytes),
             expiresAt: Int(expiry.timeIntervalSince1970 * 1000))
+    }
+
+    /// Registers a minted payload's token with the relay — now if we are
+    /// connected, otherwise on the next auth, and never after the deadline
+    /// the user was shown.
+    func publishPairing(_ payload: PairingPayload) {
+        pendingPair = (token: payload.token,
+                       expiresAt: Date(timeIntervalSince1970: Double(payload.expiresAt) / 1000))
+        sendPairTokenIfPossible()
+    }
+
+    /// Mint and register in one step. The probe hook (ruling 9) and the
+    /// simplest thing a caller that does not render a QR can do.
+    @discardableResult
+    func startPairing(now: Date = Date()) -> PairingPayload {
+        let payload = makePairingPayload(now: now)
+        publishPairing(payload)
+        return payload
     }
 
     /// The URL the QR encodes: the relay's own web client, with the payload
@@ -361,11 +380,18 @@ final class RemoteHost {
         sendJSON(["type": "allowed", "devices": store.allowedIds])
     }
 
-    private func sendPairTokenIfPossible() {
-        guard probeState == "connected", let token = pendingPairToken else { return }
-        sendJSON(["type": "pair-token", "token": token])
+    private func sendPairTokenIfPossible(now: Date = Date()) {
+        guard let pending = pendingPair else { return }
+        guard pending.expiresAt > now else {
+            // The code the user watched expire must not come back to life on
+            // the next reconnect: the relay's own window would start fresh.
+            pendingPair = nil
+            return
+        }
+        guard probeState == "connected" else { return }
+        sendJSON(["type": "pair-token", "token": pending.token])
         // Single use at the relay; a second QR mints a second token.
-        pendingPairToken = nil
+        pendingPair = nil
     }
 
     private func handlePairRequest(_ object: [String: Any]) {

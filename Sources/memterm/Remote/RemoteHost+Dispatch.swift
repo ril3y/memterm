@@ -44,7 +44,13 @@ extension RemoteHost {
             // "Fit to me": the pty really does resize, and the answer reports
             // the size the grid ENDED UP at — SwiftTerm clamps, and a viewer
             // must never be told a size nothing is at.
-            let actual = stream.resize(cols: cols, rows: rows)
+            //
+            // The wire's ints are clamped FIRST. A remote client may do what a
+            // local keyboard can do and no more, and no local gesture can ask
+            // for a grid of two billion columns — which `Terminal.resize`
+            // would try to allocate and reflow.
+            let safe = RemotePaneStream.clamp(cols: cols, rows: rows)
+            let actual = stream.resize(cols: safe.cols, rows: safe.rows)
             send(.resized(cols: actual.cols, rows: actual.rows), to: session.deviceId)
 
         case .newTab(let workspaceId):

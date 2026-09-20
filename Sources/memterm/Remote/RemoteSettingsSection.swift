@@ -48,17 +48,36 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         buildDeviceTable()
-        // The host denies a pair request outright when nobody is prompting,
-        // so this hookup IS the consent path: pairing only works while the
-        // user is looking at this section.
-        host.onPairRequest = { [weak self] name, deviceId, spki, accept in
-            self?.askToPair(name: name, deviceId: deviceId, publicKeySPKI: spki, accept: accept)
-        }
-        host.onStateChange = { [weak self] in self?.loadValues() }
+        attach()
     }
 
     deinit {
         countdownTimer?.invalidate()
+    }
+
+    /// Settings is open: answer pair requests and follow the host's state.
+    ///
+    /// Called on every `show()`, not just at construction, because the window
+    /// controller and this section are cached for the app's life — without
+    /// re-arming, the first close would silently disable pairing for the rest
+    /// of the session (every later request hitting the host's auto-deny).
+    /// Installing the same closures twice is harmless: they replace, not
+    /// accumulate.
+    func attach() {
+        // The host denies a pair request outright when nobody is prompting,
+        // so this hookup IS the consent path: pairing only works while the
+        // user is looking at this section.
+        host.onPairRequest = { [weak self] name, deviceId, spki, accept in
+            // A section that has gone away answers the same way a closed
+            // Settings window does — deny — rather than leaving the device
+            // waiting on a prompt nobody will ever show.
+            guard let self else {
+                accept(false)
+                return
+            }
+            self.askToPair(name: name, deviceId: deviceId, publicKeySPKI: spki, accept: accept)
+        }
+        host.onStateChange = { [weak self] in self?.loadValues() }
     }
 
     /// Settings is closing: stop answering for the user. A pair request that
@@ -160,10 +179,14 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
 
     @objc private func pairAction(_ sender: Any?) {
         guard let window = pairButton.window else { return }
-        let payload = host.startPairing()
+        // Mint first, register LAST: a token the user never sees a QR for
+        // must not be live at the relay, so nothing is announced until the
+        // image exists.
+        let payload = host.makePairingPayload()
         guard let url = RemoteHost.pairingURL(for: payload),
               let image = Self.qrImage(for: url.absoluteString, side: 220)
         else { return }
+        host.publishPairing(payload)
         pairingDeadline = Date(timeIntervalSince1970: Double(payload.expiresAt) / 1000)
 
         let imageView = NSImageView(image: image)

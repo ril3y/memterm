@@ -352,6 +352,7 @@ final class RemoteConfigTests: XCTestCase {
         var c = Config()
         c.remoteEnabled = true
         c.remoteRelayURL = "ws://127.0.0.1:8787"
+        c.themeBackground = ConfigRGB(hex: "#102030")
         let text = c.serialize()
         XCTAssertTrue(text.contains("[remote]"), text)
         XCTAssertTrue(text.contains("enabled = true"), text)
@@ -360,7 +361,8 @@ final class RemoteConfigTests: XCTestCase {
         let back = Config.parse(text)
         XCTAssertTrue(back.remoteEnabled)
         XCTAssertEqual(back.remoteRelayURL, "ws://127.0.0.1:8787")
-        // [theme] must still round-trip after [remote] joined the file.
-        XCTAssertEqual(back.dropdownAnimationMs, c.dropdownAnimationMs)
+        // [theme] follows [remote] in the file, so its keys must still land in
+        // the theme table rather than being swallowed by the new one.
+        XCTAssertEqual(back.themeBackground, c.themeBackground)
     }
 }

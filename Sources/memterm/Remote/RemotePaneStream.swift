@@ -140,11 +140,24 @@ final class RemotePaneStream {
     /// pass may recompute cols/rows from the pane's frame and overwrite this.
     /// That is the spec's "host window wins" rule — the returned pair is the
     /// truth at this moment, not a promise about the next one.
+    /// The sizes a remote viewer may ask for. `Terminal.resize` allocates and
+    /// reflows a grid of whatever it is given, so an unbounded `cols`/`rows`
+    /// off the wire is a way to take the app down — the caps are the same
+    /// order as the largest real display, and the host clamps too (defence in
+    /// depth: this seam must be safe on its own).
+    static let colRange = 2...500
+    static let rowRange = 2...200
+
+    static func clamp(cols: Int, rows: Int) -> (cols: Int, rows: Int) {
+        (cols: min(max(cols, colRange.lowerBound), colRange.upperBound),
+         rows: min(max(rows, rowRange.lowerBound), rowRange.upperBound))
+    }
+
     @discardableResult
     func resize(cols: Int, rows: Int) -> (cols: Int, rows: Int) {
         let terminal = pane.getTerminal()
-        guard cols > 0, rows > 0 else { return (terminal.cols, terminal.rows) }
-        terminal.resize(cols: cols, rows: rows)
+        let safe = Self.clamp(cols: cols, rows: rows)
+        terminal.resize(cols: safe.cols, rows: safe.rows)
         pane.sizeChanged(source: pane, newCols: terminal.cols, newRows: terminal.rows)
         return (terminal.cols, terminal.rows)
     }

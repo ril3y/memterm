@@ -916,6 +916,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     // MARK: - Show / close
 
     func show() {
+        // This controller is cached for the app's life, so re-arm the remote
+        // section's callbacks on every visit — windowWillClose disarmed them.
+        remoteSection.attach()
         loadValues()
         refreshDiskUsage()
         window?.makeKeyAndOrderFront(nil)
