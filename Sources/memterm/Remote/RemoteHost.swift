@@ -256,45 +256,26 @@ final class RemoteHost {
         return now < pairingWindowDeadline
     }
 
-    /// The URL the QR encodes: the relay's own web client, with the payload
-    /// in the FRAGMENT so it is never sent to the relay's HTTP server — the
-    /// browser keeps it client-side, which is the point of a blind relay.
-    /// `webBase` is `[remote] web_url`: blank (the default) keeps the
-    /// historical behaviour of pointing the QR at the relay's own copy of
-    /// the page. Setting it points the code at a page served from
-    /// somewhere else, with the relay still the WebSocket endpoint — the
-    /// only way to stop the relay from being able to ship JavaScript into
-    /// an already-paired browser (security review C1). The payload itself
-    /// is unchanged either way, and stays in the FRAGMENT so it never
-    /// reaches whichever HTTP server is serving the page.
+    /// The URL the QR encodes: the browser page, with the payload in the
+    /// FRAGMENT so it is never sent to whichever HTTP server is serving
+    /// that page — the browser keeps it client-side, which is the point of
+    /// a blind relay.
+    ///
+    /// `webBase` is `[remote] web_url`, whose default is this repository's
+    /// GitHub Pages site. Blank means "the relay serves the page", which is
+    /// now the self-hosted case rather than the default: whoever serves the
+    /// page chooses the JavaScript that encrypts for a browser device, so
+    /// keeping the page off the relay is what stops the relay from being
+    /// able to type into the Mac (security review C1). The payload itself
+    /// is identical either way.
+    ///
+    /// The building is in `RemotePairingPage` (MemtermCore) so it is under
+    /// unit test; this is the app-side seam that encodes the payload.
     static func pairingURL(for payload: PairingPayload, webBase: String = "") -> URL? {
         guard let json = try? JSONEncoder().encode(payload) else { return nil }
-        let trimmed = webBase.trimmingCharacters(in: .whitespaces)
-        guard var parts = Self.webComponents(relay: payload.relay, webBase: trimmed) else { return nil }
-        parts.fragment = "pair=" + base64url(json)
-        return parts.url
-    }
-
-    private static func webComponents(relay: String, webBase: String) -> URLComponents? {
-        if !webBase.isEmpty {
-            // An explicit page origin is used as given, apart from being
-            // anchored at its own root: a code that silently fell back to
-            // the relay when this was mistyped would quietly undo the one
-            // thing setting it was for.
-            guard let url = URL(string: webBase), url.host != nil,
-                  var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            else { return nil }
-            if parts.path.isEmpty { parts.path = "/" }
-            parts.query = nil
-            parts.fragment = nil
-            return parts
-        }
-        guard let url = URL(string: relay),
-              var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        else { return nil }
-        parts.scheme = url.scheme == "ws" ? "http" : "https"
-        parts.path = "/"
-        return parts
+        return RemotePairingPage.url(relay: payload.relay,
+                                     webBase: webBase,
+                                     fragment: "pair=" + base64url(json))
     }
 
     /// Drops a device: it leaves the store, the relay's allow-list is

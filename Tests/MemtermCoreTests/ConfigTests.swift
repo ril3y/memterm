@@ -350,13 +350,15 @@ final class RemoteConfigTests: XCTestCase {
 
     /// `web_url` decides which origin the pairing QR points at (security
     /// review C1): whoever serves that page can ship JavaScript into an
-    /// already-paired browser, so being able to move it off the relay is
-    /// the difference between trusting the relay operator and not.
+    /// already-paired browser, so keeping it off the relay is the
+    /// difference between trusting the relay operator and not. The default
+    /// is this repository's GitHub Pages site, built by its own CI.
     ///
     /// Unlike `relay_url`, blank is MEANINGFUL — it means "the relay serves
-    /// the page" — so a blank value must survive rather than be replaced.
-    func testWebURLDefaultsToEmptyAndKeepsABlankValue() {
-        XCTAssertEqual(Config().remoteWebURL, "")
+    /// the page too", the self-hosted case — so a blank value must survive
+    /// rather than be replaced by the default.
+    func testWebURLDefaultsToPagesAndKeepsABlankValue() {
+        XCTAssertEqual(Config().remoteWebURL, "https://ril3y.github.io/memterm/")
 
         let c = Config.parse("""
             [remote]
@@ -372,8 +374,13 @@ final class RemoteConfigTests: XCTestCase {
         round.remoteWebURL = "https://pages.example.test"
         let back = Config.parse(round.serialize())
         XCTAssertEqual(back.remoteWebURL, "https://pages.example.test")
-        // And a serialized default still round-trips as "use the relay".
-        XCTAssertEqual(Config.parse(Config().serialize()).remoteWebURL, "")
+        // A serialized blank still round-trips as "the relay serves it".
+        var selfHosted = Config()
+        selfHosted.remoteWebURL = ""
+        XCTAssertEqual(Config.parse(selfHosted.serialize()).remoteWebURL, "")
+        // And a serialized default still round-trips as the Pages site.
+        XCTAssertEqual(Config.parse(Config().serialize()).remoteWebURL,
+                       "https://ril3y.github.io/memterm/")
     }
 
     func testRoundTripsThroughSerialization() {

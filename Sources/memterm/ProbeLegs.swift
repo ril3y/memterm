@@ -3486,6 +3486,13 @@ extension MemtermAppDelegate {
                 else {
                     throw ProbeFailure("web_url did not move the pairing URL's origin while keeping its payload")
                 }
+                // The shipped default is a Pages PROJECT site, so the page
+                // lives under a path and the fragment has to land after it.
+                guard let pages = RemoteHost.pairingURL(for: payload, webBase: Config.defaultRemoteWebURL),
+                      pages.absoluteString == "https://ril3y.github.io/memterm/#" + fragment
+                else {
+                    throw ProbeFailure("the default web_url did not produce a Pages URL with the payload after its path")
+                }
                 guard remote.probeSessionCount == 1 else {
                     throw ProbeFailure("host session count \(remote.probeSessionCount) after handshake, want 1")
                 }

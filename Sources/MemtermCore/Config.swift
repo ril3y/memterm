@@ -132,16 +132,21 @@ public struct Config {
     // so the URL is a plain string the user may point at their own box.
     public var remoteEnabled = false
     public var remoteRelayURL = "wss://memterm-relay.fly.dev"
-    /// Where the browser client is served from, if not the relay itself.
+    /// Where the browser client is served from.
     ///
-    /// Empty (the default) means "derive it from `relay_url`", which is
-    /// what the QR code has always encoded. Setting it points the QR at a
-    /// different origin — a copy of `relay/web` on a host you control —
-    /// while the relay stays the WebSocket endpoint. That matters because
-    /// whoever serves the page can ship whatever JavaScript it likes to an
-    /// already-paired browser (security review C1); moving the page moves
-    /// that trust off the relay.
-    public var remoteWebURL = ""
+    /// The default is this repository's GitHub Pages site, built by its own
+    /// CI from `relay/web`. That is the security review's C1 answer:
+    /// whoever serves the page chooses the JavaScript that encrypts for a
+    /// browser device, so it can read every pane and type into the Mac —
+    /// and the relay, which used to serve it, is now only a forwarder of
+    /// bytes. The trust moves to GitHub and to a public commit history.
+    ///
+    /// Empty is still meaningful, and now means the SELF-HOSTED case: the
+    /// relay serves the page too, so the QR points at the relay's own
+    /// origin. A self-hoster sets this to their relay's https origin, or to
+    /// any other static host holding a copy of `relay/web`.
+    public static let defaultRemoteWebURL = "https://ril3y.github.io/memterm/"
+    public var remoteWebURL = Config.defaultRemoteWebURL
 
     public init() {}
 
@@ -255,9 +260,9 @@ public struct Config {
         // An empty relay_url would leave the host with nothing to dial, so it
         // keeps the default rather than producing a URL that cannot parse.
         if let s = string(values["remote.relay_url"]), !s.isEmpty { c.remoteRelayURL = s }
-        // Unlike relay_url, empty is MEANINGFUL here: it means "serve the
-        // client from the relay", so a blank value is kept rather than
-        // replaced by a default.
+        // Unlike relay_url, empty is MEANINGFUL here: it means "the relay
+        // serves the page as well", the self-hosted case — so a blank value
+        // is kept rather than replaced by the Pages default.
         if let s = string(values["remote.web_url"]) { c.remoteWebURL = s }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
@@ -385,7 +390,7 @@ public struct Config {
         lines.append("[remote]")
         lines.append("enabled = \(remoteEnabled)  # off = memterm never opens an outbound socket")
         lines.append("relay_url = \"\(remoteRelayURL)\"  # your own relay works too — it holds no secrets")
-        lines.append("web_url = \"\(remoteWebURL)\"  # blank = the relay serves the browser page; set it to serve that page yourself")
+        lines.append("web_url = \"\(remoteWebURL)\"  # where the browser page comes from; blank = your relay serves it")
         lines.append("")
         // [theme] stays LAST: its ansi0…15 keys are bare (untabled) names, so
         // any table written after it would be swallowed into [theme] on the
@@ -496,13 +501,15 @@ public struct Config {
 
         # Remote attach: mirror and type into these sessions from a phone.
         # The relay forwards end-to-end-encrypted envelopes it cannot read,
-        # but it also serves the browser page, so it can read and inject for
-        # browser devices; self-hosting it (or web_url) removes that trust.
+        # and nothing else: the browser page comes from GitHub Pages, built
+        # by this project's CI from its own source. Whoever serves that page
+        # can read and type for a browser device, so web_url is who you
+        # trust — point it at your own relay or static host to change that.
         # Off until you turn it on in Settings ▸ Remote and pair a device.
         # [remote]
         # enabled = false
-        # relay_url = "wss://memterm-relay.fly.dev"   # or your own self-hosted relay
-        # web_url = ""                                 # blank = the relay serves the browser page
+        # relay_url = "wss://memterm-relay.fly.dev"       # or your own self-hosted relay
+        # web_url = "https://ril3y.github.io/memterm/"    # blank = your relay serves the page too
 
         # [theme]
         # preset = "memterm-dark"  # display label set by Settings; colors win
