@@ -1,0 +1,68 @@
+name: Pages
+
+# The browser client, built from this repository and served by GitHub Pages
+# (security review C1). It used to come from the relay, which meant the
+# relay chose the JavaScript that encrypts and decrypts for a paired phone —
+# so it could read every pane and type into the Mac. Serving it from here
+# makes the code a phone runs the code that is in git, built by CI, and
+# leaves the relay forwarding bytes and nothing else. The relay keeps its
+# own copy for self-hosters; `[remote] web_url` picks between them.
+on:
+  push:
+    branches: ["feature/custom-tabs", "main"]
+    paths:
+      - "relay/web/**"
+      - "relay/src/auth.ts"        # the client imports idFromPublicKey from it
+      - "relay/src/envelope.ts"
+      - "relay/package.json"
+      - "relay/package-lock.json"
+      - "Tests/vectors/**"         # the cross-language crypto vectors
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: build · deploy to Pages
+    runs-on: ubuntu-latest
+    # `pages: write` + `id-token: write` are what configure-pages needs to
+    # CREATE the site on the first run (enablement below) and what
+    # deploy-pages needs to publish to it.
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+        working-directory: relay
+      # Emits relay/dist/web: index.html, app.js, xterm.css — exactly what
+      # the relay serves, so the two copies cannot drift.
+      - name: Build web client
+        run: npm run build
+        working-directory: relay
+      # `enablement: true` creates the Pages site itself on the first run
+      # (build_type "workflow"), so nobody has to click through repo
+      # settings before the first deploy.
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: relay/dist/web
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@v4
