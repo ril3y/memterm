@@ -3614,6 +3614,11 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("post-close input got reason=\(client.lastRefusedReason ?? "nil"), want unknown-pane")
                 }
                 closePrunesVerified = true
+                // Otherwise this stale "unknown-pane" would satisfy
+                // remote-revoke's own `lastRefusedReason != nil` condition
+                // instantly, before its actual "not-allowed" answer ever
+                // arrives.
+                client.resetLastRefusedReason()
             },
             onFailure: { tearDownRemoteLeg() }))
 

@@ -47,6 +47,12 @@ final class RemoteProbeClient {
     /// share with the first.
     private(set) var screenCount = 0
 
+    /// Clears a previously-observed refusal so a later step's `!= nil`
+    /// condition can't be satisfied by a stale reason left over from an
+    /// earlier one (e.g. remote-close-prunes's "unknown-pane" must not make
+    /// remote-revoke's "not-allowed" wait a no-op).
+    func resetLastRefusedReason() { lastRefusedReason = nil }
+
     // MARK: - Connection
 
     /// Opens (or re-opens, after a relay restart) the `/client` socket and
