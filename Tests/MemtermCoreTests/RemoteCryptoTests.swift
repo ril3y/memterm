@@ -419,15 +419,25 @@ final class RemoteCryptoTests: XCTestCase {
                 at: url.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            // Merge rather than overwrite: the file also carries the
+            // final-review Important 6 SPKI/peerId pair (below), which this
+            // HKDF-only leg knows nothing about and must not delete.
+            var merged = (try? JSONDecoder().decode([String: String].self,
+                                                    from: Data(contentsOf: url))) ?? [:]
+            for (key, value) in produced { merged[key] = value }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            var json = String(decoding: try encoder.encode(produced), as: UTF8.self)
+            var json = String(decoding: try encoder.encode(merged), as: UTF8.self)
             json.append("\n")
             try json.write(to: url, atomically: true, encoding: .utf8)
         }
 
         let expected = try JSONDecoder().decode([String: String].self, from: try Data(contentsOf: url))
-        XCTAssertEqual(produced, expected)
+        // Subset check, not full-dictionary equality: the file also carries
+        // the unrelated deviceSPKIHex/peerId pair (below).
+        for (key, value) in produced {
+            XCTAssertEqual(expected[key], value, "vectors mismatch for \(key)")
+        }
 
         // The two directions must not share a key.
         XCTAssertNotEqual(produced["hostToClientKeyHex"], produced["clientToHostKeyHex"])
@@ -435,5 +445,32 @@ final class RemoteCryptoTests: XCTestCase {
         // The client opens exactly what the vectors record.
         let record0 = try bytes(fromHex: try XCTUnwrap(expected["record0Hex"]))
         XCTAssertEqual(try clientKeys.open(record0), Data("hello".utf8))
+    }
+
+    /// Final-review Important 6: `testIdMatchesAnIdDerivedByTheRelayItself`
+    /// above pins one SPKI whose id was derived once, by hand, outside
+    /// Swift — but nothing had ever fed the SPKI half of a REAL WebCrypto
+    /// `exportKey("spki")` output through `x963(fromSPKI:)`. A divergence in
+    /// the exact 26-byte DER header or the 91-byte total length would leave
+    /// this Swift suite green while no browser could actually pair.
+    ///
+    /// `deviceSPKIHex`/`peerId` were produced by a one-off Node script
+    /// (`webcrypto.subtle.exportKey("spki", ...)`, hex-encoded, fed through
+    /// the relay's own compiled `idFromPublicKey`) — never hand-assembled —
+    /// and are asserted against this exact same file by
+    /// `relay/test/auth.test.ts`, so both suites check the identical bytes.
+    func testWebCryptoExportedSPKIMatchesTheSharedVector() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("vectors/remote-crypto-vectors.json")
+        let expected = try JSONDecoder().decode([String: String].self, from: try Data(contentsOf: url))
+        let spki = try bytes(fromHex: try XCTUnwrap(expected["deviceSPKIHex"]))
+        let peerId = try XCTUnwrap(expected["peerId"])
+
+        XCTAssertEqual(spki.count, 91)
+        XCTAssertNotNil(RemoteIdentity.x963(fromSPKI: spki),
+                        "a real WebCrypto SPKI export must be accepted by x963(fromSPKI:)")
+        XCTAssertEqual(RemoteIdentity.peerId(forSPKI: spki), peerId)
     }
 }
