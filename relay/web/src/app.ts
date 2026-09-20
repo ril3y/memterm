@@ -380,7 +380,17 @@ function handleRemoteMessage(msg: RemoteMessage): void {
       tree = msg.tree;
       if (term) {
         // Already attached (a `tree-changed` arrived mid-session): keep
-        // showing the terminal, just refresh the cached tree for later.
+        // showing the terminal, just refresh the cached tree for later --
+        // unless the attached pane itself is gone (closed locally on the
+        // host: final-review Important 1's tree-changed now actually fires
+        // for that). Left open, every further keystroke would just come
+        // back refused("unknown-pane") as a toast, one per keystroke.
+        // lastAttachedPaneId is left as-is -- this is not the dropped-session
+        // recovery path below, just leaving a dead terminal.
+        if (lastAttachedPaneId && !paneExists(msg.tree, lastAttachedPaneId)) {
+          leaveTerminal();
+          renderTree();
+        }
         return;
       }
       showView("tree");
