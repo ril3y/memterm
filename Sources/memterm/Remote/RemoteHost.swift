@@ -104,6 +104,16 @@ final class RemoteHost {
     /// without this a code the user watched expire would go live again, for a
     /// fresh two minutes, the moment the relay came back.
     private var pendingPair: (token: String, expiresAt: Date)?
+    /// The deadline of the currently-shown QR sheet, if any (final-review
+    /// Important 3). Set whenever a payload is published (`publishPairing`,
+    /// and therefore `startPairing`) and cleared early by `endPairing()` —
+    /// the sheet's dismissal, of any kind — so a `pair-request` arriving
+    /// after the user has stopped looking at the code is auto-denied
+    /// instead of still reaching the "Allow ?" prompt. Reading it against
+    /// `now` (rather than scheduling a Timer) means the 120 s expiry closes
+    /// the window on its own with no extra timer to keep in sync with the
+    /// relay's.
+    private var pairingWindowDeadline: Date?
     /// Generation counter: every connect attempt bumps it, and a callback
     /// from an older socket is ignored. Without it, a slow failure from a
     /// socket we already replaced would schedule a second reconnect loop.
@@ -185,10 +195,13 @@ final class RemoteHost {
 
     /// Registers a minted payload's token with the relay — now if we are
     /// connected, otherwise on the next auth, and never after the deadline
-    /// the user was shown.
+    /// the user was shown. Also opens the pairing window (final-review
+    /// Important 3): a `pair-request` is only ever entertained between here
+    /// and `endPairing()`/the same deadline.
     func publishPairing(_ payload: PairingPayload) {
-        pendingPair = (token: payload.token,
-                       expiresAt: Date(timeIntervalSince1970: Double(payload.expiresAt) / 1000))
+        let expiresAt = Date(timeIntervalSince1970: Double(payload.expiresAt) / 1000)
+        pendingPair = (token: payload.token, expiresAt: expiresAt)
+        pairingWindowDeadline = expiresAt
         sendPairTokenIfPossible()
     }
 
@@ -199,6 +212,26 @@ final class RemoteHost {
         let payload = makePairingPayload(now: now)
         publishPairing(payload)
         return payload
+    }
+
+    /// Closes the pairing window right now, regardless of the deadline —
+    /// the QR sheet's completion handler calls this on every dismissal
+    /// (Done, Cancel, or the window simply closing), so a token that is
+    /// still technically live at the relay for up to 120 s stops being able
+    /// to reach the "Allow ?" prompt the moment nobody is looking at the
+    /// code anymore. Also drops a not-yet-published token outright, so it
+    /// can never go live later. Idempotent; safe to call with no pairing in
+    /// progress.
+    func endPairing() {
+        pairingWindowDeadline = nil
+        pendingPair = nil
+    }
+
+    /// Whether a `pair-request` may currently reach the user. `now` is
+    /// injectable for tests; production callers use the default.
+    func isPairingWindowOpen(now: Date = Date()) -> Bool {
+        guard let pairingWindowDeadline else { return false }
+        return now < pairingWindowDeadline
     }
 
     /// The URL the QR encodes: the relay's own web client, with the payload
@@ -418,6 +451,14 @@ final class RemoteHost {
                 }
                 self.sendJSON(["type": "pair-answer", "deviceId": deviceId, "accept": allowed])
             }
+        }
+        guard isPairingWindowOpen() else {
+            // Final-review Important 3: the QR sheet is closed (or its 120 s
+            // deadline has passed) — a request against a token from an
+            // earlier, dismissed pairing must not still be able to reach the
+            // user.
+            accept(false)
+            return
         }
         guard let onPairRequest else {
             // Nobody is watching (Settings is closed): deny rather than let a

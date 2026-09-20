@@ -227,6 +227,12 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
             self?.countdownTimer?.invalidate()
             self?.countdownTimer = nil
             self?.pairingSheet = nil
+            // Final-review Important 3: every dismissal of this sheet (Done,
+            // Cancel, or the window just closing) ends the pairing window,
+            // so a token that is technically still live at the relay can no
+            // longer reach the "Allow ?" prompt once nobody is looking at
+            // the QR anymore.
+            self?.host.endPairing()
         }
     }
 

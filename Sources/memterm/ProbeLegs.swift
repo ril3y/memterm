@@ -3363,6 +3363,7 @@ extension MemtermAppDelegate {
         let client = RemoteProbeClient()
         var pairingPayload: PairingPayload?
         var incomingPairName: String?
+        var pairingWindowClosedClient: RemoteProbeClient?
         var pane: PaneView?
         var closePane: PaneView?
         var closeProbeController: TerminalWindowController?
@@ -3385,6 +3386,7 @@ extension MemtermAppDelegate {
             guard !remoteLegTornDown else { return }
             remoteLegTornDown = true
             client.disconnect()
+            pairingWindowClosedClient?.disconnect()
             if relay.isRunning {
                 relay.terminate()
                 relay.waitUntilExit()
@@ -3453,6 +3455,39 @@ extension MemtermAppDelegate {
                 guard remote.probeSessionCount == 1 else {
                     throw ProbeFailure("host session count \(remote.probeSessionCount) after handshake, want 1")
                 }
+            },
+            onFailure: { tearDownRemoteLeg() }))
+
+        probe.add(ProbeStep(
+            // Final-review Important 3: a QR sheet's token must stop being
+            // able to reach the "Allow ?" prompt the moment the sheet
+            // closes, even though the relay itself keeps the token alive
+            // for the rest of its 120 s window. This mints a SECOND token,
+            // closes its pairing window immediately (mirroring the sheet's
+            // completion handler calling endPairing()), and has a fresh
+            // device attempt it — the still-cryptographically-valid token
+            // must still come back pair-denied, without ever reaching
+            // onPairRequest (which would auto-accept, per the step above).
+            name: "remote-pairing-window-closes", timeout: 10,
+            action: { [self] in
+                incomingPairName = nil
+                let payload = remote.startPairing()
+                remote.endPairing()
+                let device = RemoteProbeClient()
+                pairingWindowClosedClient = device
+                device.connect(relay: relayURL)
+                device.pair(payload, name: "probe-client-late")
+            },
+            condition: { pairingWindowClosedClient?.paired == false },
+            assert: {
+                guard pairingWindowClosedClient?.paired == false else {
+                    throw ProbeFailure("pair attempt after endPairing() was not denied (paired=\(String(describing: pairingWindowClosedClient?.paired)))")
+                }
+                guard incomingPairName == nil else {
+                    throw ProbeFailure("closed-window pair-request reached onPairRequest (name=\(incomingPairName ?? "nil")) instead of being auto-denied")
+                }
+                pairingWindowClosedClient?.disconnect()
+                pairingWindowClosedClient = nil
             },
             onFailure: { tearDownRemoteLeg() }))
 
