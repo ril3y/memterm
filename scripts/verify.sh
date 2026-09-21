@@ -226,6 +226,8 @@ check "fresh-default-capture-cells" "$LOG/probe-fresh-default.log" "UIPROBE-CAPT
 # and "Don't ask me again" persisted false.
 check "fresh-default-close-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CLOSE-CONFIRM closed=true rows_forgotten=true setting_now=false saved_false=true"
 check "fresh-default-cmdw-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CMDW-CONFIRM sheet=true cancelled=true tab_alive=true setting_kept_on=true"
+# Founder 2026-09-21: a plain click on a parked chip must not unpark it.
+check "fresh-default-parked-click" "$LOG/probe-fresh-default.log" "UIPROBE-PARKED-CLICK still_parked=true active_unchanged=true"
 # Quake-style drop-down (2026-09-09): shown at the configured frame, hidden
 # off-edge with its tab live, journaled with its role, per-workspace.
 # Founder 2026-09-19: an inline workspace rename must survive a chip-row refresh and a click into the field.

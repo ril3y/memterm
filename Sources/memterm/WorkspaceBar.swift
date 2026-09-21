@@ -15,7 +15,8 @@ import MemtermCore
 // the active one visually distinct, parked ones dimmed with "(parked)",
 // plus a "+" to create one.
 //
-//   click a chip           = switch to it (reopens if parked); a single
+//   click a chip           = switch to it (a PARKED chip ignores clicks —
+//                            reopen is right-click ▸ Reopen only); a single
 //                            click on the ACTIVE chip is a no-op (already
 //                            active — founder polish 2026-09-01: single-click
 //                            rename fired accidentally too often)
@@ -456,7 +457,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         // The active workspace's chip never indicates (the user is looking at
         // it) — belt and braces on top of the center's own guard.
         applyActivity(isActive ? .idle : activity)
-        toolTip = isParked ? "\(name) — parked. Click to reopen."
+        toolTip = isParked ? "\(name) — parked. Right-click ▸ Reopen."
             : isActive ? "Double-click to rename" : "Switch to \(name)"
         closeButton.toolTip = isParked ? "Forget \(name)…" : "Park \(name) (keeps its memory)"
     }
@@ -548,6 +549,11 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         // Single click on the active chip: no-op — it is already active, and
         // a single click must never start a rename.
         if isActive { return }
+        // Founder 2026-09-21: a single click must NOT unpark. Parking is a
+        // deliberate "put it away" gesture; a stray click on the dimmed chip
+        // used to resurrect the whole workspace. Reopen is an explicit
+        // right-click ▸ Reopen (or the timeline card) — nothing else.
+        if isParked { return }
         // Deferred: switching orders out this chip's own window (the outgoing
         // workspace's, FR-59 hide/show) — never hide the window from inside
         // its own mouseDown.

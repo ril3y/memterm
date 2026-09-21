@@ -828,6 +828,71 @@ extension MemtermAppDelegate {
             }))
 
         // ---------------------------------------------------------------
+        // Founder 2026-09-21: a plain click on a PARKED chip must not
+        // unpark it. Parking is deliberate; reopening is right-click ▸
+        // Reopen (or the timeline card). Drives the chip's REAL mouseDown.
+        // ---------------------------------------------------------------
+        final class ParkedClickProbe {
+            var workspaceId: String?
+            var settled = false
+            var stillParked = false
+            var activeUnchanged = false
+        }
+        let parkedClick = ParkedClickProbe()
+        probe.add(ProbeStep(
+            name: "parked-chip-click-ignored", timeout: 8,
+            action: { [self] in
+                guard config.workspaceBar else { parkedClick.settled = true; return }
+                guard let store = memory?.store else {
+                    probeFail("parked-click leg: no store")
+                }
+                let before = activeWorkspaceId
+                guard let id = createWorkspace(named: "ParkClick Probe") else {
+                    probeFail("parked-click leg: could not create a workspace")
+                }
+                parkedClick.workspaceId = id
+                if activeWorkspaceId != before { switchToWorkspace(before) }
+                parkWorkspace(id)
+                guard store.listWorkspaces().first(where: { $0.id == id })?.isParked == true else {
+                    probeFail("parked-click leg: workspace did not park")
+                }
+                guard let host = keyHost(), let bar = host.workspaceBar,
+                      let chip = bar.probeChipView(id), bar.probeChipIsParked(id) else {
+                    probeFail("parked-click leg: no parked chip for the workspace")
+                }
+                let center = NSPoint(x: chip.bounds.midX, y: chip.bounds.midY)
+                guard let single = probeMouseEvent(.leftMouseDown, in: chip,
+                                                   at: center, clickCount: 1) else {
+                    probeFail("parked-click leg: could not synthesize the event")
+                }
+                chip.mouseDown(with: single)
+                // The (former) switch path hops to the main queue; give it a
+                // few turns so a regression would actually show up here.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+                    parkedClick.stillParked = store.listWorkspaces()
+                        .first(where: { $0.id == id })?.isParked == true
+                    parkedClick.activeUnchanged = (activeWorkspaceId == before)
+                    parkedClick.settled = true
+                }
+            },
+            condition: { parkedClick.settled },
+            assert: { [self] in
+                defer { if let id = parkedClick.workspaceId { forgetWorkspace(id) } }
+                guard config.workspaceBar else {
+                    probe.skipLine(step: "parked-chip-click-ignored", reason: "workspace_bar=false")
+                    return
+                }
+                guard parkedClick.stillParked, parkedClick.activeUnchanged else {
+                    throw ProbeFailure("click on a parked chip unparked it: still_parked=\(parkedClick.stillParked) active_unchanged=\(parkedClick.activeUnchanged)")
+                }
+                print("UIPROBE-PARKED-CLICK still_parked=true active_unchanged=true")
+            },
+            onFailure: { [self] in
+                if let id = parkedClick.workspaceId { forgetWorkspace(id) }
+                print("UIPROBE-PARKED-CLICK still_parked=\(parkedClick.stillParked) active_unchanged=\(parkedClick.activeUnchanged)")
+            }))
+
+        // ---------------------------------------------------------------
         // Random workspace colors (founder polish 2026-09-01): every NEW
         // workspace draws a preset no existing workspace is using — repeats
         // are legal only once all six presets are taken. Exercises the REAL
