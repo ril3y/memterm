@@ -4460,14 +4460,46 @@ extension MemtermAppDelegate {
         var hosts: [WindowHostController] = []
         var framesBefore: [NSRect] = []
         var framesAfter: [NSRect] = []
-        var beforeBytes: UInt64 = 0
-        var afterBytes: UInt64 = 0
         var baselineBytes: UInt64 = 0
+        /// One entry per present/release cycle: the hidden state it started
+        /// from, the presented state, and the hidden state it ended at.
+        var cycles: [(from: UInt64, before: UInt64, after: UInt64)] = []
         var churnStartBytes: UInt64 = 0
         var churnBytes: UInt64 = 0
         var expectedBytes: Double = 0
         var rendered = false
-        var releasedBytes: Double { max(0, Double(beforeBytes) - Double(afterBytes)) }
+        /// The cycle with the clearest signal — the one the verdict reads.
+        var best: (from: UInt64, before: UInt64, after: UInt64) {
+            cycles.max { bump($0) < bump($1) } ?? (0, 0, 0)
+        }
+        func released(_ cycle: (from: UInt64, before: UInt64, after: UInt64)) -> Double {
+            Double(cycle.before) - Double(cycle.after)
+        }
+        func cost(_ cycle: (from: UInt64, before: UInt64, after: UInt64)) -> Double {
+            Double(cycle.before) - Double(cycle.from)
+        }
+        /// THE statistic, and the reason this leg is not a coin flip: a
+        /// released window has no drawables, so presenting it must ALLOCATE
+        /// and hiding it must FREE — the cycle's footprint has to rise above
+        /// the settled hidden states on BOTH sides of it. Taking the smaller
+        /// of the two rises is what makes the reading immune to the slow
+        /// downward drift this process shows over a probe run: drift moves
+        /// `from -> before` and `before -> after` the same way, so it can
+        /// only ever cancel out here, while a real allocate/free moves them
+        /// in opposite directions. Measured with the release stubbed out,
+        /// 11 MB of drift landed inside one cycle's hide window and read as
+        /// a 10.8 MB "release" — this statistic read -0.1 MB for the same
+        /// cycle and refused it.
+        func bump(_ cycle: (from: UInt64, before: UInt64, after: UInt64)) -> Double {
+            min(cost(cycle), released(cycle))
+        }
+        var beforeBytes: UInt64 { best.before }
+        var afterBytes: UInt64 { best.after }
+        var releasedBytes: Double { released(best) }
+        /// What presenting the (released) windows cost in that same cycle,
+        /// measured against the settled hidden state it started from.
+        var presentedCost: Double { cost(best) }
+        var bestBump: Double { bump(best) }
         var framesStable: Bool {
             framesBefore.count == framesAfter.count
                 && zip(framesBefore, framesAfter).allSatisfy { $0 == $1 }
@@ -4480,7 +4512,7 @@ extension MemtermAppDelegate {
         func mb(_ bytes: Double) -> String { String(format: "%.1f", bytes / (1024 * 1024)) }
 
         probe.addStateful(ProbeStep(
-            name: "hidden-windows-release-surfaces", timeout: 70,
+            name: "hidden-windows-release-surfaces", timeout: 150,
             action: { [self] in
                 guard config.workspaceBar else {
                     state.skipped = true
@@ -4522,15 +4554,27 @@ extension MemtermAppDelegate {
                     state.expectedBytes = state.hosts
                         .compactMap { $0.window.map(probeWindowDrawableBytes) }
                         .min() ?? 0
-                    // BASELINE: the hidden steady state the switches left —
-                    // settled, because a switch's own re-render takes seconds
-                    // to drain and would otherwise be read as window memory.
+                    // BASELINE: the hidden steady state the switches left.
+                    // Settled, not read once — the leg that runs just before
+                    // this one (the remote end-to-end teardown) and the three
+                    // switches themselves leave tens of MB draining for
+                    // seconds, and an unsettled baseline read as "-52 MB of
+                    // presenting cost" on a loaded machine (2026-09-21).
                     settle { bytes in
                         state.baselineBytes = bytes
-                        present()
+                        cycle(0, from: bytes)
                     }
                 }
-                func present() {
+                // ONE present/release cycle, repeated up to three times.
+                // Presenting three windows costs ~5 MB of real drawables and
+                // warms ~60 MB of something else (glyph and compositor
+                // scratch) that drains in steps for up to ten seconds.
+                // Settling handles that; the repeat is the belt to its
+                // braces, since a later cycle runs against an already-warm
+                // allocator. A stubbed release returns nothing in ANY cycle,
+                // so repeating cannot manufacture a pass — it only removes
+                // the one-in-three chance that a slow drain hid a real one.
+                func cycle(_ index: Int, from: UInt64) {
                     // BEFORE: the same windows with their drawables resident.
                     // Presenting a released window re-allocates them; quiet
                     // runs keep the windows offscreen, so nothing appears.
@@ -4539,43 +4583,46 @@ extension MemtermAppDelegate {
                         host.window?.orderFront(nil)
                         host.window?.displayIfNeeded()
                     }
-                    settle { bytes in
-                        state.beforeBytes = bytes
-                        release()
+                    settle { before in
+                        // AFTER: the same windows through the REAL hide path.
+                        for host in state.hosts { host.orderOutReleasingSurfaces() }
+                        settle { after in
+                            let measured = (from: from, before: before, after: after)
+                            state.cycles.append(measured)
+                            if state.bump(measured) >= state.expectedBytes || index >= 2 {
+                                switchBack()
+                            } else {
+                                cycle(index + 1, from: after)
+                            }
+                        }
                     }
                 }
-                func release() {
-                    // AFTER: the same windows through the REAL hide path.
-                    for host in state.hosts { host.orderOutReleasingSurfaces() }
-                    settle { bytes in
-                        state.afterBytes = bytes
-                        switchBack()
-                    }
-                }
-                /// Samples the footprint every 0.3 s and reports the lowest
-                /// reading once it has stopped falling for six samples (or
-                /// after 7 s). The window server destroys surfaces
-                /// ASYNCHRONOUSLY and in steps — the footprint is unchanged
-                /// the instant orderOut returns and lands over the next 0.3
-                /// to 2 s in a staircase with plateaus — so a fixed delay
-                /// reads whichever step it lands on (measured: 9 MB to 66 MB
-                /// for the same release). Settling is the difference between
-                /// a gate and a coin flip.
+                /// Samples the footprint every 0.3 s and reports the LOWEST
+                /// reading once it has stopped falling for twenty samples (or
+                /// after sixty). Both numbers come off measured curves, not
+                /// taste: presenting three windows drains in a staircase
+                /// whose plateaus run as long as SIXTEEN samples before the
+                /// next step lands, and the whole drain takes thirty-five.
+                /// A six-sample rule exited on those plateaus and read
+                /// anything from 0.4 MB to 64 MB for the SAME release. The
+                /// lowest reading rather than the last, because this
+                /// footprint only falls as memory drains — an upward blip is
+                /// some other allocation arriving, not this one failing.
                 func settle(_ done: @escaping (UInt64) -> Void) {
-                    func poll(previous: UInt64, stable: Int, samples: Int) {
+                    func poll(best: UInt64, stable: Int, samples: Int) {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                             let now = probePhysFootprint() ?? 0
-                            let improved = now + 512 * 1024 < previous
+                            let improved = now + 512 * 1024 < best
                             let stableNow = improved ? 0 : stable + 1
-                            if (stableNow >= 6 && samples >= 6) || samples >= 24 {
-                                done(min(now, previous))
+                            if stableNow >= 20 || samples >= 60 {
+                                done(min(now, best))
                             } else {
-                                poll(previous: min(now, previous), stable: stableNow,
+                                poll(best: min(now, best), stable: stableNow,
                                      samples: samples + 1)
                             }
                         }
                     }
-                    poll(previous: .max, stable: 0, samples: 0)
+                    poll(best: .max, stable: 0, samples: 0)
                 }
                 func switchBack() {
                     switchToWorkspace(state.startWorkspace)
@@ -4628,34 +4675,23 @@ extension MemtermAppDelegate {
                 if let failure = state.failure { throw ProbeFailure(failure) }
                 print("UIPROBE-HIDDEN-SURFACES before_mb=\(mb(Double(state.beforeBytes))) after_mb=\(mb(Double(state.afterBytes))) released_mb=\(mb(state.releasedBytes)) frames_stable=\(state.framesStable)")
                 print("UIPROBE-HIDDEN-SURFACES-DETAIL hidden_windows=\(state.hosts.count) baseline_mb=\(mb(Double(state.baselineBytes))) expected_per_window_mb=\(mb(state.expectedBytes)) pane_rendered=\(state.rendered) switch_churn_mb=\(mb(Double(state.churnStartBytes)))->\(mb(Double(state.churnBytes)))")
+                print("UIPROBE-HIDDEN-SURFACES-CYCLES \(state.cycles.map { "\(mb(Double($0.from)))/\(mb(Double($0.before)))/\(mb(Double($0.after)))" })")
                 guard state.expectedBytes > 0 else {
                     throw ProbeFailure("no drawable size for the hidden windows")
                 }
-                // FLOOR: one window's single-buffer drawable. Calibrated
-                // against the stubbed-out release, which measures EXACTLY
-                // zero here — hidden windows keep every byte, baseline ==
-                // before == after, and presenting them costs nothing because
-                // nothing was given back. With the release in place the same
-                // three 980x640 windows return 8-9 MB against a 2.4 MB
-                // floor, so this separates behavior from noise by ~4x.
-                let floorBytes = state.expectedBytes
-                guard state.releasedBytes >= floorBytes else {
-                    throw ProbeFailure("hiding \(state.hosts.count) windows returned \(mb(state.releasedBytes)) MB, under one window's \(mb(floorBytes)) MB drawable")
+                guard !state.cycles.isEmpty else {
+                    throw ProbeFailure("no present/release cycle completed")
                 }
-                // The other half of the same truth: a HIDDEN window holds no
-                // drawables, so presenting it has to allocate them. Without
-                // the release this is zero — the surfaces were already there.
-                // This reading is the fragile one: baseline and before are
-                // seconds apart, and an unrelated asynchronous free landing
-                // in between (the remote leg's teardown runs just before
-                // this leg) drags `before` under `baseline`, which read as
-                // "-52 MB" on a loaded machine (2026-09-21). So it only
-                // decides the verdict when the release signal itself is
-                // weak; a strong release (≥ 3× the floor) is proof enough.
-                let presentedCost = Double(state.beforeBytes) - Double(state.baselineBytes)
-                print("UIPROBE-HIDDEN-SURFACES-PRESENT cost_mb=\(mb(presentedCost)) floor_mb=\(mb(floorBytes))")
-                guard presentedCost >= floorBytes || state.releasedBytes >= floorBytes * 3 else {
-                    throw ProbeFailure("presenting \(state.hosts.count) hidden windows cost \(mb(presentedCost)) MB and hiding released only \(mb(state.releasedBytes)) MB — they still held their drawables while hidden")
+                // FLOOR: one window's single-buffer drawable. Calibrated
+                // against the stubbed-out release, where hidden windows keep
+                // every byte and the bump is zero (measured -0.1 and -0.0 MB)
+                // in every cycle. With the release in place the same three
+                // 980x640 windows bump 10-15 MB against a 2.4 MB floor, so
+                // this separates behavior from noise by ~4x.
+                let floorBytes = state.expectedBytes
+                print("UIPROBE-HIDDEN-SURFACES-PRESENT cost_mb=\(mb(state.presentedCost)) bump_mb=\(mb(state.bestBump)) floor_mb=\(mb(floorBytes))")
+                guard state.bestBump >= floorBytes else {
+                    throw ProbeFailure("across \(state.cycles.count) cycles the best showed presenting \(state.hosts.count) hidden windows cost \(mb(state.presentedCost)) MB and hiding them returned \(mb(state.releasedBytes)) MB — under one window's \(mb(floorBytes)) MB drawable on one side or the other, so they were holding their drawables while hidden")
                 }
                 guard state.framesStable else {
                     throw ProbeFailure("FR-59: window frames moved across the hide/show round trip \(state.framesBefore) -> \(state.framesAfter)")
@@ -4678,6 +4714,7 @@ extension MemtermAppDelegate {
                 print("UIPROBE-HIDDEN-SURFACES-STATE released_flags=\(state.hosts.map(\.surfacesReleased))")
                 print("UIPROBE-HIDDEN-SURFACES before_mb=\(mb(Double(state.beforeBytes))) after_mb=\(mb(Double(state.afterBytes))) released_mb=\(mb(state.releasedBytes)) frames_stable=\(state.framesStable)")
                 print("UIPROBE-HIDDEN-SURFACES-DETAIL hidden_windows=\(state.hosts.count) baseline_mb=\(mb(Double(state.baselineBytes))) expected_per_window_mb=\(mb(state.expectedBytes)) pane_rendered=\(state.rendered) switch_churn_mb=\(mb(Double(state.churnStartBytes)))->\(mb(Double(state.churnBytes)))")
+                print("UIPROBE-HIDDEN-SURFACES-CYCLES \(state.cycles.map { "\(mb(Double($0.from)))/\(mb(Double($0.before)))/\(mb(Double($0.after)))" })")
                 for id in state.workspaces { forgetWorkspace(id) }
             }))
     }
