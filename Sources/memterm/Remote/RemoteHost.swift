@@ -283,7 +283,13 @@ final class RemoteHost {
     /// The building is in `RemotePairingPage` (MemtermCore) so it is under
     /// unit test; this is the app-side seam that encodes the payload.
     static func pairingURL(for payload: PairingPayload, webBase: String = "") -> URL? {
-        guard let json = try? JSONEncoder().encode(payload) else { return nil }
+        // sortedKeys: Darwin's JSONEncoder does not promise the same key
+        // order across two encodes of one value (the probe caught two
+        // fragments of the same payload differing, 2026-09-21). A QR minted
+        // twice must be byte-identical.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let json = try? encoder.encode(payload) else { return nil }
         return RemotePairingPage.url(relay: payload.relay,
                                      webBase: webBase,
                                      fragment: "pair=" + base64url(json))
