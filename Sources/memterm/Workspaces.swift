@@ -67,7 +67,7 @@ extension MemtermAppDelegate {
         // The drop-down panel is never a swap slot: the outgoing one hides
         // with its workspace, the incoming one stays hidden until its hotkey.
         for panel in hosts where panel.isDropdown && panel.workspaceId == outgoingId {
-            panel.window?.orderOut(nil)
+            panel.orderOutReleasingSurfaces()
         }
         var outgoing = hosts.filter { $0.workspaceId == outgoingId && !$0.isDropdown }
         if let keyWindow = NSApp.keyWindow ?? NSApp.mainWindow
@@ -86,7 +86,7 @@ extension MemtermAppDelegate {
             let adoptFrame = outgoing.first?.window?.frame
             let fresh = openNewWindow(in: id)
             if let adoptFrame { fresh.window?.setFrame(adoptFrame, display: true) }
-            for host in outgoing { host.window?.orderOut(nil) }
+            for host in outgoing { host.orderOutReleasingSurfaces() }
         } else {
             // Resurrect path: no live tabs for this workspace exist — journal
             // rows become fresh tab models in fresh hosts; the primary host
@@ -143,12 +143,16 @@ extension MemtermAppDelegate {
             if fade { visible.beginContentCrossfade() }
             visible.setTabs(incomingTabs, selecting: incomingSelected)
             holder.setTabs(outgoingTabs, selecting: outgoingSelected)
-            holder.window?.orderOut(nil)  // the holder stays (or goes) hidden
+            // The holder stays (or goes) hidden — and gives its drawables
+            // back on the way (it is normally hidden already, in which case
+            // releasing is the no-op its content view's state says it is).
+            holder.orderOutReleasingSurfaces()
         }
         // Incoming groups beyond the overlap: show their hosts as-is.
         if incoming.count > outgoing.count {
             for host in incoming[outgoing.count...] {
                 guard let window = host.window else { continue }
+                host.restoreGPUSurfaces()
                 if fade { window.alphaValue = 0 }
                 window.orderFront(nil)
             }
@@ -170,13 +174,13 @@ extension MemtermAppDelegate {
                     // Re-switch during the fade: hide only what is still not
                     // the active workspace's (the swap may have re-homed it).
                     if host.workspaceId != self.activeWorkspaceId {
-                        host.window?.orderOut(nil)
+                        host.orderOutReleasingSurfaces()
                     }
                     host.window?.alphaValue = 1
                 }
             })
         } else {
-            for host in extraOutgoing { host.window?.orderOut(nil) }
+            for host in extraOutgoing { host.orderOutReleasingSurfaces() }
         }
         (outgoing.first ?? incoming.first)?.focusWindow()
     }
@@ -189,7 +193,7 @@ extension MemtermAppDelegate {
     private func crossfadeInResurrected(incomingId: String, outgoingId: String,
                                         outgoing: [WindowHostController], fade: Bool) {
         guard fade else {
-            for host in outgoing { host.window?.orderOut(nil) }
+            for host in outgoing { host.orderOutReleasingSurfaces() }
             return
         }
         let incomingWindows = hosts.filter { $0.workspaceId == incomingId && !$0.isDropdown }
@@ -204,7 +208,7 @@ extension MemtermAppDelegate {
             for host in outgoing {
                 // Re-switch during the fade: leave the now-active alone.
                 if host.workspaceId != self.activeWorkspaceId {
-                    host.window?.orderOut(nil)
+                    host.orderOutReleasingSurfaces()
                 }
                 host.window?.alphaValue = 1
             }

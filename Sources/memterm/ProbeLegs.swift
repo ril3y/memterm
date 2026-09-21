@@ -1051,6 +1051,12 @@ extension MemtermAppDelegate {
         // echo round trip) runs once per verify.sh pass, not once per
         // fresh-mode config variant.
         if mode == "fresh" { addRemoteSteps(probe) }
+        // Hidden-window GPU surfaces (founder 2026-09-21). Fresh-mode only:
+        // it builds three workspaces of its own, measures the process
+        // footprint around a real hide, and forgets them again — a restored
+        // world's shared manifest has no business repeating that, and a
+        // footprint measurement wants the quietest world available.
+        if mode == "fresh" { addHiddenWindowMemorySteps(probe) }
         // Quake-style drop-down legs: before the archive legs (which wipe
         // the probe state dir last by design).
         addDropdownSteps(probe)
@@ -4382,6 +4388,236 @@ extension MemtermAppDelegate {
                 }
                 switchToWorkspace(previousId)  // leave the world as found
                 print("UIPROBE-TIMELINE-PARKED workspace=\(parkedId.prefix(8)) reopened=true card_cleared=true")
+            }))
+    }
+
+    // MARK: - Hidden-window GPU surfaces (founder 2026-09-21: a 1.0 GB
+    // instance whose 442 MB of IOSurface belonged to windows nobody could
+    // see). FR-59 keeps hidden workspaces' ptys and processes alive; it must
+    // NOT keep their window-sized GPU drawables resident.
+
+    /// Cross-phase state for the single `hidden-windows-release-surfaces`
+    /// step (the leg is a timed sequence, like the parked-chip-click leg).
+    private final class HiddenSurfaceProbe {
+        var settled = false
+        var skipped = false
+        var failure: String?
+        var workspaces: [String] = []
+        var startWorkspace = ""
+        var hosts: [WindowHostController] = []
+        var framesBefore: [NSRect] = []
+        var framesAfter: [NSRect] = []
+        var beforeBytes: UInt64 = 0
+        var afterBytes: UInt64 = 0
+        var baselineBytes: UInt64 = 0
+        var churnStartBytes: UInt64 = 0
+        var churnBytes: UInt64 = 0
+        var expectedBytes: Double = 0
+        var rendered = false
+        var releasedBytes: Double { max(0, Double(beforeBytes) - Double(afterBytes)) }
+        var framesStable: Bool {
+            framesBefore.count == framesAfter.count
+                && zip(framesBefore, framesAfter).allSatisfy { $0 == $1 }
+        }
+    }
+
+    // swiftlint:disable:next function_body_length
+    private func addHiddenWindowMemorySteps(_ probe: ProbeRunner) {
+        let state = HiddenSurfaceProbe()
+        func mb(_ bytes: Double) -> String { String(format: "%.1f", bytes / (1024 * 1024)) }
+
+        probe.addStateful(ProbeStep(
+            name: "hidden-windows-release-surfaces", timeout: 70,
+            action: { [self] in
+                guard config.workspaceBar else {
+                    state.skipped = true
+                    state.settled = true
+                    return
+                }
+                state.startWorkspace = activeWorkspaceId
+                for i in 0..<3 {
+                    guard let id = createWorkspace(named: "HiddenSurfaces-\(i)") else {
+                        state.failure = "createWorkspace failed"
+                        state.settled = true
+                        return
+                    }
+                    state.workspaces.append(id)
+                }
+                // Visit each in turn: every one materializes a window of its
+                // own, and each visit hides the one before it — exactly the
+                // founder's ten-workspace shape, at three.
+                func visit(_ index: Int) {
+                    guard index < state.workspaces.count else {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { measure() }
+                        return
+                    }
+                    switchToWorkspace(state.workspaces[index])
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { visit(index + 1) }
+                }
+                func measure() {
+                    // Every host that is not presenting the active workspace.
+                    state.hosts = hosts.filter {
+                        !$0.isDropdown && $0.window != nil
+                            && $0.workspaceId != self.activeWorkspaceId
+                    }
+                    guard state.hosts.count >= 3 else {
+                        state.failure = "only \(state.hosts.count) hidden hosts after three switches"
+                        state.settled = true
+                        return
+                    }
+                    state.framesBefore = state.hosts.compactMap { $0.window?.frame }
+                    state.expectedBytes = state.hosts
+                        .compactMap { $0.window.map(probeWindowDrawableBytes) }
+                        .min() ?? 0
+                    // BASELINE: the hidden steady state the switches left —
+                    // settled, because a switch's own re-render takes seconds
+                    // to drain and would otherwise be read as window memory.
+                    settle { bytes in
+                        state.baselineBytes = bytes
+                        present()
+                    }
+                }
+                func present() {
+                    // BEFORE: the same windows with their drawables resident.
+                    // Presenting a released window re-allocates them; quiet
+                    // runs keep the windows offscreen, so nothing appears.
+                    for host in state.hosts {
+                        host.restoreGPUSurfaces()
+                        host.window?.orderFront(nil)
+                        host.window?.displayIfNeeded()
+                    }
+                    settle { bytes in
+                        state.beforeBytes = bytes
+                        release()
+                    }
+                }
+                func release() {
+                    // AFTER: the same windows through the REAL hide path.
+                    for host in state.hosts { host.orderOutReleasingSurfaces() }
+                    settle { bytes in
+                        state.afterBytes = bytes
+                        switchBack()
+                    }
+                }
+                /// Samples the footprint every 0.3 s and reports the lowest
+                /// reading once it has stopped falling for six samples (or
+                /// after 7 s). The window server destroys surfaces
+                /// ASYNCHRONOUSLY and in steps — the footprint is unchanged
+                /// the instant orderOut returns and lands over the next 0.3
+                /// to 2 s in a staircase with plateaus — so a fixed delay
+                /// reads whichever step it lands on (measured: 9 MB to 66 MB
+                /// for the same release). Settling is the difference between
+                /// a gate and a coin flip.
+                func settle(_ done: @escaping (UInt64) -> Void) {
+                    func poll(previous: UInt64, stable: Int, samples: Int) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            let now = probePhysFootprint() ?? 0
+                            let improved = now + 512 * 1024 < previous
+                            let stableNow = improved ? 0 : stable + 1
+                            if (stableNow >= 6 && samples >= 6) || samples >= 24 {
+                                done(min(now, previous))
+                            } else {
+                                poll(previous: min(now, previous), stable: stableNow,
+                                     samples: samples + 1)
+                            }
+                        }
+                    }
+                    poll(previous: .max, stable: 0, samples: 0)
+                }
+                func switchBack() {
+                    switchToWorkspace(state.startWorkspace)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { finish() }
+                }
+                func finish() {
+                    state.framesAfter = state.hosts.compactMap { $0.window?.frame }
+                    if let host = self.hosts.first(where: { $0.window?.isVisible == true }),
+                       let tab = host.selectedTab,
+                       let bmp = probeBitmap(tab.paneRoot) {
+                        state.rendered = (try? assertRendered(
+                            bmp, region: CGRect(origin: .zero, size: bmp.size),
+                            what: "pane after switch-back")) != nil
+                    }
+                    churn(0)
+                }
+                // Switching must not ACCUMULATE either: each switch snapshots
+                // the outgoing content into a window-sized overlay image
+                // (WindowHost.beginContentCrossfade) and re-homes whole tab
+                // sets, so a per-switch leak would compound over a founder's
+                // day. The FIRST switch back legitimately costs the visible
+                // window a full re-render, so the baseline is taken after
+                // four switches and compared with the twenty-fourth. Measured
+                // over 48 rounds the curve is flat (133 MB at round 4, 127 MB
+                // at round 48) — no per-switch accumulation on this path.
+                func churn(_ round: Int) {
+                    if round == 4 { state.churnStartBytes = probePhysFootprint() ?? 0 }
+                    guard round < 24 else {
+                        state.churnBytes = probePhysFootprint() ?? 0
+                        state.settled = true
+                        return
+                    }
+                    let target = round.isMultiple(of: 2)
+                        ? state.workspaces[0] : state.startWorkspace
+                    switchToWorkspace(target)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        churn(round + 1)
+                    }
+                }
+                visit(0)
+            },
+            condition: { state.settled },
+            assert: { [self] in
+                defer { for id in state.workspaces { forgetWorkspace(id) } }
+                guard !state.skipped else {
+                    probe.skipLine(step: "hidden-windows-release-surfaces",
+                                   reason: "workspace_bar=false")
+                    return
+                }
+                if let failure = state.failure { throw ProbeFailure(failure) }
+                print("UIPROBE-HIDDEN-SURFACES before_mb=\(mb(Double(state.beforeBytes))) after_mb=\(mb(Double(state.afterBytes))) released_mb=\(mb(state.releasedBytes)) frames_stable=\(state.framesStable)")
+                print("UIPROBE-HIDDEN-SURFACES-DETAIL hidden_windows=\(state.hosts.count) baseline_mb=\(mb(Double(state.baselineBytes))) expected_per_window_mb=\(mb(state.expectedBytes)) pane_rendered=\(state.rendered) switch_churn_mb=\(mb(Double(state.churnStartBytes)))->\(mb(Double(state.churnBytes)))")
+                guard state.expectedBytes > 0 else {
+                    throw ProbeFailure("no drawable size for the hidden windows")
+                }
+                // FLOOR: one window's single-buffer drawable. Calibrated
+                // against the stubbed-out release, which measures EXACTLY
+                // zero here — hidden windows keep every byte, baseline ==
+                // before == after, and presenting them costs nothing because
+                // nothing was given back. With the release in place the same
+                // three 980x640 windows return 8-9 MB against a 2.4 MB
+                // floor, so this separates behavior from noise by ~4x.
+                let floorBytes = state.expectedBytes
+                guard state.releasedBytes >= floorBytes else {
+                    throw ProbeFailure("hiding \(state.hosts.count) windows returned \(mb(state.releasedBytes)) MB, under one window's \(mb(floorBytes)) MB drawable")
+                }
+                // The other half of the same truth: a HIDDEN window holds no
+                // drawables, so presenting it has to allocate them. Without
+                // the release this is zero — the surfaces were already there.
+                let presentedCost = Double(state.beforeBytes) - Double(state.baselineBytes)
+                guard presentedCost >= floorBytes else {
+                    throw ProbeFailure("presenting \(state.hosts.count) hidden windows cost \(mb(presentedCost)) MB — they still held their drawables while hidden")
+                }
+                guard state.framesStable else {
+                    throw ProbeFailure("FR-59: window frames moved across the hide/show round trip \(state.framesBefore) -> \(state.framesAfter)")
+                }
+                guard state.rendered else {
+                    throw ProbeFailure("the pane did not render after switching back")
+                }
+                // Per-switch accumulation: twenty more switches must not move
+                // the footprint. A leaked window-sized snapshot per switch
+                // would be an order of magnitude past this ceiling.
+                let churnCeiling = Double(state.churnStartBytes) + floorBytes * 9
+                guard Double(state.churnBytes) <= churnCeiling else {
+                    throw ProbeFailure("twenty switches grew the footprint to \(mb(Double(state.churnBytes))) MB from \(mb(Double(state.churnStartBytes))) MB — something accumulates per switch")
+                }
+            },
+            onFailure: { [self] in
+                // Which half failed: did the hide path not release (the
+                // content views would still be showing), or did the window
+                // server not give the memory back?
+                print("UIPROBE-HIDDEN-SURFACES-STATE released_flags=\(state.hosts.map(\.surfacesReleased))")
+                print("UIPROBE-HIDDEN-SURFACES before_mb=\(mb(Double(state.beforeBytes))) after_mb=\(mb(Double(state.afterBytes))) released_mb=\(mb(state.releasedBytes)) frames_stable=\(state.framesStable)")
+                print("UIPROBE-HIDDEN-SURFACES-DETAIL hidden_windows=\(state.hosts.count) baseline_mb=\(mb(Double(state.baselineBytes))) expected_per_window_mb=\(mb(state.expectedBytes)) pane_rendered=\(state.rendered) switch_churn_mb=\(mb(Double(state.churnStartBytes)))->\(mb(Double(state.churnBytes)))")
+                for id in state.workspaces { forgetWorkspace(id) }
             }))
     }
 

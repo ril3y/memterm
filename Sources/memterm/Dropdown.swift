@@ -366,7 +366,10 @@ final class DropdownController {
                                                 edge: edge(config))
         animate(window, to: hidden, config: config) { [weak self, weak host] in
             guard let self, let host else { return }
-            host.window?.orderOut(nil)
+            // The panel has slid off its edge; releasing its drawables here
+            // costs a redraw on the next hotkey and saves a window-sized
+            // backing store per workspace in between.
+            host.orderOutReleasingSurfaces()
             if self.hiding === host { self.hiding = nil }
         }
     }

@@ -222,13 +222,98 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     /// nil entirely when the app is not the active app (probe/smoke runs), so
     /// keyHost() needs the model's own notion kept current.
     func focusWindow() {
+        restoreGPUSurfaces()
         window?.makeKeyAndOrderFront(nil)
         app.noteHostFocused(self)
     }
 
     override func showWindow(_ sender: Any?) {
+        restoreGPUSurfaces()
         super.showWindow(sender)
         app.noteHostFocused(self)
+    }
+
+    // MARK: - Hidden-window GPU surfaces (founder 2026-09-21)
+
+    // FR-59 hides the outgoing workspace's windows with orderOut and keeps
+    // every pane's pty and process alive. What orderOut does NOT do is give
+    // back the window's GPU drawables: an ordered-out NSWindow keeps its
+    // window-sized, multiply-buffered layer backing stores for as long as it
+    // lives. The founder's ten-workspace instance carried 442 MB of them
+    // (vmmap: eleven 45 MB regions plus nine 27 MB ones) for windows nobody
+    // could see.
+    //
+    // MEASURED MECHANISM (scratch experiment, six 1600x1000 windows, macOS
+    // 26.2, ri_phys_footprint): the ONLY sequence that gives the memory back
+    // is to hide the content view and FLUSH the transaction WHILE THE WINDOW
+    // IS STILL ON SCREEN, then order out — 90.2 MB -> 21.6 MB, i.e. 11.4 MB
+    // per window. Every variant that acts after orderOut fails, and fails
+    // silently: hiding the content view then, dropping layer contents,
+    // clearing wantsLayer, resizing the ordered-out window, even closing the
+    // window, all merely UNMAP the surfaces — vmmap then reports them as
+    // "owned unmapped" and the process is still charged for every byte
+    // (90.2 MB -> 95.3 MB, nothing returned). Dropping the flush fails the
+    // same way. Hence the odd-looking display() + CATransaction.flush below:
+    // they are the load-bearing part, not decoration.
+    //
+    // macOS does NOT do this on its own. With the release stubbed out, the
+    // probe leg measures the hidden windows' footprint as EXACTLY unchanged —
+    // hidden, presented and hidden again all read the same — which is the
+    // founder's 442 MB, reproduced at three windows.
+    //
+    // The window's FRAME is never touched, so FR-59 frame stability and the
+    // smoke geometry golden are untouched by construction. Gate:
+    // ProbeLegs "hidden-windows-release-surfaces".
+
+    /// True while this host's drawables are released (its window is hidden).
+    var surfacesReleased: Bool { window?.contentView?.isHidden == true }
+
+    /// Hides this host's window AND gives its GPU drawables back. The one
+    /// hide path for a host window — plain `window.orderOut` leaves the
+    /// drawables resident for the window's whole life (see the note above).
+    func orderOutReleasingSurfaces() {
+        guard let window else { return }
+        // Blank under cover of transparency: the release must commit while
+        // the window is still on screen, and a window at alpha 0 composites
+        // nothing. In the faded paths alpha is already 0 here.
+        let alpha = window.alphaValue
+        if window.isVisible, alpha != 0 { window.alphaValue = 0 }
+        releaseGPUSurfaces()
+        window.orderOut(nil)
+        window.alphaValue = alpha
+    }
+
+    /// Drops the window's drawables. MUST run while the window is still on
+    /// screen; callers order out immediately afterwards.
+    func releaseGPUSurfaces() {
+        guard let window, let content = window.contentView, !content.isHidden else { return }
+        content.isHidden = true
+        // display(), not displayIfNeeded(): hiding a view does not always
+        // leave AppKit with a dirty rect to redraw, and a flush that commits
+        // nothing releases nothing (measured: the release landed on some runs
+        // and not others until this was forced).
+        window.display()
+        CATransaction.flush()
+    }
+
+    /// Re-attaches the drawables before the window is presented again. The
+    /// released backing stores held no state — the panes' terminal buffers,
+    /// selections and scrollback live in the views — so a full redraw
+    /// restores the exact pixels that were there.
+    func restoreGPUSurfaces() {
+        guard let content = window?.contentView, content.isHidden else { return }
+        content.isHidden = false
+        Self.markNeedingDisplay(content)
+        // Focus follows the selected tab back: hiding the content view can
+        // cost the focused pane its first-responder status.
+        if let tab = selectedTab, let pane = tab.currentPane() {
+            window?.makeFirstResponder(pane)
+        }
+    }
+
+    private static func markNeedingDisplay(_ view: NSView) {
+        view.needsDisplay = true
+        for sub in view.subviews { markNeedingDisplay(sub) }
     }
 
     // MARK: - Tab management

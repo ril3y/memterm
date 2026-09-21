@@ -228,6 +228,11 @@ check "fresh-default-close-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CLOS
 check "fresh-default-cmdw-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CMDW-CONFIRM sheet=true cancelled=true tab_alive=true setting_kept_on=true"
 # Founder 2026-09-21: a plain click on a parked chip must not unpark it.
 check "fresh-default-parked-click" "$LOG/probe-fresh-default.log" "UIPROBE-PARKED-CLICK still_parked=true active_unchanged=true"
+# Founder 2026-09-21 (442 MB of IOSurface behind hidden workspace windows):
+# hiding a workspace's windows must give their GPU drawables back, and give
+# the windows back unmoved and repainted on the way in. The leg FAILS with
+# the release removed (measured), so this sentinel gates behavior, not luck.
+check "fresh-default-hidden-surfaces" "$LOG/probe-fresh-default.log" "UIPROBE-HIDDEN-SURFACES before_mb=[0-9.]+ after_mb=[0-9.]+ released_mb=[0-9.]+ frames_stable=true"
 # Quake-style drop-down (2026-09-09): shown at the configured frame, hidden
 # off-edge with its tab live, journaled with its role, per-workspace.
 # Founder 2026-09-19: an inline workspace rename must survive a chip-row refresh and a click into the field.

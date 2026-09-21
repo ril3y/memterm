@@ -255,6 +255,33 @@ func installProbeAbortGuard() {
     }
 }
 
+// MARK: - Memory measurement (hidden-window GPU surfaces, founder 2026-09-21)
+
+/// This process's physical footprint in bytes — the same number Activity
+/// Monitor's "Memory" column and vmmap's "Physical footprint:" line report,
+/// read straight from the kernel ledger (`rusage_info_v4.ri_phys_footprint`).
+/// Returns nil if the call fails. Validated against vmmap: a 200 MB
+/// vm_allocate + touch moves it by 200 MB and the vm_deallocate moves it
+/// straight back, so a drop this reports is a real drop.
+func probePhysFootprint() -> UInt64? {
+    var info = rusage_info_v4()
+    let rc = withUnsafeMutablePointer(to: &info) { pointer -> Int32 in
+        pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { reboundPointer in
+            proc_pid_rusage(getpid(), RUSAGE_INFO_V4, reboundPointer)
+        }
+    }
+    guard rc == 0 else { return nil }
+    return info.ri_phys_footprint
+}
+
+/// One window's drawable in bytes: its backing (device-pixel) size times 4
+/// bytes per pixel — the floor a window-sized layer backing store costs,
+/// before any multiple buffering.
+func probeWindowDrawableBytes(_ window: NSWindow) -> Double {
+    let backing = window.convertToBacking(NSRect(origin: .zero, size: window.frame.size))
+    return Double(backing.width * backing.height) * 4
+}
+
 // MARK: - Frame + pixel assertion helpers (TESTING.md §2.3 — the layer bugs
 // 1 and 2 lived above every model-level assertion)
 
