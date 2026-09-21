@@ -228,6 +228,8 @@ check "fresh-default-close-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CLOS
 check "fresh-default-cmdw-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CMDW-CONFIRM sheet=true cancelled=true tab_alive=true setting_kept_on=true"
 # Founder 2026-09-21: a plain click on a parked chip must not unpark it.
 check "fresh-default-parked-click" "$LOG/probe-fresh-default.log" "UIPROBE-PARKED-CLICK still_parked=true active_unchanged=true"
+# Founder memory spike 2026-09-21: the scrollback flush rebuilds only dirty panes.
+check "fresh-default-scrollback-gate" "$LOG/probe-fresh-default.log" "UIPROBE-SCROLLBACK-GATE settle_calls=[0-9]+ rebuilt=1 of=[0-9]+ clean_after=true"
 # Founder 2026-09-21 (442 MB of IOSurface behind hidden workspace windows):
 # hiding a workspace's windows must give their GPU drawables back, and give
 # the windows back unmoved and repainted on the way in. The leg FAILS with

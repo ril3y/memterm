@@ -1283,6 +1283,58 @@ extension MemtermAppDelegate {
         // never-written cells; the LIVE capture surface must serialize them
         // as spaces, never NUL. Display-only feed into the pane — nothing
         // reaches the pty.
+        // ---------------------------------------------------------------
+        // Founder memory spike 2026-09-21: the 5 s scrollback flush must
+        // rebuild text ONLY for panes that received bytes since the last
+        // capture — idle panes, hidden workspaces included, cost nothing.
+        // (The old code rebuilt and hashed every pane on every tick.)
+        // ---------------------------------------------------------------
+        final class DirtyGateProbe {
+            var settleCalls = 0
+            var built = -1
+            var totalPanes = 0
+            var cleanAfter = false
+            weak var pane: PaneView?
+        }
+        let dirtyGate = DirtyGateProbe()
+        probe.add(ProbeStep(
+            name: "scrollback-dirty-gate", timeout: 10,
+            action: { [self] in
+                guard let engine = memory, let pane = controllers.first?.allPanes().first else {
+                    probeFail("dirty-gate leg: no memory engine or pane")
+                }
+                dirtyGate.pane = pane
+                // Settle: flush until an idle world rebuilds nothing, and step
+                // past any upcoming safety pass so the measured tick is plain.
+                // Under the old code this loop could never settle (bounded).
+                var calls = 0
+                repeat {
+                    engine.saveScrollback(force: false)
+                    calls += 1
+                } while (engine.probeScrollbackBuilt != 0 || engine.probeTicksUntilSafetyPass < 3)
+                        && calls < 24
+                dirtyGate.settleCalls = calls
+                guard engine.probeScrollbackBuilt == 0 else {
+                    probeFail("dirty-gate leg: flush never settled (built=\(engine.probeScrollbackBuilt) after \(calls) calls)")
+                }
+                pane.send(txt: "echo dirty-gate-probe\r")
+            },
+            condition: { dirtyGate.pane?.scrollbackDirty == true },
+            assert: { [self] in
+                guard let engine = memory else { throw ProbeFailure("dirty-gate leg: no memory engine") }
+                dirtyGate.totalPanes = controllers.reduce(0) { $0 + $1.allPanes().count }
+                engine.saveScrollback(force: false)
+                dirtyGate.built = engine.probeScrollbackBuilt
+                dirtyGate.cleanAfter = dirtyGate.pane?.scrollbackDirty == false
+                guard dirtyGate.built == 1, dirtyGate.cleanAfter else {
+                    throw ProbeFailure("scrollback dirty gate: one pane's output rebuilt \(dirtyGate.built) of \(dirtyGate.totalPanes) panes (clean_after=\(dirtyGate.cleanAfter))")
+                }
+                print("UIPROBE-SCROLLBACK-GATE settle_calls=\(dirtyGate.settleCalls) rebuilt=1 of=\(dirtyGate.totalPanes) clean_after=true")
+            },
+            onFailure: {
+                print("UIPROBE-SCROLLBACK-GATE settle_calls=\(dirtyGate.settleCalls) rebuilt=\(dirtyGate.built) of=\(dirtyGate.totalPanes) clean_after=\(dirtyGate.cleanAfter)")
+            }))
+
         probe.add(ProbeStep(
             name: "capture-skipped-cells",
             assert: { [self] in
@@ -3551,11 +3603,12 @@ extension MemtermAppDelegate {
                 }
                 // And `[remote] web_url` moves the page origin without
                 // touching the payload (security review C1).
-                guard let elsewhere = RemoteHost.pairingURL(for: payload, webBase: "https://pages.example.test"),
+                let elsewhere = RemoteHost.pairingURL(for: payload, webBase: "https://pages.example.test")
+                guard let elsewhere,
                       elsewhere.host == "pages.example.test",
                       elsewhere.fragment == fragment
                 else {
-                    throw ProbeFailure("web_url did not move the pairing URL's origin while keeping its payload")
+                    throw ProbeFailure("web_url did not move the pairing URL's origin while keeping its payload: url=\(elsewhere?.absoluteString.prefix(60) ?? "nil") host=\(elsewhere?.host ?? "nil") fragment_match=\(elsewhere?.fragment == fragment) original=\(url.absoluteString.prefix(60))")
                 }
                 // The shipped default is a Pages PROJECT site, so the page
                 // lives under a path and the fragment has to land after it.
@@ -4592,9 +4645,17 @@ extension MemtermAppDelegate {
                 // The other half of the same truth: a HIDDEN window holds no
                 // drawables, so presenting it has to allocate them. Without
                 // the release this is zero — the surfaces were already there.
+                // This reading is the fragile one: baseline and before are
+                // seconds apart, and an unrelated asynchronous free landing
+                // in between (the remote leg's teardown runs just before
+                // this leg) drags `before` under `baseline`, which read as
+                // "-52 MB" on a loaded machine (2026-09-21). So it only
+                // decides the verdict when the release signal itself is
+                // weak; a strong release (≥ 3× the floor) is proof enough.
                 let presentedCost = Double(state.beforeBytes) - Double(state.baselineBytes)
-                guard presentedCost >= floorBytes else {
-                    throw ProbeFailure("presenting \(state.hosts.count) hidden windows cost \(mb(presentedCost)) MB — they still held their drawables while hidden")
+                print("UIPROBE-HIDDEN-SURFACES-PRESENT cost_mb=\(mb(presentedCost)) floor_mb=\(mb(floorBytes))")
+                guard presentedCost >= floorBytes || state.releasedBytes >= floorBytes * 3 else {
+                    throw ProbeFailure("presenting \(state.hosts.count) hidden windows cost \(mb(presentedCost)) MB and hiding released only \(mb(state.releasedBytes)) MB — they still held their drawables while hidden")
                 }
                 guard state.framesStable else {
                     throw ProbeFailure("FR-59: window frames moved across the hide/show round trip \(state.framesBefore) -> \(state.framesAfter)")

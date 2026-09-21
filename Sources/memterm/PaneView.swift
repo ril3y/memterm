@@ -206,6 +206,7 @@ class PaneView: LocalProcessTerminalView {
         syncAllowMouseReporting()
         super.dataReceived(slice: slice)
         syncAllowMouseReporting()
+        scrollbackDirty = true
         onOutputActivity?()
         // Remote attach (Task 8): taps run LAST, after the terminal has the
         // bytes and the local activity hook has fired, so a remote viewer can
@@ -266,6 +267,17 @@ class PaneView: LocalProcessTerminalView {
     /// Output taps: called with a copy of every pty chunk AFTER the terminal
     /// has parsed it. Keyed by the token `addOutputTap` hands back.
     /// Main-thread only, like `dataReceived` itself.
+    /// Scrollback capture gate (founder memory spike 2026-09-21): true when
+    /// bytes arrived since MemoryEngine last captured this pane's scrollback.
+    /// The 5 s flush used to rebuild and hash EVERY pane's full scrollback —
+    /// hidden workspaces included — just to learn nothing changed; with 24
+    /// panes × 10k lines that is a recurring multi-hundred-MB transient. Now
+    /// only dirty panes are rebuilt (a slow safety pass still catches reflow
+    /// and clears, which change text without bytes arriving).
+    private(set) var scrollbackDirty = true
+    func markScrollbackCaptured() { scrollbackDirty = false }
+    func markScrollbackDirty() { scrollbackDirty = true }
+
     private(set) var outputTaps: [UUID: (Data) -> Void] = [:]
 
     /// Registers a tap; keep the returned token to remove it again.

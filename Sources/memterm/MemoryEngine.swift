@@ -238,19 +238,42 @@ final class MemoryEngine {
 
     // MARK: - Scrollback (FR-16, v0: plain text, change-detected)
 
+    /// Every Nth 5 s tick rebuilds even clean panes: resize reflow and ⌘K
+    /// change the text without bytes arriving, and the dirty flag cannot see
+    /// them. 12 ticks = once a minute, bounded cost.
+    private static let scrollbackSafetyEvery = 12
+    private var scrollbackTick = 0
+    /// Probe seam: how many panes the LAST saveScrollback call rebuilt text
+    /// for (the dirty-gate leg asserts one pane's output costs one rebuild).
+    private(set) var probeScrollbackBuilt = 0
+    /// Probe seam: ticks left before the next safety pass (so a leg can step
+    /// past it and measure a plain dirty-gated tick).
+    var probeTicksUntilSafetyPass: Int {
+        Self.scrollbackSafetyEvery - scrollbackTick % Self.scrollbackSafetyEvery
+    }
+
     func saveScrollback(force: Bool) {
         guard force || !app.isTerminating else { return }
+        scrollbackTick &+= 1
+        let safetyPass = force || scrollbackTick % Self.scrollbackSafetyEvery == 0
+        probeScrollbackBuilt = 0
         var livePaneIds = Set<String>()
         // app.controllers: hidden workspaces' scrollback keeps flushing (FR-59).
         for controller in app.controllers {
             for pane in controller.allPanes() {
                 livePaneIds.insert(pane.paneId)
+                // Founder memory spike 2026-09-21: building the text is the
+                // expensive part (every line translated, then hashed). Skip
+                // panes that saw no bytes since the last capture.
+                guard safetyPass || pane.scrollbackDirty else { continue }
+                pane.markScrollbackCaptured()
+                probeScrollbackBuilt += 1
                 let text = pane.scrollbackText(maxLines: scrollbackLines)
                 let hash = text.hashValue
                 if !force && lastScrollbackHash[pane.paneId] == hash { continue }
                 let url = scrollbackURL(for: pane.paneId)
                 let paneId = pane.paneId
-                store.onWriter { [weak self] in
+                store.onWriter { [weak self, weak pane] in
                     do {
                         try text.write(to: url, atomically: true, encoding: .utf8)
                         try? FileManager.default.setAttributes(
@@ -262,6 +285,9 @@ final class MemoryEngine {
                         }
                     } catch {
                         DispatchQueue.main.async {
+                            // Re-arm the dirty gate so the retry is not
+                            // deferred to the next safety pass.
+                            pane?.markScrollbackDirty()
                             guard let self, !self.loggedScrollbackWriteFailure else { return }
                             self.loggedScrollbackWriteFailure = true
                             NSLog("memterm: scrollback write failed (%@) — capture degraded",

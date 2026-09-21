@@ -278,6 +278,9 @@ final class SerialPaneView: PaneView {
             feed(byteArray: ArraySlice([UInt8](data)))
         }
         syncAllowMouseReporting()
+        // Serial bytes bypass PaneView.dataReceived, so the scrollback
+        // capture gate must be armed here too (see PaneView.scrollbackDirty).
+        markScrollbackDirty()
         onOutputActivity?()
     }
 
