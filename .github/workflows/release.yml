@@ -145,6 +145,10 @@ jobs:
       - name: Deploy relay
         if: steps.fly-token.outputs.has_token == 'true'
         working-directory: relay
-        run: flyctl deploy --remote-only
+        # --ha=false: the relay keeps hosts, clients and pairing tokens in
+        # memory, so it must be exactly ONE machine. Fly's default creates
+        # two for availability, and a host on one machine is invisible to a
+        # phone whose socket lands on the other (field bug 2026-09-21).
+        run: flyctl deploy --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

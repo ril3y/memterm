@@ -30,10 +30,34 @@ export class Registry {
     for (const deviceId of allowed) watching.add(deviceId);
     this.watchers.set(hostId, capSet(watching));
   }
-  unregisterHost(hostId: string) { this.hosts.delete(hostId); this.watchers.delete(hostId); }
+  /**
+   * Drops a host — but ONLY if `socket` (when given) is still the socket
+   * registered for it. A peer that reconnects registers its new socket
+   * first; the old socket's `close` event can arrive afterwards, and an
+   * unconditional delete here wiped the fresh registration, leaving a host
+   * that believed itself connected but that no envelope could reach
+   * (field bug 2026-09-22: "click a pane, type, kicked out, then nothing").
+   * Returns whether anything was removed, so a stale close fans out no
+   * `offline`.
+   */
+  unregisterHost(hostId: string, socket?: PeerSocket): boolean {
+    const current = this.hosts.get(hostId);
+    if (!current) return false;
+    if (socket !== undefined && current.socket !== socket) return false;
+    this.hosts.delete(hostId);
+    this.watchers.delete(hostId);
+    return true;
+  }
   host(hostId: string) { return this.hosts.get(hostId); }
   registerClient(deviceId: string, socket: PeerSocket) { this.clients.set(deviceId, { socket }); }
-  unregisterClient(deviceId: string) { this.clients.delete(deviceId); }
+  /** Same stale-close rule as `unregisterHost`. */
+  unregisterClient(deviceId: string, socket?: PeerSocket): boolean {
+    const current = this.clients.get(deviceId);
+    if (!current) return false;
+    if (socket !== undefined && current.socket !== socket) return false;
+    this.clients.delete(deviceId);
+    return true;
+  }
   client(deviceId: string) { return this.clients.get(deviceId); }
   /** Marks deviceId as paired with hostId for presence purposes (see `watchers` above). */
   addWatcher(hostId: string, deviceId: string) {

@@ -224,6 +224,10 @@ function handleConnection(
           // than once per message, and it needs no timer to keep alive or
           // tear down.
           registry.sweep(Date.now());
+          // A reconnecting host replaces its previous socket; close that one
+          // so it cannot linger half-dead (its late close is ignored anyway).
+          const previousHost = registry.host(id);
+          if (previousHost && previousHost.socket !== ws) previousHost.socket.close(4005, "replaced");
           registry.registerHost(id, ws, allowed, msg.publicKey);
           registry.markSeen(id, Date.now());
           ws.send(JSON.stringify({ type: "authed", id }));
@@ -231,6 +235,8 @@ function handleConnection(
             client.socket.send(JSON.stringify({ type: "online", hostId: id }));
           }
         } else {
+          const previousClient = registry.client(id);
+          if (previousClient && previousClient.socket !== ws) previousClient.socket.close(4005, "replaced");
           registry.registerClient(id, ws);
           ws.send(JSON.stringify({ type: "authed", id }));
         }
@@ -249,12 +255,14 @@ function handleConnection(
     if (role === "host") {
       const lastSeen = registry.lastSeen(authedId) ?? Date.now();
       const allowedClients = registry.clientsAllowedBy(authedId);
-      registry.unregisterHost(authedId);
+      // A close from a socket this host has already replaced must neither
+      // drop the live registration nor tell anyone the host went offline.
+      if (!registry.unregisterHost(authedId, ws)) return;
       for (const client of allowedClients) {
         client.socket.send(JSON.stringify({ type: "offline", hostId: authedId, lastSeen }));
       }
     } else {
-      registry.unregisterClient(authedId);
+      registry.unregisterClient(authedId, ws);
     }
   });
 }

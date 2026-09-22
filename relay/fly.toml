@@ -15,6 +15,10 @@ primary_region = 'iad'
 [http_service]
   internal_port = 8787
   force_https = true
+  # EXACTLY ONE machine: the registry (hosts, clients, pairing tokens) is
+  # in-memory per process. Deploy with --ha=false (release.yml does); if a
+  # second machine ever appears, `fly scale count 1` — otherwise a host and
+  # a phone on different machines never see each other (2026-09-21).
   auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1

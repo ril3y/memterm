@@ -34,6 +34,19 @@ export async function connectAuthed(
   extra: Record<string, unknown> = {}
 ): Promise<AuthedPeer> {
   const kp = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  return connectAuthedAs(port, path, kp, extra);
+}
+
+/**
+ * Like `connectAuthed`, with a caller-supplied key pair — the way to open a
+ * SECOND socket for the same peer id (a reconnect).
+ */
+export async function connectAuthedAs(
+  port: number,
+  path: "host" | "client",
+  kp: CryptoKeyPair,
+  extra: Record<string, unknown> = {}
+): Promise<AuthedPeer> {
   const spki = new Uint8Array(await webcrypto.subtle.exportKey("spki", kp.publicKey));
   const ws = new WebSocket(`ws://127.0.0.1:${port}/${path}`);
   const id = await new Promise<string>((resolve, reject) => {
