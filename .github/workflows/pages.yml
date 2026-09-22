@@ -9,7 +9,11 @@ name: Pages
 # own copy for self-hosters; `[remote] web_url` picks between them.
 on:
   push:
-    branches: ["feature/custom-tabs", "main"]
+    # Only the repository's default branch may deploy to the github-pages
+    # environment (GitHub's protection rule). main mirrors feature/custom-tabs
+    # anyway; listing it too made a rejected run from main cancel the good
+    # run from the default branch via the concurrency group (2026-09-22).
+    branches: ["feature/custom-tabs"]
     paths:
       - "relay/web/**"
       - "relay/src/auth.ts"        # the client imports idFromPublicKey from it
