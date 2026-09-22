@@ -398,6 +398,11 @@ final class RemoteHost {
     }
 
     private func setState(_ state: String, error: String?) {
+        if state != probeState || error != probeLastError {
+            // One line per transition (2026-09-21 field debugging: a host
+            // that silently dropped off the relay looked like a bad token).
+            log("relay \(state)\(error.map { " — \($0)" } ?? "")")
+        }
         probeState = state
         probeLastError = error
         onStateChange?()
@@ -412,6 +417,9 @@ final class RemoteHost {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["type"] as? String
         else { return }
+        // Control traffic only (types, never payloads): envelopes are sealed
+        // and frequent, everything else is rare and worth a line.
+        if type != "env" { log("relay → \(type)") }
         switch type {
         case "challenge":
             guard let nonceB64 = object["nonce"] as? String,
@@ -470,6 +478,7 @@ final class RemoteHost {
         }
         guard probeState == "connected" else { return }
         sendJSON(["type": "pair-token", "token": pending.token])
+        log("published a pairing token to the relay")
         // Single use at the relay; a second QR mints a second token.
         pendingPair = nil
     }
@@ -632,9 +641,16 @@ final class RemoteHost {
     /// counting in-flight bytes never waits forever on a message that was
     /// never actually sent.
     func send(_ message: RemoteMessage, to deviceId: String, completion: (() -> Void)? = nil) {
-        guard let session = sessions[deviceId],
-              let record = try? session.keys.seal(message.encode())
-        else {
+        guard let session = sessions[deviceId] else {
+            log("send \(message.tag) to \(deviceId): no session")
+            if let completion { DispatchQueue.main.async(execute: completion) }
+            return
+        }
+        let record: Data
+        do {
+            record = try session.keys.seal(message.encode())
+        } catch {
+            log("send \(message.tag) to \(deviceId): seal failed: \(error)")
             if let completion { DispatchQueue.main.async(execute: completion) }
             return
         }
@@ -666,7 +682,10 @@ final class RemoteHost {
         guard let data = try? JSONSerialization.data(withJSONObject: object),
               let text = String(data: data, encoding: .utf8)
         else { return }
-        task?.send(.string(text)) { _ in }
+        task?.send(.string(text)) { [weak self] error in
+            guard let error else { return }
+            Self.onMain { self?.log("send failed: \(error.localizedDescription)") }
+        }
     }
 
     // MARK: - Helpers

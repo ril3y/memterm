@@ -144,6 +144,26 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         .derived(fromTerminalFontSize: config.fontSize)
     }
 
+    /// See the MEMTERM_REMOTE_PAIR_LINK_FILE note in applicationDidFinishLaunching.
+    private func writePairingLinkWhenConnected(to path: String, attempt: Int = 0) {
+        guard attempt < 120 else { return }  // give the relay a minute
+        guard remote.probeState == "connected" else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.writePairingLinkWhenConnected(to: path, attempt: attempt + 1)
+            }
+            return
+        }
+        let payload = remote.startPairing()
+        guard let url = RemoteHost.pairingURL(for: payload, webBase: config.remoteWebURL) else { return }
+        try? url.absoluteString.write(toFile: path, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        // Codes live two minutes; a scripted consumer may be slower than a
+        // person with a camera, so keep a fresh one in the file.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+            self?.writePairingLinkWhenConnected(to: path)
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = buildMainMenu(for: self)
 
@@ -229,6 +249,21 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         // install. Last, because a host that connects wants the live model
         // (workspaces, windows, panes) already standing.
         remote.applyConfig(config)
+        // Dev aid (2026-09-21, scripted camera-less pairing): when
+        // MEMTERM_REMOTE_PAIR_LINK_FILE names a path, start a pairing as soon
+        // as the relay connects, write the QR's URL there (0600), and accept
+        // the first device that proves it holds that code. Off unless the
+        // env var is set — whoever can set env vars on this launch already
+        // owns the account — and the link (secret half included) goes to the
+        // named file only, never to a log.
+        if let linkPath = ProcessInfo.processInfo.environment["MEMTERM_REMOTE_PAIR_LINK_FILE"],
+           !linkPath.isEmpty, config.remoteEnabled {
+            remote.onPairRequest = { name, deviceId, _, accept in
+                NSLog("memterm: MEMTERM_REMOTE_PAIR_LINK_FILE accepting device %@ (%@)", deviceId, name)
+                accept(true)
+            }
+            writePairingLinkWhenConnected(to: linkPath)
+        }
 
         if let run = smokeRun { runSmoke(run: run, restoredAnything: restoredAnything) }
         // MEMTERM_UI_PROBE=1: harness v2 (TESTING.md §2) — gesture routing,

@@ -25,6 +25,7 @@ extension RemoteHost {
     var lockedWorkspaceIds: Set<String> { [] }
 
     func dispatch(_ message: RemoteMessage, session: Session) {
+        log("← \(message.tag) from \(session.deviceId)")
         switch message {
         case .list:
             send(.tree(buildTree()), to: session.deviceId)

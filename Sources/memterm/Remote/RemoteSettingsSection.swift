@@ -33,6 +33,8 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
     /// The open QR sheet, if any, plus the token's deadline and the ticker
     /// that counts it down.
     private var pairingSheet: NSWindow?
+    /// The URL the current QR encodes, for "Copy link" (camera-less pairing).
+    private var pairingLink: String?
     private var pairingDeadline: Date?
     private var countdownTimer: Timer?
     private let countdownLabel = NSTextField(labelWithString: "")
@@ -257,8 +259,19 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
         let done = NSButton(title: "Done", target: self, action: #selector(endPairingSheet))
         done.bezelStyle = .rounded
         done.keyEquivalent = "\r"
+        // Founder 2026-09-21: a Mac (or anything without a camera) pairs by
+        // pasting the same link the QR encodes. The secret half of the token
+        // rides in the fragment either way, so copying it is no weaker than
+        // showing it as a code.
+        pairingLink = RemoteHost.pairingURL(for: payload, webBase: app.config.remoteWebURL)?.absoluteString
+        let copy = NSButton(title: "Copy link", target: self, action: #selector(copyPairingLink))
+        copy.bezelStyle = .rounded
+        copy.isEnabled = pairingLink != nil
+        let buttons = NSStackView(views: [copy, done])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
 
-        let stack = NSStackView(views: [title, imageView, countdownLabel, caption, done])
+        let stack = NSStackView(views: [title, imageView, countdownLabel, caption, buttons])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 10
@@ -284,6 +297,13 @@ final class RemoteSettingsSection: NSObject, NSTableViewDataSource, NSTableViewD
             // the QR anymore.
             self?.host.endPairing()
         }
+    }
+
+    @objc private func copyPairingLink() {
+        guard let pairingLink else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(pairingLink, forType: .string)
     }
 
     @objc private func endPairingSheet() {

@@ -21,6 +21,25 @@ public enum RemoteMessage: Equatable {
     case refused(reason: String)
     case resized(cols: Int, rows: Int)
 
+    /// The wire tag, for logs (never the payload).
+    public var tag: String {
+        switch self {
+        case .list: return "list"
+        case .attach: return "attach"
+        case .detach: return "detach"
+        case .input: return "input"
+        case .resize: return "resize"
+        case .newTab: return "newTab"
+        case .unlock: return "unlock"
+        case .tree: return "tree"
+        case .screen: return "screen"
+        case .output: return "output"
+        case .treeChanged: return "tree-changed"
+        case .refused: return "refused"
+        case .resized: return "resized"
+        }
+    }
+
     // JSONEncoder/JSONDecoder's default Data strategy is base64, which is
     // exactly the wire contract ("b" fields are base64 strings) — so the
     // wire struct's `b: Data?` gets the encoding for free.

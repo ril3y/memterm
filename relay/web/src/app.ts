@@ -295,6 +295,10 @@ function updateTreeDisabled(): void {
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 function showToast(text: string): void {
+  // Every user-visible notice also lands in the console: a toast lives
+  // four seconds, and "it said something and went away" was the entire
+  // bug report the first time a phone paired (2026-09-21). Never secrets.
+  console.log("memterm remote:", text);
   const el = document.getElementById("toast");
   if (!el) return;
   el.textContent = text;
@@ -870,6 +874,22 @@ if (embedded()) {
 } else {
   document.getElementById("fit-btn")?.addEventListener("click", onFitClick);
   document.getElementById("back-btn")?.addEventListener("click", onBackClick);
+  // Founder 2026-09-21: rotating the phone did nothing. A viewport change
+  // while a pane is attached is the one case where the viewer's size should
+  // win without a button press -- the person turned the device to get more
+  // columns. Debounced, and a no-op when no terminal is open (the host's
+  // own window size stays the default until then).
+  let fitTimer: number | undefined;
+  const refitOnViewportChange = (): void => {
+    if (!term || !fitAddon) return;
+    if (fitTimer !== undefined) window.clearTimeout(fitTimer);
+    fitTimer = window.setTimeout(() => {
+      fitTimer = undefined;
+      onFitClick();
+    }, 250);
+  };
+  window.addEventListener("resize", refitOnViewportChange);
+  window.addEventListener("orientationchange", refitOnViewportChange);
   document.getElementById("confirm-pair-btn")?.addEventListener("click", onConfirmPairClick);
   document.getElementById("cancel-pair-btn")?.addEventListener("click", onCancelPairClick);
 
