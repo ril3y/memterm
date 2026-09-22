@@ -418,7 +418,11 @@ function teardownSession(message: string): void {
 
 async function sendMessage(m: RemoteMessage): Promise<void> {
   if (!session || !host || !relay) return;
+  // `seal` reserves its counter synchronously and resolves in counter
+  // order, so awaiting it here keeps wire order equal to nonce order even
+  // when several keystrokes are sealed in the same turn.
   const sealed = await session.seal(new TextEncoder().encode(encodeMessage(m)));
+  if (!relay || !host) return; // dropped while sealing
   relay.sendEnvelope(host.hostId, sealed);
 }
 

@@ -282,35 +282,66 @@ export class SessionKeys {
     this.recvKey = recvKey;
   }
 
-  /** Record = nonce (12) ‖ ciphertext ‖ tag (16); WebCrypto's `encrypt` output is already ciphertext‖tag. */
-  async seal(plain: Uint8Array): Promise<Uint8Array> {
-    const nonce = nonceBytes(this.sendCounter);
-    const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: bs(nonce) }, this.sendKey, bs(plain)));
+  /**
+   * Record = nonce (12) ‖ ciphertext ‖ tag (16); WebCrypto's `encrypt`
+   * output is already ciphertext‖tag.
+   *
+   * The counter is RESERVED synchronously, before the encrypt `await`.
+   * Field bug 2026-09-22 (founder: "type a letter and it kicks me out"):
+   * two keystrokes in one event loop turn each read the same counter,
+   * awaited, then each incremented — two records under ONE nonce. The host
+   * rightly refused the second as a replay and tore the session down; and
+   * a GCM nonce reused under one key is a real leak, not just a hiccup.
+   * Seals are also chained so records leave in counter order: a strict
+   * receiver cannot accept N+1 before N.
+   */
+  seal(plain: Uint8Array): Promise<Uint8Array> {
+    const counter = this.sendCounter;
     this.sendCounter += 1n;
-    const out = new Uint8Array(nonce.length + sealed.length);
-    out.set(nonce, 0);
-    out.set(sealed, nonce.length);
-    return out;
+    const nonce = nonceBytes(counter);
+    const run = async (): Promise<Uint8Array> => {
+      const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: bs(nonce) }, this.sendKey, bs(plain)));
+      const out = new Uint8Array(nonce.length + sealed.length);
+      out.set(nonce, 0);
+      out.set(sealed, nonce.length);
+      return out;
+    };
+    const result = this.sealChain.then(run, run);
+    this.sealChain = result.then(() => undefined, () => undefined);
+    return result;
   }
+  private sealChain: Promise<void> = Promise.resolve();
 
   /**
    * Requires the record's nonce to equal the next expected counter, else
    * throws `Error("replay")` without advancing. A wrong length or a failed
    * GCM tag throws `Error("malformed")`, also without advancing.
+   *
+   * Opens are chained: the check-then-`await`-then-advance sequence must not
+   * interleave, or two records arriving in one turn (an echo and the prompt
+   * that follows it) both compare against the same expected counter and the
+   * second reads as a replay of the first (the same 2026-09-22 field bug,
+   * receive side).
    */
-  async open(record: Uint8Array): Promise<Uint8Array> {
-    if (record.length < 12 + 16) throw new Error("malformed");
-    const recordNonce = record.slice(0, 12);
-    if (!bytesEqual(recordNonce, nonceBytes(this.recvCounter))) throw new Error("replay");
-    let plain: Uint8Array;
-    try {
-      plain = new Uint8Array(
-        await crypto.subtle.decrypt({ name: "AES-GCM", iv: bs(recordNonce) }, this.recvKey, bs(record.slice(12)))
-      );
-    } catch {
-      throw new Error("malformed");
-    }
-    this.recvCounter += 1n;
-    return plain;
+  open(record: Uint8Array): Promise<Uint8Array> {
+    const run = async (): Promise<Uint8Array> => {
+      if (record.length < 12 + 16) throw new Error("malformed");
+      const recordNonce = record.slice(0, 12);
+      if (!bytesEqual(recordNonce, nonceBytes(this.recvCounter))) throw new Error("replay");
+      let plain: Uint8Array;
+      try {
+        plain = new Uint8Array(
+          await crypto.subtle.decrypt({ name: "AES-GCM", iv: bs(recordNonce) }, this.recvKey, bs(record.slice(12)))
+        );
+      } catch {
+        throw new Error("malformed");
+      }
+      this.recvCounter += 1n;
+      return plain;
+    };
+    const result = this.openChain.then(run, run);
+    this.openChain = result.then(() => undefined, () => undefined);
+    return result;
   }
+  private openChain: Promise<void> = Promise.resolve();
 }
