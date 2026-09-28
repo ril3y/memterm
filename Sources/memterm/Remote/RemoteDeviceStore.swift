@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MemtermCore
+import MemtermRemoteKit
 
 // Remote attach (decision doc 2026-09-19): the two pieces of state the host
 // must survive a relaunch with — WHO WE ARE (the long-lived P-256 identity)

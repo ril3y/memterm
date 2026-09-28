@@ -1,5 +1,5 @@
 import XCTest
-@testable import MemtermCore
+@testable import MemtermRemoteKit
 
 // Remote-attach (decision doc 2026-09-19): while a phone client is
 // reconnecting, terminal output keeps accumulating locally. OutputBacklog is

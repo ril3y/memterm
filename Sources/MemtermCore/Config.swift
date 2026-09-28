@@ -1,4 +1,5 @@
 import Foundation
+import MemtermRemoteKit
 
 // Config model + parsing, AppKit-free so it is testable headlessly. Colors are
 // plain RGB triples here; the executable maps them to NSColor / SwiftTerm

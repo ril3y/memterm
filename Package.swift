@@ -4,7 +4,10 @@ import PackageDescription
 let package = Package(
     name: "memterm",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v14),
+        // The iPhone client (spec 2026-09-28) imports MemtermRemoteKit only;
+        // nothing else in this package is built for iOS.
+        .iOS(.v17)
     ],
     dependencies: [
         // ril3y/SwiftTerm = upstream 1.20.0 + translucentCellBackgrounds
@@ -23,11 +26,18 @@ let package = Package(
             name: "CProcShim",
             path: "Sources/CProcShim"
         ),
+        // Remote attach, shared with the iPhone client: protocol, crypto,
+        // relay client. Foundation + CryptoKit only — no AppKit/UIKit,
+        // Security, libproc, SQLite. Both apps and MemtermCore depend on it.
+        .target(
+            name: "MemtermRemoteKit",
+            path: "Sources/MemtermRemoteKit"
+        ),
         // Pure logic (config, state store, adapters, restore helpers) —
         // AppKit-free so it is testable headlessly.
         .target(
             name: "MemtermCore",
-            dependencies: ["CProcShim"],
+            dependencies: ["CProcShim", "MemtermRemoteKit"],
             path: "Sources/MemtermCore"
         ),
         // Extension architecture (option B, decision doc 496a85fe): the ONLY
@@ -64,6 +74,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
                 "CProcShim",
                 "MemtermCore",
+                "MemtermRemoteKit",
                 "MemtermExtensionKit",
                 "MemtermClaudeBrowser",
                 "MemtermTimeline"
@@ -79,9 +90,17 @@ let package = Package(
             // probe legs build on.
             dependencies: [
                 "MemtermCore",
+                "MemtermRemoteKit",
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ],
             path: "Tests/MemtermCoreTests"
+        ),
+        // Kit tests: the moved Remote* suites plus the relay connection
+        // against a fake transport. Headless, no app, no relay process.
+        .testTarget(
+            name: "MemtermRemoteKitTests",
+            dependencies: ["MemtermRemoteKit"],
+            path: "Tests/MemtermRemoteKitTests"
         ),
         // Kit contract tests: the Host surface against a mock implementation
         // (pins the API shape and the archive-stub contract).

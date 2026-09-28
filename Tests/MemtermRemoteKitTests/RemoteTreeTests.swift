@@ -1,5 +1,5 @@
 import XCTest
-@testable import MemtermCore
+@testable import MemtermRemoteKit
 
 // Remote-attach wire model (decision doc 2026-09-19): pins the JSON shape of
 // RemoteTree sent to a phone client over RemoteMessage.tree. A locked

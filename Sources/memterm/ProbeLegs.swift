@@ -2,6 +2,7 @@ import AppKit
 import MemtermClaudeBrowser
 import MemtermCore
 import MemtermExtensionKit
+import MemtermRemoteKit
 import MemtermTimeline
 import SwiftTerm
 

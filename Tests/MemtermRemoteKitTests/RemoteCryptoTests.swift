@@ -1,7 +1,7 @@
 import CryptoKit
 import Dispatch
 import XCTest
-@testable import MemtermCore
+@testable import MemtermRemoteKit
 
 // Remote-attach crypto (decision doc 2026-09-19). Every byte format here is a
 // wire contract with two other implementations: the Node relay

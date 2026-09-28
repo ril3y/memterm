@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import MemtermCore
+import MemtermRemoteKit
 
 // Remote attach (decision doc 2026-09-19): the half of RemoteHost that knows
 // about memterm's live model. Everything here runs on the MAIN thread —

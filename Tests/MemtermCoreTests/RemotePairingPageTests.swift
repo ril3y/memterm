@@ -1,5 +1,6 @@
 import XCTest
 @testable import MemtermCore
+import MemtermRemoteKit
 
 /// The pairing QR's URL builder — `RemoteHost.pairingURL(for:webBase:)`'s
 /// pure half. It decides which origin a scanned code opens, and therefore

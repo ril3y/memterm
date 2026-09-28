@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import Foundation
 import MemtermCore
+import MemtermRemoteKit
 
 // Remote attach (decision doc 2026-09-19): the host that lives inside the
 // running app. It keeps ONE outbound WebSocket to the relay, pairs devices,

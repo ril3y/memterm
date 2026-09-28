@@ -1,5 +1,6 @@
 import Foundation
 import MemtermCore
+import MemtermRemoteKit
 
 // Remote attach (decision doc 2026-09-19), Task 8: the object that turns ONE
 // live pane into a stream a remote viewer can follow, and turns a remote

@@ -1,5 +1,5 @@
 import XCTest
-@testable import MemtermCore
+@testable import MemtermRemoteKit
 
 // Remote-attach wire contract (Task 5, decision doc 2026-09-19): the inner
 // RemoteMessage protocol and outer RemoteEnvelope are the JSON spoken between

@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MemtermCore
+import MemtermRemoteKit
 
 // Task 12's headless DEVICE-side client: the relay/handshake/RemoteMessage
 // protocol driven from a plain Swift object instead of a browser, so the

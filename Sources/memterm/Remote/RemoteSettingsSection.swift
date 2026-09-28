@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import MemtermCore
+import MemtermRemoteKit
 
 // Settings ▸ Remote (decision doc 2026-09-19): the only place remote attach
 // can be turned on, the only place a device can be paired, and the only place

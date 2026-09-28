@@ -1,5 +1,5 @@
 import XCTest
-@testable import MemtermCore
+@testable import MemtermRemoteKit
 
 // Remote-attach (decision doc 2026-09-19): unlocking a locked workspace from
 // a phone client requires a passcode check on the Mac side. This sliding
