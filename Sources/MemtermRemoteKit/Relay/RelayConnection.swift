@@ -19,6 +19,11 @@ public final class RelayConnection {
         /// `authed` included — after the connection has updated its own state.
         public var onControl: ([String: Any]) -> Void = { _ in }
         public var onEnvelope: (RemoteEnvelope) -> Void = { _ in }
+        /// A transport-reported error sending a control frame the
+        /// connection itself originates (currently just `auth`). Frames the
+        /// caller sends through `send(control:onFailure:)` report their own
+        /// failures directly; this is only for the kit's own internal send.
+        public var onSendFailure: (Error) -> Void = { _ in }
         public init() {}
     }
 
@@ -55,6 +60,14 @@ public final class RelayConnection {
         self.makeConnectURL = makeConnectURL
     }
 
+    deinit {
+        // Cheap insurance for a caller (an iOS view model, most likely) that
+        // drops its last reference without calling `stop()` first: leaves no
+        // socket open and resumed. Both Mac-side teardown paths call `stop()`
+        // before releasing their reference, so this is a no-op there today.
+        transport?.cancel()
+    }
+
     public static func mainQueueSchedule(_ delay: TimeInterval, _ body: @escaping () -> Void) -> DispatchWorkItem {
         let item = DispatchWorkItem(block: body)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
@@ -77,11 +90,17 @@ public final class RelayConnection {
     // MARK: - Lifecycle
 
     public func start() {
+        #if DEBUG
+        dispatchPrecondition(condition: .onQueue(.main))
+        #endif
         running = true
         connect()
     }
 
     public func stop() {
+        #if DEBUG
+        dispatchPrecondition(condition: .onQueue(.main))
+        #endif
         running = false
         generation += 1
         reconnectWork?.cancel(); reconnectWork = nil
@@ -93,6 +112,10 @@ public final class RelayConnection {
 
     private func connect() {
         guard running else { return }
+        // A socket we are about to replace must be closed, not merely
+        // orphaned: the generation guard stops us reading it, but it would
+        // stay open and authenticated at the relay.
+        transport?.cancel(); transport = nil
         generation += 1
         let gen = generation
         guard let url = makeConnectURL(base, role) else {
@@ -122,6 +145,15 @@ public final class RelayConnection {
                     self.handleFailure(error)
                 case .success(let text):
                     self.handleFrame(Data(text.utf8))
+                    // handleFrame can itself call handleFailure (a challenge
+                    // whose signing throws): that cancels and nils transport
+                    // without bumping generation, since it retries through
+                    // the same reconnect path a socket failure does. Without
+                    // this check, re-arming unconditionally would register
+                    // another receive on the now-cancelled socket, which
+                    // completes with a cancellation error and drives a
+                    // second, spurious handleFailure.
+                    guard self.transport === socket else { return }
                     self.receive(on: socket, generation: gen)
                 }
             }
@@ -159,13 +191,28 @@ public final class RelayConnection {
         switch type {
         case "challenge":
             guard let nonceB64 = object["nonce"] as? String, let nonce = Data(base64Encoded: nonceB64) else { return }
+            let signature: Data
+            do {
+                signature = try signer.sign(nonce)
+            } catch {
+                // A signing failure here is not a protocol error — on the
+                // phone it is the ordinary case of a locked device, a
+                // cancelled biometric prompt, or a Secure Enclave timeout.
+                // Route it to the SAME path a dead socket takes: `.offline`
+                // plus the existing reconnect backoff, since a locked phone
+                // may be unlocked by the time the backoff fires. Sending an
+                // empty signature instead would make the relay drop the
+                // socket anyway, but with no error to show for it.
+                handleFailure(error)
+                return
+            }
             var auth: [String: Any] = [
                 "type": "auth",
                 "publicKey": signer.publicKeySPKI.base64EncodedString(),
-                "signature": signer.sign(nonce).base64EncodedString(),
+                "signature": signature.base64EncodedString(),
             ]
             for (key, value) in extraAuthFields() { auth[key] = value }
-            send(control: auth)
+            send(control: auth, onFailure: events.onSendFailure)
             // The connection answers the challenge itself, but it still
             // reports it to the caller — a host logs the handshake it just
             // took part in, which is how "connects but never authenticates"
@@ -193,6 +240,9 @@ public final class RelayConnection {
     /// socket (that case is silent by design: a control frame with nowhere
     /// to go is not worth alarming about).
     public func send(control object: [String: Any], onFailure: ((Error) -> Void)? = nil) {
+        #if DEBUG
+        dispatchPrecondition(condition: .onQueue(.main))
+        #endif
         guard let transport, let data = try? JSONSerialization.data(withJSONObject: object),
               let text = String(data: data, encoding: .utf8) else { return }
         transport.send(text) { error in
@@ -201,23 +251,24 @@ public final class RelayConnection {
         }
     }
 
-    /// The completion fires exactly once, on the main queue, whether the
-    /// frame was sent, failed, or there was no socket to send it on — a
-    /// caller counting in-flight bytes must never wait forever.
+    /// The completion fires exactly once, always via `DispatchQueue.main.async`
+    /// (never inline, even when already on main), whether the frame was
+    /// sent, failed, or there was no socket to send it on — a caller
+    /// counting in-flight bytes must never wait forever, and a synchronous
+    /// completion on the sent path would re-enter `RemotePaneStream`'s pump
+    /// while it is still mid-call. This matches `RemoteHost.sendEnvelope`,
+    /// which the move to this class carried forward.
     public func send(envelope: RemoteEnvelope, completion: (() -> Void)?) {
+        #if DEBUG
+        dispatchPrecondition(condition: .onQueue(.main))
+        #endif
         guard let transport, let text = String(data: envelope.encode(), encoding: .utf8) else {
-            // Deliberately `.async`, not `Self.onMain`, even when already on
-            // main: inherited verbatim from `RemoteHost`. A synchronous
-            // completion here would re-enter `RemotePaneStream`'s pump,
-            // which counts in-flight bytes — the asymmetry with the sent
-            // path below (which does use `Self.onMain`) is intentional, not
-            // a bug to fix.
             if let completion { DispatchQueue.main.async(execute: completion) }
             return
         }
         transport.send(text) { _ in
             guard let completion else { return }
-            Self.onMain(completion)
+            DispatchQueue.main.async(execute: completion)
         }
     }
 

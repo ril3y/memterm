@@ -20,9 +20,13 @@ import MemtermRemoteKit
 // guarantees every one of its callbacks (`onState`, `onControl`,
 // `onEnvelope`, and every `send` completion) lands on main, because dispatch
 // touches panes and AppKit, and SwiftTerm asserts the main thread. Sends are
-// safe from anywhere (`RelayConnection` and RemoteSessionKeys are both
-// thread-safe), but they are made from main too so the counters advance in
-// the order the messages were produced.
+// made from main because `RelayConnection` REQUIRES it — `start`, `stop`,
+// and both `send`s read and write its `transport` var without locking, so
+// an off-main call is a real data race, not merely an unnecessary one. (The
+// old comment here was true of `URLSessionWebSocketTask`, which genuinely is
+// thread-safe; it stopped being true the day the socket moved into this
+// class, and the debug-only `dispatchPrecondition` calls in `RelayConnection`
+// now catch a violation instead of just documenting one.)
 
 /// What a device needs to reach this host, encoded into the pairing QR.
 /// The field names are a cross-language contract: the TypeScript web client
@@ -181,11 +185,19 @@ final class RemoteHost {
             setState("off", error: "relay URL is not usable")
             return
         }
-        if enabled, relayBase == url, connection != nil { return }  // nothing changed
+        // Nothing changed: same on/off switch, same relay URL — deliberately
+        // not forcing a reconnect here even mid-offline-gap, since the
+        // backoff recovers within 30 s regardless — AND a connection that
+        // still has some chance of using that URL. That second half matters
+        // because `connection != nil` no longer implies "we have a socket":
+        // the kit's unusable-URL branch sets `.off` permanently without
+        // clearing `connection`, so without it, one unusable URL would make
+        // every later apply return here and leave remote stuck off until the
+        // user toggles it manually.
+        if enabled, relayBase == url, let connection, connection.state != .off { return }
         disconnect(state: "off")
         enabled = true
         relayBase = url
-        connection?.stop()
         connection = makeConnection(base: url)
         connection?.start()
     }
@@ -212,6 +224,13 @@ final class RemoteHost {
         }
         events.onControl = { [weak self] object in self?.handleControl(object) }
         events.onEnvelope = { [weak self] envelope in self?.handleEnvelope(envelope) }
+        // The kit sends its own `auth` frame directly (challenge response);
+        // this is the only way that send's failure can reach the host's log,
+        // matching the wording `sendControl` already uses for every frame
+        // the host sends itself.
+        events.onSendFailure = { [weak self] error in
+            self?.log("send failed: \(error.localizedDescription)")
+        }
         return RelayConnection(base: base, role: .host, signer: identity,
                                extraAuthFields: { [weak self] in ["allowed": self?.store.allowedIds ?? []] },
                                events: events)
@@ -334,9 +353,15 @@ final class RemoteHost {
 
     private func disconnect(state: String) {
         enabled = false
+        // Sessions come down BEFORE the connection stops: `connection?.stop()`
+        // synchronously drives `onState(.off)` -> `setState("off", nil)` ->
+        // `onStateChange?()`, so an observer notified of that must never see
+        // `probeState == "off"` while `sessions` is still populated. Tearing
+        // down first also means the trailing `setState` below dedups to a
+        // no-op instead of firing `onStateChange` a second time.
+        tearDownAllSessions()
         connection?.stop()
         connection = nil
-        tearDownAllSessions()
         relayBase = nil
         setState(state, error: nil)
     }

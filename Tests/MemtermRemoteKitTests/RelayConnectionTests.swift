@@ -32,6 +32,16 @@ final class RelayConnectionTests: XCTestCase {
         t.push(["type": "challenge", "nonce": Data(repeating: 7, count: 32).base64EncodedString()])
     }
 
+    /// I4: a Secure Enclave key fails to sign for ordinary reasons (locked
+    /// device, cancelled biometric prompt, timeout) — this stands in for
+    /// that, unconditionally.
+    private struct ThrowingSigner: RemoteSigner {
+        struct SigningError: Error {}
+        let id = "throws"
+        let publicKeySPKI = Data([1, 2, 3])
+        func sign(_ data: Data) throws -> Data { throw SigningError() }
+    }
+
     func testConnectsToRolePathAndAnswersChallenge() {
         let c = make(role: .host, extra: { ["allowed": ["abc"]] })
         c.start()
@@ -123,6 +133,54 @@ final class RelayConnectionTests: XCTestCase {
         XCTAssertTrue(envelopes.isEmpty, "a frame from the replaced socket is ignored")
         challenge(second); second.push(["type": "authed"])
         XCTAssertEqual(states.last, .connected)
+    }
+
+    /// I3: `start()` is a public entry point a caller (an iOS view model's
+    /// `onAppear`, most plausibly) can call more than once. A second call
+    /// must not orphan a live, already-authenticated socket.
+    func testStartIsIdempotentAndClosesThePreviousSocket() {
+        let c = make()
+        c.start()
+        challenge(factory.current)
+        factory.current.push(["type": "authed"])
+        let first = factory.current
+        XCTAssertFalse(first.cancelled)
+        c.start()
+        XCTAssertTrue(first.cancelled, "the replaced socket is closed, not merely orphaned")
+        XCTAssertEqual(factory.made.count, 2, "a second transport is made")
+    }
+
+    /// I4: a signing failure (the ordinary case for a Secure Enclave key —
+    /// locked device, cancelled prompt, timeout) must not become an empty
+    /// signature on the wire. It routes to the same path a dead socket
+    /// takes: offline, with the normal reconnect backoff, since a locked
+    /// phone may be unlocked by the time it fires.
+    func testSigningFailureGoesOfflineWithoutSendingAuth() {
+        var events = RelayConnection.Events()
+        events.onState = { [self] in states.append($0) }
+        let c = RelayConnection(base: URL(string: "wss://relay.example.test")!, role: .client,
+                                signer: ThrowingSigner(), events: events, transports: factory,
+                                schedule: { [self] d, body in scheduler.schedule(d, body) })
+        c.start()
+        challenge(factory.current)
+        guard case .offline = states.last else {
+            return XCTFail("expected .offline after a signing failure, got \(String(describing: states.last))")
+        }
+        XCTAssertNil(factory.current.lastSent, "no auth frame is ever sent when signing throws")
+        XCTAssertEqual(scheduler.pendingDelays, [1], "a reconnect is scheduled with the normal backoff")
+    }
+
+    /// Recommendation 4: the ping's re-arm across a reconnect had no
+    /// coverage — every other ping test stays within one generation.
+    func testPingReArmsAndTargetsTheNewTransportAfterReconnect() {
+        let c = make()
+        c.start()
+        factory.current.fail("boom")
+        scheduler.fireNext()                                    // reconnect -> new transport
+        XCTAssertEqual(scheduler.pendingDelays, [30], "ping re-armed after reconnect")
+        let reconnected = factory.current
+        scheduler.fireNext()                                    // fires the ping
+        XCTAssertEqual(reconnected.pings, 1, "pings the NEW transport, not the replaced one")
     }
 
     func testStopCancelsTheLiveSocket() {
