@@ -15,12 +15,14 @@ import MemtermRemoteKit
 // envelopes by `to`/`from` and never holds a key — so "no cloud that can read
 // your terminal" survives the feature.
 //
-// THREADING: every relay message is handled on the MAIN thread. The socket's
-// completion handlers land on URLSession's delegate queue and immediately hop
-// (`onMain`), because dispatch touches panes and AppKit, and SwiftTerm asserts
-// the main thread. Sends are safe from anywhere (URLSessionWebSocketTask and
-// RemoteSessionKeys are both thread-safe), but they are made from main too so
-// the counters advance in the order the messages were produced.
+// THREADING: every relay message is handled on the MAIN thread. The socket
+// itself now lives in MemtermRemoteKit's `RelayConnection`, which already
+// guarantees every one of its callbacks (`onState`, `onControl`,
+// `onEnvelope`, and every `send` completion) lands on main, because dispatch
+// touches panes and AppKit, and SwiftTerm asserts the main thread. Sends are
+// safe from anywhere (`RelayConnection` and RemoteSessionKeys are both
+// thread-safe), but they are made from main too so the counters advance in
+// the order the messages were produced.
 
 /// What a device needs to reach this host, encoded into the pairing QR.
 /// The field names are a cross-language contract: the TypeScript web client
@@ -99,12 +101,9 @@ final class RemoteHost {
     // MARK: - Connection state
 
     private var identityCache: RemoteIdentity?
-    private var task: URLSessionWebSocketTask?
+    private var connection: RelayConnection?
     private var enabled = false
     private var relayBase: URL?
-    private var reconnectDelay: TimeInterval = 1
-    private var reconnectWork: DispatchWorkItem?
-    private var pingWork: DispatchWorkItem?
     /// A token minted while the socket was down, or before the relay had
     /// authed us, with the deadline the USER was shown counting down. It is
     /// sent when we next reach `connected`, and dropped once that deadline has
@@ -130,10 +129,6 @@ final class RemoteHost {
     /// The last `web_url` complaint printed, so a live config apply does
     /// not repeat it on every keystroke in Settings.
     private var lastWebURLWarning: String?
-    /// Generation counter: every connect attempt bumps it, and a callback
-    /// from an older socket is ignored. Without it, a slow failure from a
-    /// socket we already replaced would schedule a second reconnect loop.
-    private var generation = 0
 
     init(app: MemtermAppDelegate, store: RemoteDeviceStore = RemoteDeviceStore()) {
         self.app = app
@@ -186,11 +181,40 @@ final class RemoteHost {
             setState("off", error: "relay URL is not usable")
             return
         }
-        if enabled, relayBase == url, task != nil { return }  // nothing changed
+        if enabled, relayBase == url, connection != nil { return }  // nothing changed
         disconnect(state: "off")
         enabled = true
         relayBase = url
-        connect()
+        connection?.stop()
+        connection = makeConnection(base: url)
+        connection?.start()
+    }
+
+    /// Builds the shared relay client for this host: the socket, challenge,
+    /// auth (with the device allow-list attached), envelope framing, ping,
+    /// and reconnect are all `RelayConnection`'s; only the mapping from its
+    /// states to `probeState` and its control/envelope callbacks are ours.
+    private func makeConnection(base: URL) -> RelayConnection {
+        var events = RelayConnection.Events()
+        events.onState = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .off: self.setState("off", error: nil)
+            case .connecting: self.setState("connecting", error: self.probeLastError)
+            case .connected: self.setState("connected", error: nil)
+            case .offline(let message):
+                // Every session's keys are bound to this connection's
+                // handshake, so a dropped socket ends them all; the device
+                // re-Hellos on reconnect.
+                self.tearDownAllSessions()
+                self.setState("offline", error: message)
+            }
+        }
+        events.onControl = { [weak self] object in self?.handleControl(object) }
+        events.onEnvelope = { [weak self] envelope in self?.handleEnvelope(envelope) }
+        return RelayConnection(base: base, role: .host, signer: identity,
+                               extraAuthFields: { [weak self] in ["allowed": self?.store.allowedIds ?? []] },
+                               events: events)
     }
 
     // MARK: - Pairing
@@ -308,92 +332,11 @@ final class RemoteHost {
 
     // MARK: - Connection
 
-    private func connect() {
-        guard enabled, let base = relayBase else { return }
-        generation += 1
-        let gen = generation
-        // The relay's two endpoints differ only by path; `/host` is the one
-        // that may announce an allow-list.
-        var parts = URLComponents(url: base, resolvingAgainstBaseURL: false)
-        parts?.path = "/host"
-        guard let url = parts?.url else {
-            setState("off", error: "relay URL is not usable")
-            return
-        }
-        setState("connecting", error: probeLastError)
-        let socket = URLSession.shared.webSocketTask(with: url)
-        task = socket
-        socket.resume()
-        receive(on: socket, generation: gen)
-        schedulePing(generation: gen)
-    }
-
-    private func receive(on socket: URLSessionWebSocketTask, generation gen: Int) {
-        socket.receive { [weak self] result in
-            Self.onMain {
-                guard let self, gen == self.generation else { return }
-                switch result {
-                case .failure(let error):
-                    self.handleSocketFailure(error)
-                case .success(let message):
-                    switch message {
-                    case .string(let text):
-                        self.handleRelay(Data(text.utf8))
-                    case .data(let data):
-                        self.handleRelay(data)
-                    @unknown default:
-                        break
-                    }
-                    self.receive(on: socket, generation: gen)
-                }
-            }
-        }
-    }
-
-    private func handleSocketFailure(_ error: Error) {
-        // Every session's keys are bound to this connection's handshake, so a
-        // dropped socket ends them all; the device re-Hellos on reconnect.
-        tearDownAllSessions()
-        task = nil
-        pingWork?.cancel()
-        guard enabled else { return }
-        setState("offline", error: error.localizedDescription)
-        scheduleReconnect()
-    }
-
-    private func scheduleReconnect() {
-        reconnectWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.connect() }
-        reconnectWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + reconnectDelay, execute: work)
-        // 1 s → 30 s: fast enough that a relay restart is invisible, slow
-        // enough that a relay that is down for a day is not hammered.
-        reconnectDelay = min(reconnectDelay * 2, 30)
-    }
-
-    /// Fly (and most proxies) cut an idle WebSocket. A ping every 30 s keeps
-    /// an attached-but-quiet session alive instead of making it reconnect and
-    /// re-handshake every few minutes.
-    private func schedulePing(generation gen: Int) {
-        pingWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, gen == self.generation, let task = self.task else { return }
-            task.sendPing { _ in }
-            self.schedulePing(generation: gen)
-        }
-        pingWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: work)
-    }
-
     private func disconnect(state: String) {
         enabled = false
-        generation += 1
-        reconnectWork?.cancel()
-        pingWork?.cancel()
-        reconnectDelay = 1
+        connection?.stop()
+        connection = nil
         tearDownAllSessions()
-        task?.cancel(with: .goingAway, reason: nil)
-        task = nil
         relayBase = nil
         setState(state, error: nil)
     }
@@ -411,25 +354,22 @@ final class RemoteHost {
 
     // MARK: - Relay protocol
 
-    /// The relay's own control messages (everything that is not an envelope).
-    /// All of it is untrusted input: a field that is missing or the wrong
-    /// type just ends the handler, never a force-unwrap.
-    private func handleRelay(_ data: Data) {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = object["type"] as? String
-        else { return }
+    /// The relay's own control messages (everything that is not an envelope
+    /// and not the challenge, which `RelayConnection` answers itself). All of
+    /// it is untrusted input: a field that is missing or the wrong type just
+    /// ends the handler, never a force-unwrap.
+    private func handleControl(_ object: [String: Any]) {
+        guard let type = object["type"] as? String else { return }
         // Control traffic only (types, never payloads): envelopes are sealed
         // and frequent, everything else is rare and worth a line.
-        if type != "env" { log("relay → \(type)") }
+        log("relay → \(type)")
         switch type {
-        case "challenge":
-            guard let nonceB64 = object["nonce"] as? String,
-                  let nonce = Data(base64Encoded: nonceB64)
-            else { return }
-            sendAuth(nonce: nonce)
         case "authed":
-            reconnectDelay = 1
-            setState("connected", error: nil)
+            // The connection has already reset its own backoff and moved
+            // `state` to `.connected` — reflected in `probeState` by
+            // `makeConnection`'s `onState` before this callback runs — so
+            // `sendPairTokenIfPossible`'s `probeState == "connected"` guard
+            // below already passes.
             sendAllowed()
             sendPairTokenIfPossible()
         case "pair-request":
@@ -440,25 +380,9 @@ final class RemoteHost {
             // error and let the status line stay "connected".
             probeLastError = "relay refused: \((object["reason"] as? String) ?? "unknown")"
             onStateChange?()
-        case "env":
-            guard let envelope = RemoteEnvelope.decode(data) else { return }
-            handleEnvelope(envelope)
         default:
             break
         }
-    }
-
-    private func sendAuth(nonce: Data) {
-        // The relay verifies this signature over the RAW nonce bytes. Hello
-        // signatures carry a domain label precisely so that a signature
-        // gathered here can never be replayed as one.
-        let payload: [String: Any] = [
-            "type": "auth",
-            "publicKey": identity.publicKeySPKI.base64EncodedString(),
-            "signature": identity.sign(nonce).base64EncodedString(),
-            "allowed": store.allowedIds,
-        ]
-        sendJSON(payload)
     }
 
     /// Replaces the relay's allow-list with the store's. The host's device
@@ -466,7 +390,16 @@ final class RemoteHost {
     /// connection, which is why this is re-sent on every auth and after every
     /// pair or revoke.
     private func sendAllowed() {
-        sendJSON(["type": "allowed", "devices": store.allowedIds])
+        sendControl(["type": "allowed", "devices": store.allowedIds])
+    }
+
+    /// `connection?.send(control:)`, plus the "send failed" log line the
+    /// socket-owning code used to produce on a transport-reported error
+    /// (`sendJSON`, before this host rode a shared `RelayConnection`).
+    private func sendControl(_ object: [String: Any]) {
+        connection?.send(control: object) { [weak self] error in
+            self?.log("send failed: \(error.localizedDescription)")
+        }
     }
 
     private func sendPairTokenIfPossible(now: Date = Date()) {
@@ -478,7 +411,7 @@ final class RemoteHost {
             return
         }
         guard probeState == "connected" else { return }
-        sendJSON(["type": "pair-token", "token": pending.token])
+        sendControl(["type": "pair-token", "token": pending.token])
         log("published a pairing token to the relay")
         // Single use at the relay; a second QR mints a second token.
         pendingPair = nil
@@ -508,7 +441,7 @@ final class RemoteHost {
                     self.sendAllowed()
                     self.onStateChange?()
                 }
-                self.sendJSON(["type": "pair-answer", "deviceId": deviceId, "accept": allowed])
+                self.sendControl(["type": "pair-answer", "deviceId": deviceId, "accept": allowed])
             }
         }
         guard isPairingWindowOpen() else {
@@ -668,25 +601,12 @@ final class RemoteHost {
     }
 
     private func sendEnvelope(to deviceId: String, payload: Data, completion: (() -> Void)? = nil) {
-        let envelope = RemoteEnvelope(to: deviceId, from: identity.id, payload: payload)
-        guard let task, let text = String(data: envelope.encode(), encoding: .utf8) else {
+        guard let connection else {
             if let completion { DispatchQueue.main.async(execute: completion) }
             return
         }
-        task.send(.string(text)) { _ in
-            guard let completion else { return }
-            DispatchQueue.main.async(execute: completion)
-        }
-    }
-
-    private func sendJSON(_ object: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: object),
-              let text = String(data: data, encoding: .utf8)
-        else { return }
-        task?.send(.string(text)) { [weak self] error in
-            guard let error else { return }
-            Self.onMain { self?.log("send failed: \(error.localizedDescription)") }
-        }
+        let envelope = RemoteEnvelope(to: deviceId, from: identity.id, payload: payload)
+        connection.send(envelope: envelope, completion: completion)
     }
 
     // MARK: - Helpers

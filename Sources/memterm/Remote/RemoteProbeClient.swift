@@ -19,7 +19,7 @@ final class RemoteProbeClient {
     let identity = RemoteIdentity.generate()
     var deviceId: String { identity.id }
 
-    private var task: URLSessionWebSocketTask?
+    private var connection: RelayConnection?
     private var sessionKeys: RemoteSessionKeys?
     private var myEphemeral: P256.KeyAgreement.PrivateKey?
     private var hostId = ""
@@ -60,51 +60,37 @@ final class RemoteProbeClient {
 
     // MARK: - Connection
 
-    /// Opens (or re-opens, after a relay restart) the `/client` socket and
-    /// runs the challenge/auth handshake. Pairing is NOT re-sent here: a
+    /// Opens (or re-opens, after a relay restart) the `/client` connection
+    /// and runs its challenge/auth handshake. Pairing is NOT re-sent here: a
     /// reconnect only needs a fresh auth, since the host's own device store
     /// — not the relay's in-memory registry — is what remembers pairing.
+    /// Replaces (and stops) any previous connection rather than leaving it
+    /// running: `RelayConnection`, unlike the raw socket this used to hold,
+    /// retries on its own, so an old one left alive after a relay restart
+    /// would race this fresh one for the same identity.
     func connect(relay: URL) {
         authed = false
-        var parts = URLComponents(url: relay, resolvingAgainstBaseURL: false)
-        parts?.path = "/client"
-        guard let url = parts?.url else { return }
-        let socket = URLSession.shared.webSocketTask(with: url)
-        task = socket
-        socket.resume()
-        receive(on: socket)
-    }
-
-    private func receive(on socket: URLSessionWebSocketTask) {
-        socket.receive { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure:
-                DispatchQueue.main.async { self.authed = false }
-            case .success(let message):
-                let data: Data
-                switch message {
-                case .string(let text): data = Data(text.utf8)
-                case .data(let raw): data = raw
-                @unknown default: return self.receive(on: socket)
-                }
-                DispatchQueue.main.async { self.handle(data) }
-                self.receive(on: socket)
-            }
+        connection?.stop()
+        var events = RelayConnection.Events()
+        events.onState = { [weak self] state in
+            // The only transition this client ever acted on itself: a
+            // dropped socket meant a fresh auth was needed before anything
+            // else could be sent again.
+            if case .offline = state { self?.authed = false }
         }
+        events.onControl = { [weak self] object in self?.handleControl(object) }
+        events.onEnvelope = { [weak self] envelope in self?.handleEnvelope(envelope) }
+        let c = RelayConnection(base: relay, role: .client, signer: identity, events: events)
+        connection = c
+        c.start()
     }
 
-    private func handle(_ data: Data) {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = object["type"] as? String
-        else { return }
+    /// Every relay control message reaching this device — `authed`, pairing
+    /// answers, refusals — after `RelayConnection` has already answered the
+    /// challenge and updated its own state.
+    private func handleControl(_ object: [String: Any]) {
+        guard let type = object["type"] as? String else { return }
         switch type {
-        case "challenge":
-            guard let nonceB64 = object["nonce"] as? String, let nonce = Data(base64Encoded: nonceB64)
-            else { return }
-            sendJSON(["type": "auth",
-                      "publicKey": identity.publicKeySPKI.base64EncodedString(),
-                      "signature": identity.sign(nonce).base64EncodedString()])
         case "authed":
             authed = true
             sendPairIfPending()
@@ -121,9 +107,6 @@ final class RemoteProbeClient {
             paired = false
         case "refused":
             lastRefusedReason = (object["reason"] as? String) ?? "unknown"
-        case "env":
-            guard let envelope = RemoteEnvelope.decode(data) else { return }
-            handleEnvelope(envelope)
         default:
             break
         }
@@ -153,10 +136,10 @@ final class RemoteProbeClient {
 
     private func sendPairIfPending() {
         guard authed, let token = pendingPairToken else { return }
-        sendJSON(["type": "pair", "token": token,
-                  "publicKey": identity.publicKeySPKI.base64EncodedString(),
-                  "name": pendingPairName,
-                  "proof": pendingPairProof ?? ""])
+        connection?.send(control: ["type": "pair", "token": token,
+                                   "publicKey": identity.publicKeySPKI.base64EncodedString(),
+                                   "name": pendingPairName,
+                                   "proof": pendingPairProof ?? ""])
         pendingPairToken = nil
         pendingPairProof = nil
     }
@@ -213,8 +196,8 @@ final class RemoteProbeClient {
     }
 
     func disconnect() {
-        task?.cancel(with: .goingAway, reason: nil)
-        task = nil
+        connection?.stop()
+        connection = nil
     }
 
     // MARK: - Wire helpers (mirrors RemoteHost.HelloWire, which is private there)
@@ -234,14 +217,6 @@ final class RemoteProbeClient {
 
     private func sendEnvelope(to: String, payload: Data) {
         let envelope = RemoteEnvelope(to: to, from: deviceId, payload: payload)
-        guard let text = String(data: envelope.encode(), encoding: .utf8) else { return }
-        task?.send(.string(text)) { _ in }
-    }
-
-    private func sendJSON(_ object: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: object),
-              let text = String(data: data, encoding: .utf8)
-        else { return }
-        task?.send(.string(text)) { _ in }
+        connection?.send(envelope: envelope, completion: nil)
     }
 }

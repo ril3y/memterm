@@ -34,6 +34,7 @@ public final class RelayConnection {
     private let events: Events
     private let transports: WebSocketTransportFactory
     private let schedule: (TimeInterval, @escaping () -> Void) -> DispatchWorkItem
+    private let makeConnectURL: (URL, Role) -> URL?
 
     private var transport: WebSocketTransport?
     private var generation = 0
@@ -46,16 +47,31 @@ public final class RelayConnection {
                 extraAuthFields: @escaping () -> [String: Any] = { [:] },
                 events: Events,
                 transports: WebSocketTransportFactory = URLSessionTransportFactory(),
-                schedule: @escaping (TimeInterval, @escaping () -> Void) -> DispatchWorkItem = RelayConnection.mainQueueSchedule) {
+                schedule: @escaping (TimeInterval, @escaping () -> Void) -> DispatchWorkItem = RelayConnection.mainQueueSchedule,
+                makeConnectURL: @escaping (URL, Role) -> URL? = RelayConnection.connectURL) {
         self.base = base; self.role = role; self.signer = signer
         self.extraAuthFields = extraAuthFields; self.events = events
         self.transports = transports; self.schedule = schedule
+        self.makeConnectURL = makeConnectURL
     }
 
     public static func mainQueueSchedule(_ delay: TimeInterval, _ body: @escaping () -> Void) -> DispatchWorkItem {
         let item = DispatchWorkItem(block: body)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         return item
+    }
+
+    /// `/host` or `/client` appended to `base`'s path. Injectable (like
+    /// `transports` and `schedule` above) purely so a test can simulate the
+    /// nil case below deterministically: on every `URL` this was actually
+    /// tried against, `URLComponents` proved too lenient at read-time to
+    /// ever produce it from a real, publicly-constructible `URL` — the
+    /// guard in `connect()` is real defensive code, but not one a live
+    /// `base` value can be made to trip.
+    public static func connectURL(_ base: URL, _ role: Role) -> URL? {
+        var parts = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        parts?.path = "/" + role.rawValue
+        return parts?.url
     }
 
     // MARK: - Lifecycle
@@ -79,9 +95,16 @@ public final class RelayConnection {
         guard running else { return }
         generation += 1
         let gen = generation
-        var parts = URLComponents(url: base, resolvingAgainstBaseURL: false)
-        parts?.path = "/" + role.rawValue
-        guard let url = parts?.url else { setState(.offline("relay URL is not usable")); return }
+        guard let url = makeConnectURL(base, role) else {
+            // An unusable base URL is a configuration error, not a transient
+            // failure: no amount of retrying will ever produce a path where
+            // none can be formed, so this must not leave `running == true`
+            // with a reconnect that can never succeed. `off`, not `offline`,
+            // matches the Mac host's own handling of the same case.
+            running = false
+            setState(.off)
+            return
+        }
         setState(.connecting)
         let socket = transports.makeTransport(url: url)
         transport = socket
@@ -157,10 +180,19 @@ public final class RelayConnection {
 
     // MARK: - Sending
 
-    public func send(control object: [String: Any]) {
+    /// `onFailure`, when given, fires on the main queue with whatever error
+    /// the transport reported — never called when there was no transport to
+    /// send on at all, matching `RemoteHost`'s original `sendJSON`, which
+    /// only ever logged a transport-reported send error, not a missing
+    /// socket (that case is silent by design: a control frame with nowhere
+    /// to go is not worth alarming about).
+    public func send(control object: [String: Any], onFailure: ((Error) -> Void)? = nil) {
         guard let transport, let data = try? JSONSerialization.data(withJSONObject: object),
               let text = String(data: data, encoding: .utf8) else { return }
-        transport.send(text) { _ in }
+        transport.send(text) { error in
+            guard let error, let onFailure else { return }
+            Self.onMain { onFailure(error) }
+        }
     }
 
     /// The completion fires exactly once, on the main queue, whether the
@@ -168,6 +200,12 @@ public final class RelayConnection {
     /// caller counting in-flight bytes must never wait forever.
     public func send(envelope: RemoteEnvelope, completion: (() -> Void)?) {
         guard let transport, let text = String(data: envelope.encode(), encoding: .utf8) else {
+            // Deliberately `.async`, not `Self.onMain`, even when already on
+            // main: inherited verbatim from `RemoteHost`. A synchronous
+            // completion here would re-enter `RemotePaneStream`'s pump,
+            // which counts in-flight bytes — the asymmetry with the sent
+            // path below (which does use `Self.onMain`) is intentional, not
+            // a bug to fix.
             if let completion { DispatchQueue.main.async(execute: completion) }
             return
         }

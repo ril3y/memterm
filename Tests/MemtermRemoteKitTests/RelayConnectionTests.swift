@@ -175,4 +175,31 @@ final class RelayConnectionTests: XCTestCase {
         c.send(control: ["type": "allowed", "devices": []])
         XCTAssertTrue(factory.made.isEmpty)
     }
+
+    /// A base URL that cannot produce a `/host`-or-`/client` URL is a
+    /// configuration error, not a transient one: `connect()` must not leave
+    /// `running == true` with a reconnect that can never succeed (a live
+    /// bug fixed alongside this test — the old code called
+    /// `setState(.offline(...))` here and scheduled nothing, a dead end).
+    /// `RelayConnection.connectURL` is exercised directly first to confirm
+    /// no `URL` this suite could construct actually trips it — Foundation's
+    /// `URLComponents` turned out to accept every malformed base tried,
+    /// including `wss://` itself — so the failure is simulated through the
+    /// injectable `makeConnectURL`, the same seam `transports` and
+    /// `schedule` already use for deterministic tests.
+    func testUnusableConnectURLGoesOffAndSchedulesNothing() {
+        XCTAssertNotNil(RelayConnection.connectURL(URL(string: "wss://")!, .host),
+                        "documents that this base does NOT trip the real builder")
+        var events = RelayConnection.Events()
+        events.onState = { [self] in states.append($0) }
+        let c = RelayConnection(base: URL(string: "wss://relay.example.test")!, role: .host, signer: identity,
+                                events: events, transports: factory,
+                                schedule: { [self] d, body in scheduler.schedule(d, body) },
+                                makeConnectURL: { _, _ in nil })
+        c.start()
+        XCTAssertEqual(c.state, .off, "off, not offline — a bad config, not a dropped connection")
+        XCTAssertTrue(states.isEmpty, "off → off is not a transition; nothing new to tell a caller")
+        XCTAssertTrue(factory.made.isEmpty, "no transport is made")
+        XCTAssertTrue(scheduler.pendingDelays.isEmpty, "no reconnect or ping is scheduled")
+    }
 }

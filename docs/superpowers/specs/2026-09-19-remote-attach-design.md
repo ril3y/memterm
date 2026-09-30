@@ -21,9 +21,10 @@ Non-goals for this project: moving a session to another machine (journal sync), 
 
 Three units.
 
-### 1. Remote host (inside memterm, app target `Sources/memterm/Remote/`, pure parts in `MemtermCore/Remote/`)
+### 1. Remote host (inside memterm, app target `Sources/memterm/Remote/`, pure parts in `Sources/MemtermRemoteKit/` — Protocol/Crypto/Support/Relay subfolders, spec 2026-09-28)
 
 - Runs while Settings ▸ Remote is on. Keeps one outbound WebSocket to the relay (URLSessionWebSocketTask), reconnecting with backoff.
+- `Relay/RelayConnection.swift` — the relay client shared by the Mac host and the iPhone app (spec 2026-09-28).
 - Identity: a P-256 key pair generated on first enable, stored in the Keychain (stable under the Developer ID signing identity). Host ID = SHA-256 of the public key, base32, first 16 chars.
 - Exposes the live model: workspaces → windows/tabs → panes with titles and adapter kind (the same tree the timeline lists). A viewer attaches to a pane; the host fans that pane's raw pty output to every attached viewer and writes viewer input into the pty.
 - On attach, sends the pane's current screen first (the visible grid as bytes: clear + redraw from the engine's grid snapshot), then streams.
