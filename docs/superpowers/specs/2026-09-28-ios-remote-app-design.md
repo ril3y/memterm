@@ -23,7 +23,7 @@ Why native, when a web client exists:
 
 ### Non-goals for v1
 - Opening tabs, switching or parking workspaces, unlocking locked workspaces (the host supports `newTab`/`unlock`; the app does not send them).
-- Push notifications, background sessions, iPad layout, Mac Catalyst.
+- Push notifications, background sessions, Mac Catalyst.
 - App Store listing (TestFlight only). Multiple simultaneous terminals.
 
 ## 3. Architecture
@@ -99,7 +99,9 @@ One per paired Mac while the app is in the foreground and that Mac is selected.
 - **Macs** (`MacsView`): list of `PairedHost` with a presence dot (from `online`/`offline` control messages, fed by a lightweight presence connection when the app is in the foreground), a "Pair a Mac" button, swipe-to-forget. Tapping a Mac opens Tree.
 - **Pair** (`PairView`): `DataScannerViewController` (VisionKit) reading the QR; on a recognized `#pair=` fragment, a confirm sheet: "Pair with Mac ‹hostId›? This phone's key: ‹deviceId›. The Mac's prompt shows the same key; if it shows anything else, don't allow it." Then "Waiting for the Mac to accept…" until `paired` (verify `hostId`/`hostPublicKey` match the scanned payload exactly, as the web client does) or `pair-denied (reason)`. The proof is `RemotePairing.proof(secret:, deviceSPKI:)` from the kit.
 - **Tree** (`TreeView`): sections per workspace (name, color, locked/parked badges), rows per pane (adapter, cwd). Serial and locked panes are shown disabled. Tap → attach.
-- **Terminal** (`TerminalScreen`): SwiftTerm `TerminalView` (UIKit, via `UIViewRepresentable`) sized to the host's `screen` cols/rows; bytes from `HostSession.output` are fed with `feed(byteArray:)`; `TerminalViewDelegate.send` forwards keystrokes as `input`; the built-in keyboard accessory bar provides Esc/Ctrl/Tab/arrows. Toolbar: Back (detach), Fit. Fit sends `resize` with the view's proposed cols/rows; after the first Fit in a session, rotation refits automatically. Until then the host's size wins (spec rule "host window wins, Fit-to-me resizes").
+- **Terminal** (`TerminalScreen`): SwiftTerm `TerminalView` (UIKit, via `UIViewRepresentable`) sized to the host's `screen` cols/rows; bytes from `HostSession.output` are fed with `feed(byteArray:)`; `TerminalViewDelegate.send` forwards keystrokes as `input`; the built-in keyboard accessory bar provides Esc/Ctrl/Tab/arrows. Toolbar: Back (detach), Fit. Fit sends `resize` with the view's proposed cols/rows; nothing else ever does.
+
+  **Resizing the Mac's pane is always an explicit gesture** (founder decision 2026-09-30, Jev 1.0 on the iPad framing; it also settles the rotation question that was a coin flip on the iPhone alone). Rotating the device, and on iPad entering split view, slide over or Stage Manager, changes only how much of the pane this viewer SEES: the terminal view re-lays out and scrolls, and the host's grid is untouched. The reason is that a resize is visible to the person sitting at the Mac and can disturb a running full-screen program there, so it must never be a side effect of the viewer turning a device or another app taking half the screen. The rule stays "host window wins, Fit-to-me resizes" — Fit is the only thing that resizes.
 
 ### 3.4 Identity and storage
 
@@ -123,7 +125,7 @@ One per paired Mac while the app is in the foreground and that Mac is selected.
 
 ### 3.7 Build, sign, ship
 
-- Bundle id `com.memterm.remote`, team `YJ6Y72HALX`, iOS 17 deployment target, iPhone only.
+- Bundle id `com.memterm.remote`, team `YJ6Y72HALX`, iOS 17 deployment target, **universal (iPhone + iPad)**. The founder owns an iPad mini, an iPad is a better terminal viewer than a phone (roughly twice the columns in landscape), and in SwiftUI the cost is the device family plus checking the four screens at iPad sizes — which v1 does. The app must also behave in a resized multitasking window, which the resize rule in 3.3 already settles by never resizing the host for a window change.
 - Project: `ios/MemtermRemote.xcodeproj` committed to this repo; local package dependency on the repo root (`MemtermRemoteKit`) and SwiftTerm (`ril3y/SwiftTerm`, the same fork the Mac uses).
 - CI (`.github/workflows/ios.yml`): on push to the default branch and on `v*` tags, on `macos-15`: `swift test --filter MemtermRemoteKit`, `xcodebuild test` for the app's unit tests on a simulator, then on tags `xcodebuild archive` with automatic signing through the App Store Connect API key already in secrets (`ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`) and `-allowProvisioningUpdates`, export for App Store distribution, and upload with `xcrun altool --upload-app --type ios` using the same key. Version = tag; build number = commit count (as the Mac app).
 - The founder creates the App ID with the Associated Domains capability once in the developer portal (or the first `-allowProvisioningUpdates` run does).
@@ -152,5 +154,5 @@ One per paired Mac while the app is in the foreground and that Mac is selected.
 
 - Multiple paired Macs from day one (costs nothing).
 - TestFlight only; App Store listing is a later decision.
-- iPad and Mac Catalyst: not now; the SwiftUI screens should not preclude them.
+- iPad: in, from v1 (see 3.7). Mac Catalyst: not now; the SwiftUI screens should not preclude it.
 - Push notifications: no; the relay is blind and holds no tokens by design.
