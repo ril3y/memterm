@@ -356,9 +356,11 @@ final class RemoteHost {
         // Sessions come down BEFORE the connection stops: `connection?.stop()`
         // synchronously drives `onState(.off)` -> `setState("off", nil)` ->
         // `onStateChange?()`, so an observer notified of that must never see
-        // `probeState == "off"` while `sessions` is still populated. Tearing
-        // down first also means the trailing `setState` below dedups to a
-        // no-op instead of firing `onStateChange` a second time.
+        // `probeState == "off"` while `sessions` is still populated.
+        //
+        // The trailing `setState` below still fires `onStateChange` a second
+        // time — only the log line dedups — which is harmless because the one
+        // consumer, RemoteSettingsSection.loadValues(), is an idempotent read.
         tearDownAllSessions()
         connection?.stop()
         connection = nil

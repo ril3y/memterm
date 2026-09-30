@@ -138,7 +138,7 @@ final class RelayConnectionTests: XCTestCase {
     /// I3: `start()` is a public entry point a caller (an iOS view model's
     /// `onAppear`, most plausibly) can call more than once. A second call
     /// must not orphan a live, already-authenticated socket.
-    func testStartIsIdempotentAndClosesThePreviousSocket() {
+    func testStartClosesThePreviousSocketRatherThanOrphaningIt() {
         let c = make()
         c.start()
         challenge(factory.current)
