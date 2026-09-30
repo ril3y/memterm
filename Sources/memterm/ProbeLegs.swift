@@ -3496,6 +3496,17 @@ extension MemtermAppDelegate {
         var screenCountBeforeCloseAttach = 0
         var treeChangedCountBeforeClose = 0
         var closePrunesVerified = false
+        // M9: fields for the UIPROBE-REMOTE summary below, set by the step
+        // that establishes each one — same pattern as closePrunesVerified
+        // and badProofDenied above, so the printed line reports what was
+        // actually measured instead of literal "true" text.
+        var paired = false
+        var listed = false
+        var attached = false
+        var echoRoundtrip = false
+        var resized = false
+        var reconnected = false
+        var revoked = false
 
         // Plan-mandated teardown (review round 1, 2026-09-20): a probe
         // failure anywhere in this leg routes straight to ProbeRunner.fail()
@@ -3621,6 +3632,7 @@ extension MemtermAppDelegate {
                 guard remote.probeSessionCount == 1 else {
                     throw ProbeFailure("host session count \(remote.probeSessionCount) after handshake, want 1")
                 }
+                paired = true
             },
             onFailure: { tearDownRemoteLeg() }))
 
@@ -3713,6 +3725,7 @@ extension MemtermAppDelegate {
                 guard let tree = client.lastTree, Self.treeContains(tree, paneId: paneId) else {
                     throw ProbeFailure("listed tree does not contain the key host's selected pane \(paneId.prefix(8))")
                 }
+                listed = true
             },
             onFailure: { tearDownRemoteLeg() }))
 
@@ -3725,6 +3738,7 @@ extension MemtermAppDelegate {
                 guard screen.cols == pane.getTerminal().cols else {
                     throw ProbeFailure("attach screen cols \(screen.cols) != pane cols \(pane.getTerminal().cols)")
                 }
+                attached = true
             },
             onFailure: { tearDownRemoteLeg() }))
 
@@ -3739,6 +3753,7 @@ extension MemtermAppDelegate {
                 guard pane.scrollbackText(maxLines: 50).contains("remote-probe") else {
                     throw ProbeFailure("echoed bytes reached the client but never the real pty's scrollback")
                 }
+                echoRoundtrip = true
             },
             onFailure: { tearDownRemoteLeg() }))
 
@@ -3747,12 +3762,13 @@ extension MemtermAppDelegate {
             action: { client.send(.resize(cols: 100, rows: 30)) },
             condition: { client.lastResized != nil },
             assert: {
-                guard let resized = client.lastResized, resized.cols == 100, resized.rows == 30 else {
+                guard let resizedAnswer = client.lastResized, resizedAnswer.cols == 100, resizedAnswer.rows == 30 else {
                     throw ProbeFailure("resized answer was \(String(describing: client.lastResized)), want 100x30")
                 }
                 guard let pane, pane.getTerminal().cols == 100 else {
                     throw ProbeFailure("pane terminal did not actually resize to 100 cols")
                 }
+                resized = true
             },
             onFailure: { tearDownRemoteLeg() }))
 
@@ -3857,6 +3873,7 @@ extension MemtermAppDelegate {
                 guard remote.probeState == "connected" else {
                     throw ProbeFailure("host never reconnected after the relay restart (state=\(remote.probeState))")
                 }
+                reconnected = true
             },
             onFailure: { tearDownRemoteLeg() }))
 
@@ -3880,7 +3897,8 @@ extension MemtermAppDelegate {
                 guard client.lastRefusedReason == "not-allowed" else {
                     throw ProbeFailure("post-revoke envelope got reason=\(client.lastRefusedReason ?? "nil"), want not-allowed")
                 }
-                print("UIPROBE-REMOTE paired=true listed=true attached=true echo_roundtrip=true resized=true reconnected=true revoked=true close_prunes=\(closePrunesVerified) bad_proof_denied=\(badProofDenied)")
+                revoked = true
+                print("UIPROBE-REMOTE paired=\(paired) listed=\(listed) attached=\(attached) echo_roundtrip=\(echoRoundtrip) resized=\(resized) reconnected=\(reconnected) revoked=\(revoked) close_prunes=\(closePrunesVerified) bad_proof_denied=\(badProofDenied)")
                 tearDownRemoteLeg()
             },
             onFailure: { tearDownRemoteLeg() }))
