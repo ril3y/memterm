@@ -46,6 +46,8 @@ final class RelayConnectionTests: XCTestCase {
         let sig = Data(base64Encoded: auth["signature"] as! String)!
         XCTAssertEqual(sig.count, 64, "raw r‖s P-256 signature")
         XCTAssertEqual(auth["allowed"] as? [String], ["abc"], "host auth carries its allow-list")
+        XCTAssertEqual(controls.last?["type"] as? String, "challenge",
+                       "the connection answers the challenge itself but still reports it, so a host can log the handshake it just took part in")
     }
 
     func testAuthCarriesExtraFieldsPerRole() {

@@ -196,6 +196,10 @@ final class RemoteProbeClient {
     }
 
     func disconnect() {
+        // No longer resets `authed = false` here: `stop()` bumps the
+        // connection's own generation before any in-flight receive failure
+        // can land, so the old reset was guarding a race that can't happen
+        // anymore.
         connection?.stop()
         connection = nil
     }

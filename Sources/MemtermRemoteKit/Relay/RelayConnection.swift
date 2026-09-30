@@ -166,6 +166,12 @@ public final class RelayConnection {
             ]
             for (key, value) in extraAuthFields() { auth[key] = value }
             send(control: auth)
+            // The connection answers the challenge itself, but it still
+            // reports it to the caller — a host logs the handshake it just
+            // took part in, which is how "connects but never authenticates"
+            // is told apart from "never connects at all" (field bug
+            // 2026-09-21/22).
+            events.onControl(object)
         case "authed":
             backoff = 1
             setState(.connected)

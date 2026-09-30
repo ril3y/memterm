@@ -354,10 +354,12 @@ final class RemoteHost {
 
     // MARK: - Relay protocol
 
-    /// The relay's own control messages (everything that is not an envelope
-    /// and not the challenge, which `RelayConnection` answers itself). All of
-    /// it is untrusted input: a field that is missing or the wrong type just
-    /// ends the handler, never a force-unwrap.
+    /// The relay's own control messages (everything that is not an envelope).
+    /// `challenge` reaches here too — `RelayConnection` answers it itself,
+    /// but still reports it, purely so the log line below fires; there is no
+    /// `case` for it since nothing further needs doing. All of it is
+    /// untrusted input: a field that is missing or the wrong type just ends
+    /// the handler, never a force-unwrap.
     private func handleControl(_ object: [String: Any]) {
         guard let type = object["type"] as? String else { return }
         // Control traffic only (types, never payloads): envelopes are sealed
