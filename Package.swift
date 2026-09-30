@@ -9,6 +9,11 @@ let package = Package(
         // nothing else in this package is built for iOS.
         .iOS(.v17)
     ],
+    products: [
+        // The iPhone/iPad client links this from ios/MemtermRemote.xcodeproj
+        // (spec 2026-09-28 §3.7); a bare target is not visible outside the package.
+        .library(name: "MemtermRemoteKit", targets: ["MemtermRemoteKit"])
+    ],
     dependencies: [
         // ril3y/SwiftTerm = upstream 1.20.0 + translucentCellBackgrounds
         // (explicit cell backgrounds follow window opacity, iTerm2-style —

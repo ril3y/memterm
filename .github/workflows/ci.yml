@@ -22,6 +22,12 @@ jobs:
         run: swift build
       - name: Unit tests
         run: swift test
+      # Proves the "macOS 14 / iOS 17" claim on MemtermRemoteKit (the shared
+      # kit the iPhone/iPad client will link) rather than asserting it: a
+      # macOS-only import (AppKit, Security, ...) added to the kit fails
+      # here even though it happily compiles for macOS.
+      - name: Build MemtermRemoteKit for iOS
+        run: xcodebuild -scheme MemtermRemoteKit -destination 'generic/platform=iOS' build
       - name: Config dump (headless wiring)
         run: |
           mkdir -p /tmp/cfg && : > /tmp/cfg/default.toml

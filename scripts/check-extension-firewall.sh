@@ -51,6 +51,7 @@ check_dir() {  # check_dir <dir> <allowed-regex> <label>
 
 # -- 1. Kit purity -----------------------------------------------------------
 check_dir "Sources/MemtermExtensionKit" "Foundation|AppKit" "kit"
+check_dir "Sources/MemtermRemoteKit" "Foundation|CryptoKit" "remote-kit"
 
 # -- 2. Extension targets ----------------------------------------------------
 EXT_DIRS=""
