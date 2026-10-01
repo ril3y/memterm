@@ -84,7 +84,11 @@ public struct RemoteIdentity {
     static let x963Length = 65
     static let spkiLength = spkiHeader.count + x963Length
 
-    static func spki(forX963 x963: Data) -> Data {
+    /// Public so a `RemoteSigner` that cannot construct a `RemoteIdentity` —
+    /// a Secure Enclave key on the phone has no `P256.Signing.PrivateKey` to
+    /// hand one — can still wrap its public key in the same SPKI bytes,
+    /// without re-deriving `spkiHeader` at the call site (task 2).
+    public static func spki(forX963 x963: Data) -> Data {
         spkiHeader + x963
     }
 
