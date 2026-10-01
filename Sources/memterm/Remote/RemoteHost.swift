@@ -557,7 +557,10 @@ final class RemoteHost {
         // keys, so its pane viewers do not leak.
         endSession(deviceId: device.id)
 
-        let (mine, ephemeral) = RemoteHandshake.makeHello(identity: identity)
+        guard let (mine, ephemeral) = try? RemoteHandshake.makeHello(signer: identity) else {
+            log("could not build a Hello for \(device.id): signing failed")
+            return
+        }
         // Both ids come from verified keys, never from a wire field: that
         // binding is what stops an unknown-key-share attack.
         let deviceId = RemoteIdentity.peerId(forSPKI: device.publicKeySPKI)
@@ -639,30 +642,6 @@ final class RemoteHost {
     }
 
     // MARK: - Helpers
-
-    /// The handshake's clear-text wire form. Separate from `RemoteMessage`
-    /// because it is the one payload that is NOT sealed — keeping it a
-    /// distinct shape means a Hello can never be confused for an inner
-    /// message, in either direction.
-    enum HelloWire {
-        private struct Wire: Codable {
-            var hs: String
-            var eph: Data
-            var sig: Data
-        }
-
-        static func encode(_ hello: RemoteHandshake.Hello) -> Data {
-            let wire = Wire(hs: "hello", eph: hello.ephemeralRaw, sig: hello.signature)
-            return (try? JSONEncoder().encode(wire)) ?? Data()
-        }
-
-        static func decode(_ data: Data) -> RemoteHandshake.Hello? {
-            guard let wire = try? JSONDecoder().decode(Wire.self, from: data),
-                  wire.hs == "hello"
-            else { return nil }
-            return RemoteHandshake.Hello(ephemeralRaw: wire.eph, signature: wire.sig)
-        }
-    }
 
     /// One encoder for the QR payload's own base64url (the pairing URL's
     /// fragment) and for the token halves, so they cannot drift apart.

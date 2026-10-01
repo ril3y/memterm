@@ -271,10 +271,16 @@ public enum RemoteHandshake {
         Data(helloSigningLabel.utf8) + ephemeralRaw
     }
 
-    public static func makeHello(identity: RemoteIdentity) -> (Hello, P256.KeyAgreement.PrivateKey) {
+    /// Builds a fresh ephemeral and signs it with whatever `RemoteSigner` is
+    /// given — a Keychain-backed `RemoteIdentity` on the Mac, a Secure
+    /// Enclave key on the phone. Throwing because `RemoteSigner.sign` is:
+    /// a phone's signer fails for ordinary reasons (locked device, cancelled
+    /// prompt), and that must surface as a failed handshake, never as a
+    /// `Hello` carrying an empty signature.
+    public static func makeHello(signer: RemoteSigner) throws -> (Hello, P256.KeyAgreement.PrivateKey) {
         let ephemeral = P256.KeyAgreement.PrivateKey()
         let raw = ephemeral.publicKey.x963Representation
-        let signature = identity.sign(helloSigningPayload(ephemeralRaw: raw))
+        let signature = try signer.sign(helloSigningPayload(ephemeralRaw: raw))
         return (Hello(ephemeralRaw: raw, signature: signature), ephemeral)
     }
 

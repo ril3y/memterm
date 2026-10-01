@@ -139,8 +139,8 @@ final class RemoteCryptoTests: XCTestCase {
     func testTwoPartiesDeriveMatchingKeysAndTalkBothDirections() throws {
         let hostIdentity = RemoteIdentity.generate()
         let clientIdentity = RemoteIdentity.generate()
-        let (hostHello, hostEphemeral) = RemoteHandshake.makeHello(identity: hostIdentity)
-        let (clientHello, clientEphemeral) = RemoteHandshake.makeHello(identity: clientIdentity)
+        let (hostHello, hostEphemeral) = try RemoteHandshake.makeHello(signer: hostIdentity)
+        let (clientHello, clientEphemeral) = try RemoteHandshake.makeHello(signer: clientIdentity)
 
         XCTAssertEqual(hostHello.ephemeralRaw.count, 65)
         XCTAssertEqual(hostHello.signature.count, 64)
@@ -180,10 +180,10 @@ final class RemoteCryptoTests: XCTestCase {
 
     /// A Hello signed by somebody else must not authenticate the peer we
     /// think we are talking to — that is the whole point of signing it.
-    func testVerifyHelloRejectsWrongIdentityAndTamperedPoint() {
+    func testVerifyHelloRejectsWrongIdentityAndTamperedPoint() throws {
         let identity = RemoteIdentity.generate()
         let impostor = RemoteIdentity.generate()
-        let (hello, _) = RemoteHandshake.makeHello(identity: identity)
+        let (hello, _) = try RemoteHandshake.makeHello(signer: identity)
         XCTAssertFalse(RemoteHandshake.verifyHello(hello, peerSPKI: impostor.publicKeySPKI))
 
         var tampered = hello
@@ -205,7 +205,7 @@ final class RemoteCryptoTests: XCTestCase {
         XCTAssertEqual(RemoteHandshake.helloSigningLabel, "memterm-remote-v1:hello")
 
         let identity = RemoteIdentity.generate()
-        let (hello, _) = RemoteHandshake.makeHello(identity: identity)
+        let (hello, _) = try RemoteHandshake.makeHello(signer: identity)
 
         let payload = RemoteHandshake.helloSigningPayload(ephemeralRaw: hello.ephemeralRaw)
         XCTAssertEqual(payload, Data("memterm-remote-v1:hello".utf8) + hello.ephemeralRaw)
@@ -230,9 +230,23 @@ final class RemoteCryptoTests: XCTestCase {
         )
     }
 
-    func testDeriveKeysRejectsMalformedPeerPoint() {
+    /// A signer that fails is the ordinary case for a phone's Secure Enclave
+    /// key (locked device, cancelled prompt) — `makeHello` must surface that
+    /// as a thrown error, never as a `Hello` carrying an empty signature.
+    private struct ThrowingSigner: RemoteSigner {
+        struct SigningError: Error {}
+        let id = "throws"
+        let publicKeySPKI = Data([1, 2, 3])
+        func sign(_ data: Data) throws -> Data { throw SigningError() }
+    }
+
+    func testMakeHelloThrowsWhenTheSignerThrows() {
+        XCTAssertThrowsError(try RemoteHandshake.makeHello(signer: ThrowingSigner()))
+    }
+
+    func testDeriveKeysRejectsMalformedPeerPoint() throws {
         let identity = RemoteIdentity.generate()
-        let (_, ephemeral) = RemoteHandshake.makeHello(identity: identity)
+        let (_, ephemeral) = try RemoteHandshake.makeHello(signer: identity)
         XCTAssertThrowsError(try RemoteHandshake.deriveKeys(
             myEphemeral: ephemeral,
             peerEphemeralRaw: Data(repeating: 0x04, count: 65),

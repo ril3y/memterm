@@ -148,14 +148,14 @@ final class RemoteProbeClient {
     /// ephemeral, signed and sent in the clear inside an envelope, kept
     /// around until the host's own Hello comes back.
     private func sendHello() {
-        let (hello, ephemeral) = RemoteHandshake.makeHello(identity: identity)
+        guard let (hello, ephemeral) = try? RemoteHandshake.makeHello(signer: identity) else { return }
         myEphemeral = ephemeral
-        sendEnvelope(to: hostId, payload: helloWireEncode(hello))
+        sendEnvelope(to: hostId, payload: HelloWire.encode(hello))
     }
 
     private func handleEnvelope(_ envelope: RemoteEnvelope) {
         guard envelope.to == deviceId else { return }
-        if let hello = helloWireDecode(envelope.payload) {
+        if let hello = HelloWire.decode(envelope.payload) {
             guard RemoteHandshake.verifyHello(hello, peerSPKI: hostPublicKeySPKI),
                   let ephemeral = myEphemeral,
                   let keys = try? RemoteHandshake.deriveKeys(
@@ -204,20 +204,7 @@ final class RemoteProbeClient {
         connection = nil
     }
 
-    // MARK: - Wire helpers (mirrors RemoteHost.HelloWire, which is private there)
-
-    private struct HelloWireData: Codable { var hs: String; var eph: Data; var sig: Data }
-
-    private func helloWireEncode(_ hello: RemoteHandshake.Hello) -> Data {
-        let wire = HelloWireData(hs: "hello", eph: hello.ephemeralRaw, sig: hello.signature)
-        return (try? JSONEncoder().encode(wire)) ?? Data()
-    }
-
-    private func helloWireDecode(_ data: Data) -> RemoteHandshake.Hello? {
-        guard let wire = try? JSONDecoder().decode(HelloWireData.self, from: data), wire.hs == "hello"
-        else { return nil }
-        return RemoteHandshake.Hello(ephemeralRaw: wire.eph, signature: wire.sig)
-    }
+    // MARK: - Wire helpers
 
     private func sendEnvelope(to: String, payload: Data) {
         let envelope = RemoteEnvelope(to: to, from: deviceId, payload: payload)
