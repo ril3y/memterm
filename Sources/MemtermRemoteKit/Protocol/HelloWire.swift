@@ -16,7 +16,18 @@ public enum HelloWire {
 
     public static func encode(_ hello: RemoteHandshake.Hello) -> Data {
         let wire = Wire(hs: "hello", eph: hello.ephemeralRaw, sig: hello.signature)
-        return (try? JSONEncoder().encode(wire)) ?? Data()
+        // sortedKeys: the comment above promises every party agrees on this
+        // shape byte-for-byte, and a bare JSONEncoder cannot keep that
+        // promise -- Darwin's does not guarantee the same key order across
+        // two encodes of one value. Nothing in the protocol reads these
+        // bytes positionally (the signature covers label + ephemeral, not
+        // the JSON), so the order has never mattered for correctness; it
+        // matters for being able to TEST the shape, and for a human
+        // diffing two captured frames. Same reason RemoteMessage.encode,
+        // RemoteDeviceSeal and the pairing QR all sort their keys.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(wire)) ?? Data()
     }
 
     public static func decode(_ data: Data) -> RemoteHandshake.Hello? {

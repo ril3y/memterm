@@ -278,24 +278,36 @@ final class RemoteCryptoTests: XCTestCase {
     /// different `Data` strategy cannot drift the format out from under the
     /// browser without a failing test.
     ///
-    /// Deliberately NOT a whole-string byte comparison, and that is worth
-    /// writing down: `HelloWire.encode` uses a bare `JSONEncoder()`, and
-    /// Darwin's does not promise the same key order across two encodes of one
-    /// value. An `==` against a literal `{"hs":…,"eph":…,"sig":…}` passes in
-    /// isolation and fails in a full run — measured here, not feared. That
-    /// instability is also why key order cannot be part of this contract, and
-    /// it costs nothing: order reaches no parser (every consumer reads by
-    /// name), no signature (a Hello's covers the labelled ephemeral point,
-    /// never this JSON), and no stored vector. What every consumer DOES depend
-    /// on byte for byte is each field's spelling, the tag's value, and base64
-    /// rather than an array of numbers — so that is what is pinned, and pinned
-    /// order-independently.
-    func testHelloWireFieldNamesTagAndBase64AreThePinnedContract() throws {
+    /// This began as three by-name assertions only, because a bare
+    /// `JSONEncoder()` does not promise the same key order across two encodes
+    /// and a byte comparison therefore passed alone and failed in a full run
+    /// — measured, not feared. The remedy was the encoder, not a weaker test:
+    /// `HelloWire.encode` now sorts its keys, so the Swift bytes are
+    /// reproducible and this pins them exactly.
+    ///
+    /// Both halves are kept on purpose, because they guard different things.
+    /// The byte literal catches a reordering or re-escaping change inside
+    /// Swift. The by-name assertions are the CROSS-LANGUAGE contract, and
+    /// they are the stronger claim: the browser's `JSON.stringify` emits
+    /// `"+/++"` where Foundation emits `"+\/++"`, because JavaScript does not
+    /// escape a forward slash. Those two byte strings differ and both are
+    /// correct — every consumer parses JSON and reads by name, and a Hello's
+    /// signature covers the labelled ephemeral point, never this JSON. So do
+    /// not "fix" a future mismatch by making the TypeScript side match this
+    /// literal: the literal is Swift's own reproducibility, while the names,
+    /// the tag, and base64-rather-than-an-array are what both languages must
+    /// agree on.
+    func testHelloWireBytesFieldNamesTagAndBase64AreThePinnedContract() throws {
         // A signature whose base64 needs `+` and `/` from the standard
         // alphabet, so a switch to base64url would be visible right here.
         let hello = RemoteHandshake.Hello(ephemeralRaw: Data([0x04, 0x01, 0x02]),
                                           signature: Data([0xFB, 0xFF, 0xBE]))
         let encoded = HelloWire.encode(hello)
+        XCTAssertEqual(String(data: encoded, encoding: .utf8),
+                       #"{"eph":"BAEC","hs":"hello","sig":"+\/++"}"#,
+                       "the exact Swift bytes, keys sorted; the note above says why the browser's differ")
+        XCTAssertEqual(encoded, HelloWire.encode(hello),
+                       "and encoding is reproducible — the property that makes the line above testable")
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         XCTAssertEqual(Set(json.keys), ["hs", "eph", "sig"], "exactly these three field names")
         XCTAssertEqual(json["hs"] as? String, "hello", "the tag that tells a Hello from a sealed record")
