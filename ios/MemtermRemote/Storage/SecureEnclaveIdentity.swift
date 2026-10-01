@@ -6,11 +6,10 @@ import Security
 
 /// This device's long-lived signing identity, backed by the Secure Enclave.
 ///
-/// NOT compiled yet: `ios/` has no SwiftPM/Xcode target of its own in this
-/// package (Task 3 adds the iOS app target that links it). It cannot be
-/// built or run from this task, so it has not been exercised by `swift
-/// test` — only read closely against the Secure Enclave / Keychain APIs it
-/// calls. Task 3's first build is this file's first compile.
+/// Built by the iOS app target only, so `swift test` never exercises it:
+/// its proof is the app building and running, plus the device checklist —
+/// the Enclave itself is unavailable in a simulator, where the software
+/// fallback below takes over.
 ///
 /// No biometry or passcode gate: this key signs the relay's challenge on
 /// EVERY connect (`RelayConnection.handleFrame`'s `"challenge"` case), which

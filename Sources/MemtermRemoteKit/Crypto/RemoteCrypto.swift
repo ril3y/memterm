@@ -226,7 +226,12 @@ public enum RemotePairing {
     ///
     /// Names are labels, never identity: the key is what gets stored, and
     /// the prompt shows the key id alongside.
-    public static func sanitizedDeviceName(_ raw: String) -> String {
+    /// `fallback` is what an empty or entirely-stripped name becomes. The Mac
+    /// names a device it is being asked to trust ("Device"); a phone names a
+    /// Mac the person just stood in front of ("Mac"). Same rules either way —
+    /// the string ends up in a Keychain item and in a list row, so it is
+    /// bounded and free of anything that could forge a second line of text.
+    public static func sanitizedDeviceName(_ raw: String, fallback: String = "Device") -> String {
         // `.newlines` as well as `.controlCharacters`: the latter covers
         // CR/LF and the C0/C1 ranges, the former adds U+2028/U+2029, which
         // AppKit also breaks a line on.
@@ -236,7 +241,7 @@ public enum RemotePairing {
         let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
         let capped = String(trimmed.prefix(deviceNameLimit))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return capped.isEmpty ? "Device" : capped
+        return capped.isEmpty ? fallback : capped
     }
 
     /// The inverse. Untrusted input (it arrives inside a QR payload the

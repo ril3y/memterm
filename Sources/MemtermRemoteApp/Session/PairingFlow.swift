@@ -153,8 +153,11 @@ public final class PairingFlow: ObservableObject {
     public func confirm(name: String = "Mac") {
         guard case .confirming(let payload) = phase, let relayURL = URL(string: payload.relay) else { return }
         teardownConnection()
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        confirmedName = trimmed.isEmpty ? "Mac" : trimmed
+        // Same sanitizer the Mac applies to a device's name: bounded, and
+        // stripped of anything that could forge a second line of text. This
+        // one is typed by the person rather than sent by a peer, but it still
+        // lands in a Keychain item and in a list row.
+        confirmedName = RemotePairing.sanitizedDeviceName(name, fallback: "Mac")
 
         var events = RelayConnection.Events()
         events.onControl = { [weak self] object in self?.handleControl(object) }

@@ -6,10 +6,8 @@ import Security
 /// Where paired Macs live on the phone: one Keychain item per host, keyed by
 /// `hostId`, value the JSON-encoded `PairedHost`.
 ///
-/// NOT compiled yet (same note as `SecureEnclaveIdentity`): `ios/` has no
-/// build target in this package until Task 3 adds the iOS app target. Read
-/// closely against the Keychain APIs it calls, but not yet exercised by
-/// `swift test` or any build.
+/// Built by the iOS app target only, so `swift test` never exercises it:
+/// its proof is the app building and running, plus the device checklist.
 ///
 /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and never synchronizable —
 /// the same choice `SecureEnclaveIdentity` makes and for a related reason:
