@@ -204,8 +204,6 @@ final class RemoteProbeClient {
         connection = nil
     }
 
-    // MARK: - Wire helpers
-
     private func sendEnvelope(to: String, payload: Data) {
         let envelope = RemoteEnvelope(to: to, from: deviceId, payload: payload)
         connection?.send(envelope: envelope, completion: nil)

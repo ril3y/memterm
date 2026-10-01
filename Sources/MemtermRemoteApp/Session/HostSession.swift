@@ -40,12 +40,18 @@ public final class HostSession: ObservableObject {
     private var connection: RelayConnection?
     private var keys: RemoteSessionKeys?
 
-    /// The handshake in flight, and the generation that identifies it. A
-    /// second `start()` (or a fresh "authed") bumps the generation, so a
-    /// Hello reply that belongs to a superseded attempt is dropped rather
-    /// than racing the live one into `keys`.
-    private var pendingEphemeral: P256.KeyAgreement.PrivateKey?
-    private var pendingGeneration: Int?
+    /// Handshakes sent but not yet answered, oldest first. A reconnect can
+    /// fire "authed" a second time with no `start()` in between — the relay
+    /// re-authenticating us under us — so more than one Hello can be
+    /// genuinely in flight at once, each with its own ephemeral. The Mac
+    /// answers each Hello it receives exactly once, in the order it received
+    /// them, so a reply is matched to the OLDEST still-outstanding entry
+    /// (`removeFirst()`), never to whatever is merely "current" — pairing a
+    /// stale reply with a newer ephemeral would silently derive keys neither
+    /// side actually holds, which is worse than dropping it. `generation`
+    /// then decides whether that correctly-paired entry is still the live
+    /// attempt or one a later `start()`/"authed" has since superseded.
+    private var pendingHandshakes: [(ephemeral: P256.KeyAgreement.PrivateKey, generation: Int)] = []
     private var handshakeGeneration = 0
 
     private var attachedPaneId: String?
@@ -69,8 +75,7 @@ public final class HostSession: ObservableObject {
         handshakeGeneration += 1
         connection?.stop()
         keys = nil
-        pendingEphemeral = nil
-        pendingGeneration = nil
+        pendingHandshakes.removeAll()
         attachedPaneId = nil
         phase = .connecting
 
@@ -86,8 +91,7 @@ public final class HostSession: ObservableObject {
         connection?.stop()
         connection = nil
         keys = nil
-        pendingEphemeral = nil
-        pendingGeneration = nil
+        pendingHandshakes.removeAll()
         attachedPaneId = nil
         phase = .idle
     }
@@ -97,6 +101,11 @@ public final class HostSession: ObservableObject {
 
     // MARK: - Viewer actions
 
+    /// Sets `.attached` optimistically, before the Mac's `.screen` reply
+    /// arrives: the screen is one round trip away, and a viewer should not
+    /// stall on a blank state waiting for it. A pane id that turns out to be
+    /// wrong is corrected by the `refused` that follows — do not "fix" this
+    /// into waiting for `.screen` first.
     public func attach(paneId: String) {
         attachedPaneId = paneId
         lastAttachedPaneId = paneId
@@ -155,8 +164,7 @@ public final class HostSession: ObservableObject {
             phase = .failed("Could not sign the handshake.")
             return
         }
-        pendingEphemeral = ephemeral
-        pendingGeneration = generation
+        pendingHandshakes.append((ephemeral: ephemeral, generation: generation))
         phase = .handshaking
 
         let envelope = RemoteEnvelope(to: hostId, from: signer.id, payload: HelloWire.encode(hello))
@@ -169,14 +177,18 @@ public final class HostSession: ObservableObject {
         guard envelope.from == hostId else { return }
 
         if let hello = HelloWire.decode(envelope.payload) {
-            // The Mac's half of the handshake, in the clear. A Hello that
-            // does not match the handshake we are currently waiting on
-            // (none pending, or a superseded one) is dropped silently: it
-            // is either a duplicate or a stray reply to an attempt we have
-            // already moved past, and must never be let into `keys`.
-            guard let ephemeral = pendingEphemeral, let generation = pendingGeneration,
-                  generation == handshakeGeneration
-            else { return }
+            // The Mac's half of the handshake, in the clear, answered in the
+            // order the Hellos were sent — so the oldest still-outstanding
+            // entry is the one THIS reply pairs with, never whichever
+            // ephemeral merely happens to be current. Popping is itself the
+            // correlation: there is no request id on the wire to match
+            // against, only send order.
+            guard !pendingHandshakes.isEmpty else { return }
+            let (ephemeral, generation) = pendingHandshakes.removeFirst()
+            // The correctly-paired entry may still belong to an attempt a
+            // later `start()`/"authed" has since superseded — that reply
+            // must not win a race against the live handshake's keys.
+            guard generation == handshakeGeneration else { return }
             guard RemoteHandshake.verifyHello(hello, peerSPKI: host.publicKeySPKI) else {
                 phase = .failed("Could not verify this Mac's identity.")
                 return
@@ -191,13 +203,7 @@ public final class HostSession: ObservableObject {
                 phase = .failed("Could not complete the handshake.")
                 return
             }
-            // Re-checked after deriving: a synchronous path today, but the
-            // generation guard is what keeps this correct if signing or
-            // derivation ever gains a genuine async step.
-            guard generation == handshakeGeneration else { return }
             keys = derived
-            pendingEphemeral = nil
-            pendingGeneration = nil
             send(.list)
             return
         }
@@ -254,7 +260,17 @@ public final class HostSession: ObservableObject {
 
     private func send(_ message: RemoteMessage) {
         guard let keys, let connection else { return }
-        guard let sealed = try? keys.seal(message.encode()) else { return }
+        guard let sealed = try? keys.seal(message.encode()) else {
+            // Near-unreachable (seal only fails on a hardware/entropy
+            // fault), but a silently swallowed failure here is exactly the
+            // shape of bug this project has already paid for twice: treat
+            // it the same as an unreadable record, not a no-op. `stop()`
+            // first (it sets `.idle`), then `.failed` so that is the phase
+            // left standing, not the one `stop()` passes through.
+            stop()
+            phase = .failed("The session with this Mac could not be continued.")
+            return
+        }
         let envelope = RemoteEnvelope(to: hostId, from: signer.id, payload: sealed)
         connection.send(envelope: envelope, completion: nil)
     }

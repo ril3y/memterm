@@ -38,8 +38,13 @@ final class HostSessionTests: XCTestCase {
 
     /// The Mac's side of the handshake: read the phone's Hello off the wire,
     /// answer with ours, and return the session keys the Mac would hold.
-    private func completeHandshake() throws -> RemoteSessionKeys {
-        let sent = factory.current.sentEnvelopes.last!
+    /// `forHelloAt` picks which sent Hello to answer (Python-style negative
+    /// indices; the default, -1, is the most recent) — when a reconnect
+    /// sends a second Hello before the first is answered, a test needs to
+    /// address either one.
+    private func completeHandshake(forHelloAt index: Int = -1) throws -> RemoteSessionKeys {
+        let hellos = factory.current.sentEnvelopes
+        let sent = hellos[index >= 0 ? index : hellos.count + index]
         let theirHello = try XCTUnwrap(HelloWire.decode(sent.payload))
         let (mine, ephemeral) = try RemoteHandshake.makeHello(signer: hostIdentity)
         let keys = try RemoteHandshake.deriveKeys(myEphemeral: ephemeral,
@@ -124,19 +129,28 @@ final class HostSessionTests: XCTestCase {
         XCTAssertEqual(session.phase, .ready, "a vanished pane drops the viewer back to the tree")
     }
 
-    func testSecondStartSupersedesTheHandshakeInFlight() throws {
-        session.start(); authenticate()
-        let stale = factory.current.sentEnvelopes.last!     // the first Hello
-        session.start()                                      // supersede it
-        authenticate()
-        let keys = try completeHandshake()
-        // The Mac's reply to the SUPERSEDED Hello must not produce a session.
-        let (otherHello, _) = try RemoteHandshake.makeHello(signer: hostIdentity)
-        factory.current.push(["type": "env", "to": phoneIdentity.id, "from": hostIdentity.id,
-                              "payload": HelloWire.encode(otherHello).base64EncodedString()])
-        try send(.tree(tree(panes: ["p1"])), with: keys)
-        XCTAssertEqual(session.phase, .ready, "the live handshake's keys are the ones in force")
-        XCTAssertNotEqual(stale.payload, factory.current.sentEnvelopes.last!.payload)
+    func testAReplyToASupersededHandshakeIsDroppedWhileTheLiveOneSucceeds() throws {
+        session.start()
+        factory.current.push(["type": "challenge", "nonce": Data(repeating: 3, count: 32).base64EncodedString()])
+        factory.current.push(["type": "authed", "id": phoneIdentity.id])
+        // A reconnect: the relay authenticates us again with no start() in
+        // between, so a second Hello goes out while the first is still in
+        // flight. Two ephemerals now exist; only the newer one is live.
+        factory.current.push(["type": "authed", "id": phoneIdentity.id])
+        let hellos = factory.current.sentEnvelopes
+        XCTAssertEqual(hellos.count, 2, "each authed sends its own Hello")
+
+        // The Mac answers the SUPERSEDED Hello first. Derive against it, so
+        // the reply is cryptographically valid — only its generation is stale.
+        let stale = try completeHandshake(forHelloAt: 0)
+        XCTAssertEqual(session.phase, .handshaking, "a stale reply must not open a session")
+        try send(.tree(tree(panes: ["p1"])), with: stale)
+        XCTAssertNil(session.tree, "nothing sealed under the superseded keys is read")
+
+        // Then it answers the live one.
+        let live = try completeHandshake(forHelloAt: 1)
+        try send(.tree(tree(panes: ["p1"])), with: live)
+        XCTAssertEqual(session.phase, .ready)
     }
 
     func testForegroundReattachesWhenThePaneSurvives() throws {
