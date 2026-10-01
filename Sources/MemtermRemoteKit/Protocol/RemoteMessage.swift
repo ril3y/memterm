@@ -107,7 +107,17 @@ public enum RemoteMessage: Equatable {
         case .resized(let cols, let rows):
             wire = Wire(t: "resized", cols: cols, rows: rows)
         }
-        return (try? JSONEncoder().encode(wire)) ?? Data()
+        // sortedKeys: Darwin's JSONEncoder does not promise the same key
+        // order across two encodes of one value, and an unstable encoding
+        // makes every byte comparison of a message a coin flip — it surfaced
+        // as an intermittent "same length, different bytes" failure in an
+        // ordering test (2026-10-01), and as a QR that differed between
+        // mintings before that. Key order is irrelevant to every parser on
+        // the wire, so pinning it costs nothing and makes records, logs and
+        // tests reproducible.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(wire)) ?? Data()
     }
 
     public static func decode(_ data: Data) -> RemoteMessage? {

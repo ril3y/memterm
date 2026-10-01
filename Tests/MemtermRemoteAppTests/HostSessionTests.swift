@@ -111,9 +111,11 @@ final class HostSessionTests: XCTestCase {
         // — so a test that read only the last two would see them as a replay.
         // Index 0 is the clear-text Hello, which is not a sealed record.
         let opened = try factory.current.sentEnvelopes.dropFirst().map { try keys.open($0.payload) }
-        XCTAssertEqual(opened.suffix(2),
-                       [RemoteMessage.input(Data("a".utf8)).encode(),
-                        RemoteMessage.input(Data("b".utf8)).encode()],
+        // Compare DECODED messages, not encoded bytes: what this test means
+        // is "these two messages, in this order", and comparing serialized
+        // forms would also be asserting a byte layout no one promised.
+        XCTAssertEqual(opened.suffix(2).compactMap(RemoteMessage.decode),
+                       [.input(Data("a".utf8)), .input(Data("b".utf8))],
                        "records arrive in the order they were sealed")
     }
 
