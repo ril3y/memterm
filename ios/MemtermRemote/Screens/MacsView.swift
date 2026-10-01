@@ -2,9 +2,7 @@ import SwiftUI
 import MemtermRemoteApp
 
 /// The app's home screen: every Mac this device has been allowed into.
-/// Tapping a row pushes a placeholder that starts `HostSession` and shows
-/// its `phase` — `TreeView` (Task 4) replaces that placeholder without
-/// touching anything here.
+/// Tapping a row starts that Mac's `HostSession` and pushes `TreeView`.
 struct MacsView: View {
     @ObservedObject var model: AppModel
 
@@ -28,7 +26,7 @@ struct MacsView: View {
                     List {
                         ForEach(model.hosts) { host in
                             NavigationLink {
-                                MacSessionPlaceholderView(model: model, host: host)
+                                MacSessionHost(model: model, host: host)
                             } label: {
                                 MacRow(host: host)
                             }
@@ -95,41 +93,26 @@ private struct MacRow: View {
     }
 }
 
-/// Task 3's stand-in for `TreeView`: just enough to prove a Mac row starts
-/// a real `HostSession` and tracks its `phase` through connect / handshake /
-/// ready, without pre-empting Task 4's actual tree UI.
-private struct MacSessionPlaceholderView: View {
+/// Starts (and tears down) `host`'s one live `HostSession` for exactly as
+/// long as its tree is on screen, and hands that session to the real
+/// `TreeView` once it exists. Connecting/handshaking show a spinner rather
+/// than an empty tree — `TreeView` itself only has something to group once
+/// `session.tree` has arrived.
+private struct MacSessionHost: View {
     @ObservedObject var model: AppModel
     let host: PairedHost
 
     var body: some View {
-        VStack(spacing: 12) {
+        Group {
             if let session = model.session {
-                Text(phaseDescription(session.phase))
-                    .font(.title3)
-                    .multilineTextAlignment(.center)
+                TreeView(session: session, host: host)
             } else {
                 ProgressView()
+                    .navigationTitle(host.name)
+                    .navigationBarTitleDisplayMode(.inline)
             }
         }
-        .padding()
-        .navigationTitle(host.name)
-        .navigationBarTitleDisplayMode(.inline)
         .onAppear { model.startSession(for: host) }
         .onDisappear { model.stopSession() }
-    }
-
-    private func phaseDescription(_ phase: HostSession.Phase) -> String {
-        switch phase {
-        case .idle: return "Idle"
-        case .connecting: return "Connecting to \(host.name)…"
-        case .handshaking: return "Verifying \(host.name)…"
-        case .ready: return "Connected. (The session tree is coming in Task 4.)"
-        case .attached(let paneId): return "Attached to \(paneId)."
-        case .offline(let since):
-            if let since { return "\(host.name) has been offline since \(since.formatted(date: .omitted, time: .shortened))." }
-            return "\(host.name) is offline."
-        case .failed(let reason): return "Could not connect: \(reason)"
-        }
     }
 }

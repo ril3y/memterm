@@ -71,6 +71,34 @@ public final class SecureEnclaveIdentity: PhoneIdentityStoring {
         case accessControl
     }
 
+    #if DEBUG
+    /// Simulator/dev-only, and compiled out of every release build: installs
+    /// a SPECIFIC raw P-256 private key into this device's identity slot
+    /// before `identity()` is first called. The Simulator cannot pair by
+    /// scanning a camera, so task 4's real end-to-end run pairs once outside
+    /// the app (a headless tool speaking the same relay protocol
+    /// `RemoteProbeClient` does) and then seeds BOTH halves of that pairing
+    /// back in: the resulting `PairedHost` via `-memterm-seed-host`, and the
+    /// exact key that earned it via this — so the Simulator app actually
+    /// signs as the device the Mac really allowed in, rather than a fresh,
+    /// unrecognized one. See `ios/CHECKLIST.md`.
+    ///
+    /// Always takes the software-key path: `SecureEnclave.isAvailable` is
+    /// false on every Simulator, which is the only place this runs. A key
+    /// that fails to parse is left alone rather than silently ignored into a
+    /// fresh random identity, so a bad seed fails loudly as "no paired Macs"
+    /// / a handshake the Mac refuses, not a confusing partial success.
+    static func debugSeedIdentity(rawKeyBase64: String) {
+        guard let raw = Data(base64Encoded: rawKeyBase64),
+              (try? P256.Signing.PrivateKey(rawRepresentation: raw)) != nil
+        else {
+            NSLog("memterm: MEMTERM_SEED_IDENTITY_KEY_B64 did not decode as a P-256 raw key")
+            return
+        }
+        keychainWrite(raw)
+    }
+    #endif
+
     /// Wraps a Secure Enclave key as a `RemoteSigner`. `RemoteIdentity` can't
     /// serve this role itself — it holds a `P256.Signing.PrivateKey` it can
     /// construct from raw bytes, which a Secure Enclave key has none of (the

@@ -1,4 +1,5 @@
 import Combine
+import Foundation
 import SwiftUI
 import MemtermRemoteApp
 import MemtermRemoteKit
@@ -48,6 +49,37 @@ final class AppModel: ObservableObject {
     private var sessionForwarding: AnyCancellable?
 
     init() {
+        #if DEBUG
+        // Companion to the `PairedHost` seed below: installs the exact
+        // identity key that earned it, when the Mac's allow-list is checked
+        // by key, not by claim — see `SecureEnclaveIdentity.debugSeedIdentity`.
+        // Done FIRST and unconditionally on the seed flag, before
+        // `identity()` is ever called (including by `reloadHosts()` below),
+        // so there is no window where the wrong (freshly-generated) key
+        // could already be cached.
+        if CommandLine.arguments.contains("-memterm-seed-host"),
+           let keyB64 = ProcessInfo.processInfo.environment["MEMTERM_SEED_IDENTITY_KEY_B64"] {
+            SecureEnclaveIdentity.debugSeedIdentity(rawKeyBase64: keyB64)
+        }
+        // The Simulator cannot scan a QR code, so this is the only way to
+        // reach `TreeView`/`TerminalScreen` there against a real Mac host:
+        // `-memterm-seed-host` on the launch arguments plus a `PairedHost`
+        // (JSON, ISO 8601 dates) in `MEMTERM_SEED_HOST_JSON` inserts that
+        // host into the Keychain store exactly as a real pairing would have.
+        // `#if DEBUG` keeps this out of a release build entirely — there is
+        // no runtime check here that could be tricked into firing in one.
+        if CommandLine.arguments.contains("-memterm-seed-host"),
+           let json = ProcessInfo.processInfo.environment["MEMTERM_SEED_HOST_JSON"],
+           let data = json.data(using: .utf8) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            if let host = try? decoder.decode(PairedHost.self, from: data) {
+                hostStore.add(host)
+            } else {
+                NSLog("memterm: -memterm-seed-host set but MEMTERM_SEED_HOST_JSON did not decode as a PairedHost")
+            }
+        }
+        #endif
         reloadHosts()
     }
 
