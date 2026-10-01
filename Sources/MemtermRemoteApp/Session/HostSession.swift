@@ -25,18 +25,55 @@ public final class HostSession: ObservableObject {
     public enum Phase: Equatable {
         case idle, connecting, handshaking, ready
         case attached(paneId: String)
+        /// The relay was reached, and either it says this Mac is away or the
+        /// Mac never answered our Hello. `since` is the relay's `lastSeen`,
+        /// when it gave a plausible one.
         case offline(since: Date?)
+        /// The relay itself could not be reached: no network, a relay that is
+        /// down, a wrong URL. Kept separate from `.offline` because "I can't
+        /// reach the relay" and "your Mac is away" are different facts a
+        /// person acts on differently — one is about the phone in their hand,
+        /// the other about a Mac somewhere else. The payload is the
+        /// transport's own description, for diagnosis; what the person reads
+        /// is a sentence, not this. `RelayConnection` is already retrying
+        /// with backoff whenever this is set, so it is a status, not an end.
+        case unreachable(String?)
+        /// Reserved for a session that genuinely cannot continue. A refusal
+        /// the Mac sends for one request is NOT this — see `handleRefusal`.
         case failed(String)
     }
 
     @Published public private(set) var phase: Phase = .idle
     @Published public private(set) var tree: RemoteTree?
+    /// One sentence about the last thing that did not work, for the cases
+    /// where that thing did not end the session — a workspace that is locked,
+    /// a pane this app cannot attach to. Cleared by anything that supersedes
+    /// it: a restart, a teardown, or the next attach.
+    @Published public private(set) var notice: String?
     /// Screen bytes then output chunks for the attached pane, newest last.
     public var onOutput: ((Data) -> Void)?
+
+    /// How long a Hello may go unanswered before the Mac is reported as away.
+    /// The relay has already authenticated us by that point, so the thing not
+    /// answering is the Mac, not the relay.
+    public static let handshakeTimeout: TimeInterval = 20
+    /// The relay's `online` hint can arrive as often as the relay likes, and
+    /// every restart it causes makes the Mac run `endSession`. At most one
+    /// restart per this interval.
+    public static let onlineRestartInterval: TimeInterval = 5
+    /// `pendingHandshakes` is fed by a relay-sent frame (`authed`), so it
+    /// needs a ceiling. Only the newest generation can ever succeed, so the
+    /// entries this drops are already dead.
+    static let maxPendingHandshakes = 8
+    /// Bounds on a `lastSeen` this app is willing to put in a sentence.
+    static let lastSeenFutureSlack: TimeInterval = 60 * 60
+    static let lastSeenMaxAge: TimeInterval = 60 * 60 * 24 * 365
 
     private let host: PairedHost
     private let signer: RemoteSigner
     private let makeConnection: (URL, RelayConnection.Events) -> RelayConnection
+    private let schedule: (TimeInterval, @escaping () -> Void) -> DispatchWorkItem
+    private let now: () -> Date
     private var connection: RelayConnection?
     private var keys: RemoteSessionKeys?
 
@@ -53,6 +90,8 @@ public final class HostSession: ObservableObject {
     /// attempt or one a later `start()`/"authed" has since superseded.
     private var pendingHandshakes: [(ephemeral: P256.KeyAgreement.PrivateKey, generation: Int)] = []
     private var handshakeGeneration = 0
+    private var handshakeTimeoutWork: DispatchWorkItem?
+    private var lastOnlineRestart: Date?
 
     private var attachedPaneId: String?
     /// Survives a background/foreground cycle so the viewer comes back to
@@ -64,9 +103,19 @@ public final class HostSession: ObservableObject {
     /// place this binding can go wrong, and it is this one.
     private var hostId: String { RemoteIdentity.peerId(forSPKI: host.publicKeySPKI) }
 
+    /// - Parameters:
+    ///   - schedule: How the handshake timeout is armed. Defaults to the main
+    ///     queue; a test injects a manual scheduler so the timeout can be
+    ///     fired on demand rather than waited out.
+    ///   - now: The clock the `online` throttle and the `lastSeen` sanity
+    ///     bound read. Injectable for the same reason.
     public init(host: PairedHost, signer: RemoteSigner,
-                makeConnection: @escaping (URL, RelayConnection.Events) -> RelayConnection) {
+                makeConnection: @escaping (URL, RelayConnection.Events) -> RelayConnection,
+                schedule: @escaping (TimeInterval, @escaping () -> Void) -> DispatchWorkItem
+                    = RelayConnection.mainQueueSchedule,
+                now: @escaping () -> Date = Date.init) {
         self.host = host; self.signer = signer; self.makeConnection = makeConnection
+        self.schedule = schedule; self.now = now
     }
 
     // MARK: - Lifecycle
@@ -76,10 +125,17 @@ public final class HostSession: ObservableObject {
         connection?.stop()
         keys = nil
         pendingHandshakes.removeAll()
+        cancelHandshakeTimeout()
         attachedPaneId = nil
+        notice = nil
         phase = .connecting
 
         var events = RelayConnection.Events()
+        // Transport death is reported HERE and nowhere else. Without this,
+        // an unreachable relay left `phase` at `.connecting` forever while
+        // the kit reconnected silently behind it — on screen, an eternal
+        // spinner for the one condition the person could actually act on.
+        events.onState = { [weak self] state in self?.handleState(state) }
         events.onControl = { [weak self] object in self?.handleControl(object) }
         events.onEnvelope = { [weak self] envelope in self?.handleEnvelope(envelope) }
         let conn = makeConnection(host.relay, events)
@@ -92,7 +148,13 @@ public final class HostSession: ObservableObject {
         connection = nil
         keys = nil
         pendingHandshakes.removeAll()
+        cancelHandshakeTimeout()
         attachedPaneId = nil
+        // A tree kept across a teardown is a tree that gets rendered again on
+        // the way back in, before any fresh data has arrived — panes that may
+        // have closed while the app was away, shown as though they were live.
+        tree = nil
+        notice = nil
         phase = .idle
     }
 
@@ -104,9 +166,12 @@ public final class HostSession: ObservableObject {
     /// Sets `.attached` optimistically, before the Mac's `.screen` reply
     /// arrives: the screen is one round trip away, and a viewer should not
     /// stall on a blank state waiting for it. A pane id that turns out to be
-    /// wrong is corrected by the `refused` that follows — do not "fix" this
-    /// into waiting for `.screen` first.
+    /// wrong is corrected by the `refused` that follows — `handleRefusal`
+    /// turns that into a readable return to the tree, so it really is
+    /// corrected and not merely reported. Do not "fix" this into waiting for
+    /// `.screen` first.
     public func attach(paneId: String) {
+        notice = nil
         attachedPaneId = paneId
         lastAttachedPaneId = paneId
         phase = .attached(paneId: paneId)
@@ -128,6 +193,30 @@ public final class HostSession: ObservableObject {
         send(.resize(cols: cols, rows: rows))
     }
 
+    // MARK: - Transport state
+
+    private func handleState(_ state: RelayConnection.State) {
+        // `.failed` is the one terminal phase, so nothing the transport does
+        // afterwards may overwrite the reason standing there — a revoked
+        // device must keep reading "this Mac no longer allows this device",
+        // not turn into a network complaint when the socket then closes.
+        if case .failed = phase { return }
+        switch state {
+        case .offline(let reason):
+            // The kit is already retrying with 1 s → 30 s backoff, so this is
+            // the status of that, not the end of the session.
+            cancelHandshakeTimeout()
+            phase = .unreachable(reason)
+        case .connecting:
+            phase = .connecting
+        case .connected, .off:
+            // `authed` drives the handshake from `handleControl`, and
+            // `stop()` sets `.idle` itself — including for the `.off` that
+            // `connection?.stop()` emits from inside `start()`.
+            break
+        }
+    }
+
     // MARK: - Relay control frames
 
     private func handleControl(_ object: [String: Any]) {
@@ -136,20 +225,67 @@ public final class HostSession: ObservableObject {
         case "authed":
             beginHandshake()
         case "offline":
-            let since = (object["lastSeen"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
-            phase = .offline(since: since)
+            guard isAboutThisHost(object) else { return }
+            phase = .offline(since: plausibleDate(fromEpochMilliseconds: object["lastSeen"] as? Double))
         case "online":
+            guard isAboutThisHost(object), shouldRestartOnOnline() else { return }
+            lastOnlineRestart = now()
             start()
         case "refused":
-            let reason = object["reason"] as? String ?? "refused"
+            let reason = object["reason"] as? String ?? ""
             if reason == "not-allowed" {
                 phase = .failed("This Mac no longer allows this device.")
             } else {
-                phase = .failed(reason)
+                // Every other reason here is a relay-chosen string, and the
+                // relay is hostile by assumption: it is never put on screen
+                // verbatim. The one thing it can honestly mean is that the
+                // relay will not connect this device to that Mac.
+                phase = .failed("The relay would not connect this device to \(host.name).")
             }
         default:
             break
         }
+    }
+
+    /// `offline` and `online` each name the host they are about
+    /// (`relay/src/server.ts`), and a frame about some other Mac must not
+    /// move this session's phase. A frame with no `hostId` at all is not one
+    /// this app can attribute, so it is ignored too.
+    private func isAboutThisHost(_ object: [String: Any]) -> Bool {
+        (object["hostId"] as? String) == hostId
+    }
+
+    /// `online` is a hint from an untrusted party, not a command. Acting on it
+    /// unconditionally let a relay drive an unbounded reconnect loop — each
+    /// `start()` closes the socket and makes the Mac run `endSession`,
+    /// dropping its viewer attach — so a restart happens only when this
+    /// session is in a state a restart would actually improve, and at most
+    /// once per `onlineRestartInterval`.
+    private func shouldRestartOnOnline() -> Bool {
+        switch phase {
+        case .offline, .unreachable:
+            break
+        case .idle, .connecting, .handshaking, .ready, .attached, .failed:
+            return false
+        }
+        if let lastOnlineRestart, now().timeIntervalSince(lastOnlineRestart) < Self.onlineRestartInterval {
+            return false
+        }
+        return true
+    }
+
+    /// A `lastSeen` is formatted straight into a sentence the person reads,
+    /// and it comes from the relay — so an implausible one is dropped rather
+    /// than printed. Falling back to `nil` costs only the time in that
+    /// sentence.
+    private func plausibleDate(fromEpochMilliseconds milliseconds: Double?) -> Date? {
+        guard let milliseconds, milliseconds.isFinite, milliseconds > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: milliseconds / 1000)
+        let reference = now()
+        guard date <= reference.addingTimeInterval(Self.lastSeenFutureSlack),
+              date >= reference.addingTimeInterval(-Self.lastSeenMaxAge)
+        else { return nil }
+        return date
     }
 
     /// The phone speaks first: a fresh ephemeral, signed by whatever signer
@@ -164,11 +300,35 @@ public final class HostSession: ObservableObject {
             phase = .failed("Could not sign the handshake.")
             return
         }
+        if pendingHandshakes.count >= Self.maxPendingHandshakes {
+            pendingHandshakes.removeFirst(pendingHandshakes.count - Self.maxPendingHandshakes + 1)
+        }
         pendingHandshakes.append((ephemeral: ephemeral, generation: generation))
         phase = .handshaking
+        armHandshakeTimeout(generation: generation)
 
         let envelope = RemoteEnvelope(to: hostId, from: signer.id, payload: HelloWire.encode(hello))
         connection?.send(envelope: envelope, completion: nil)
+    }
+
+    /// A Hello the Mac never answers used to leave `.handshaking` standing
+    /// indefinitely — the relay has no reason to tell us about that, so
+    /// nothing else would ever move the phase. We are past `authed` here, so
+    /// the relay is demonstrably fine and the Mac is the thing not answering:
+    /// that is the same fact the relay's own `offline` frame reports, minus a
+    /// last-seen time.
+    private func armHandshakeTimeout(generation: Int) {
+        handshakeTimeoutWork?.cancel()
+        handshakeTimeoutWork = schedule(Self.handshakeTimeout) { [weak self] in
+            guard let self, generation == self.handshakeGeneration else { return }
+            guard case .handshaking = self.phase else { return }
+            self.phase = .offline(since: nil)
+        }
+    }
+
+    private func cancelHandshakeTimeout() {
+        handshakeTimeoutWork?.cancel()
+        handshakeTimeoutWork = nil
     }
 
     // MARK: - Envelopes
@@ -177,6 +337,19 @@ public final class HostSession: ObservableObject {
         guard envelope.from == hostId else { return }
 
         if let hello = HelloWire.decode(envelope.payload) {
+            // Verified BEFORE the queue is touched. The relay chooses
+            // `envelope.from`, so it can inject a Hello claiming to be the
+            // Mac; popping first spent the live ephemeral on that forgery,
+            // dropped the Mac's genuine reply against an empty queue, and
+            // told the person their MAC's identity could not be verified — a
+            // security claim about the wrong party. Verification needs only
+            // the Hello and the pinned SPKI, so an unverifiable one is
+            // discarded with no state change at all, and the genuine reply
+            // still completes the handshake.
+            guard RemoteHandshake.verifyHello(hello, peerSPKI: host.publicKeySPKI) else {
+                NSLog("memterm: ignored a Hello for \(hostId) that this Mac's key did not sign")
+                return
+            }
             // The Mac's half of the handshake, in the clear, answered in the
             // order the Hellos were sent — so the oldest still-outstanding
             // entry is the one THIS reply pairs with, never whichever
@@ -189,10 +362,6 @@ public final class HostSession: ObservableObject {
             // later `start()`/"authed" has since superseded — that reply
             // must not win a race against the live handshake's keys.
             guard generation == handshakeGeneration else { return }
-            guard RemoteHandshake.verifyHello(hello, peerSPKI: host.publicKeySPKI) else {
-                phase = .failed("Could not verify this Mac's identity.")
-                return
-            }
             guard let derived = try? RemoteHandshake.deriveKeys(
                 myEphemeral: ephemeral,
                 peerEphemeralRaw: hello.ephemeralRaw,
@@ -204,6 +373,7 @@ public final class HostSession: ObservableObject {
                 return
             }
             keys = derived
+            cancelHandshakeTimeout()
             send(.list)
             return
         }
@@ -213,13 +383,24 @@ public final class HostSession: ObservableObject {
         do {
             plaintext = try keys.open(envelope.payload)
         } catch {
-            // A record that will not open is a replay, a forgery, or a
-            // desynced counter — none of them recoverable. The session ends
-            // rather than stalling on a connection it can no longer trust.
-            phase = .failed("Lost sync with this Mac.")
+            // A record that will not open cannot have come from the paired
+            // Mac: it would have to be sealed under keys only this device and
+            // that Mac hold, and the relay holds neither. So it is someone
+            // else's noise, and the right answer is to ignore it — the kit
+            // deliberately does not advance the receive counter on a failed
+            // open ("so the genuine next record still opens afterwards",
+            // `RemoteCrypto.swift`), which means the Mac's real next record
+            // still opens and the session carries on. `phase` is deliberately
+            // untouched: ending the session here would hand a hostile relay a
+            // one-frame denial of service, and flashing "lost sync with this
+            // Mac" before silently healing tells the person something untrue.
+            NSLog("memterm: ignored a record addressed from \(hostId) that would not open")
             return
         }
         guard let message = RemoteMessage.decode(plaintext) else {
+            // Unlike the case above, this record DID open, so the Mac really
+            // sent it and really sent something this app does not know. That
+            // is a version mismatch, and it does not get better by waiting.
             phase = .failed("Received something this app could not understand.")
             return
         }
@@ -240,6 +421,14 @@ public final class HostSession: ObservableObject {
             } else {
                 phase = .ready
             }
+        // Neither `.screen` nor `.output` carries a pane id, so bytes the Mac
+        // had already put in flight for a previous pane land in whatever
+        // terminal view is current when the viewer re-attaches elsewhere.
+        // Accepted rather than fixed: the Mac sends `.screen` on every attach,
+        // which repaints over anything stale, and adding a pane id is a
+        // protocol change this branch cannot make unilaterally (the browser
+        // client speaks the same messages). Worth knowing before treating
+        // these bytes as provably this pane's.
         case .screen(_, _, let bytes):
             if let paneId = attachedPaneId { phase = .attached(paneId: paneId) }
             onOutput?(bytes)
@@ -248,7 +437,7 @@ public final class HostSession: ObservableObject {
         case .treeChanged:
             send(.list)
         case .refused(let reason):
-            phase = .failed(reason)
+            handleRefusal(reason)
         case .resized:
             break // the view asked for it; nothing to surface
         case .list, .attach, .detach, .input, .resize, .newTab, .unlock:
@@ -256,10 +445,59 @@ public final class HostSession: ObservableObject {
         }
     }
 
+    /// The Mac's refusal reasons are machine vocabulary
+    /// (`RemoteHost+Dispatch.swift` sends `"unknown-pane"`, `"locked"`,
+    /// `"unsupported"`), and NONE of them ends a session: each answers
+    /// exactly one request the Mac would not carry out. Showing them as a
+    /// fatal error put protocol words in an orange banner over a dead
+    /// terminal — and the commonest one is sent precisely when a pane was
+    /// pruned out from under the viewer, where the right answer is the quiet
+    /// return to the tree this app already knows how to narrate. So each
+    /// reason maps to the recovery that request needs, plus one sentence the
+    /// person can act on wherever they would otherwise be left guessing.
+    private func handleRefusal(_ reason: String) {
+        switch reason {
+        case "unknown-pane":
+            // Exactly the vanished-pane path: drop the attachment, go back to
+            // the tree, ask for a fresh one. `TerminalScreen` dismisses on
+            // `.ready` and `TreeView` says the pane was closed, so this one
+            // needs no sentence of its own.
+            attachedPaneId = nil
+            lastAttachedPaneId = nil
+            phase = .ready
+            send(.list)
+        case "locked":
+            returnToTree(saying: "That workspace is locked on \(host.name). Unlock it there, then try again.")
+        case "unsupported":
+            returnToTree(saying: "memterm can't attach to that kind of pane yet.")
+        default:
+            // A reason this app does not know is still one request refused,
+            // not a session lost — and the word itself is not shown.
+            returnToTree(saying: "\(host.name) would not do that.")
+        }
+    }
+
+    /// Back to the tree with something readable, and with no pane remembered:
+    /// a pane the Mac refuses must not be re-attached automatically on the
+    /// next foreground, which would only be refused again.
+    private func returnToTree(saying sentence: String) {
+        attachedPaneId = nil
+        lastAttachedPaneId = nil
+        notice = sentence
+        phase = .ready
+    }
+
     // MARK: - Sending
 
     private func send(_ message: RemoteMessage) {
-        guard let keys, let connection else { return }
+        guard let keys, let connection else {
+            // A keystroke or a resize from before the handshake finished (or
+            // after a teardown) has nowhere to go: there is no key to seal it
+            // under. Dropping it is right; dropping it silently is how "my
+            // typing vanished" becomes unexplainable.
+            NSLog("memterm: dropped a \(message.tag) for \(hostId) — no session keys yet")
+            return
+        }
         guard let sealed = try? keys.seal(message.encode()) else {
             // Near-unreachable (seal only fails on a hardware/entropy
             // fault), but a silently swallowed failure here is exactly the

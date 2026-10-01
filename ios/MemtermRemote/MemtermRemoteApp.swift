@@ -16,7 +16,17 @@ struct MemtermRemoteApp_: App {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active: model.sceneBecameActive()
-            case .background, .inactive: model.sceneWentToBackground()
+            case .background: model.sceneWentToBackground()
+            case .inactive:
+                // Deliberately NOT a teardown. `.inactive` fires for every
+                // transient interruption — an incoming-call banner, Control
+                // Center, Notification Center, the app switcher, a system
+                // alert — and stopping the session there closed the WebSocket,
+                // forced a full re-auth and re-handshake on the way back, and
+                // made the Mac run `endSession` and drop its viewer attach.
+                // The plan's interface contract says `.background` stops; this
+                // is that, exactly.
+                break
             @unknown default: break
             }
         }

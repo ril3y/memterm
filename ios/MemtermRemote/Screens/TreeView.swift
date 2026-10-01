@@ -27,13 +27,18 @@ struct TreeView: View {
         List {
             if let banner = statusBanner {
                 Section {
-                    Label(banner, systemImage: "wifi.slash")
+                    Label(banner.text, systemImage: banner.icon)
                         .foregroundStyle(.secondary)
                 }
             }
-            if let closedPaneNotice {
+            // `closedPaneNotice` is this screen's own (the pane left the tree
+            // while its terminal was up); `session.notice` is the Mac's answer
+            // to something it would not do. At most one of the two is ever
+            // standing, and they say the same kind of thing, so they share a
+            // row.
+            if let notice = closedPaneNotice ?? session.notice {
                 Section {
-                    Text(closedPaneNotice)
+                    Text(notice)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -50,10 +55,27 @@ struct TreeView: View {
                     }
                 }
             }
-            if sections.isEmpty && statusBanner == nil {
-                Section {
-                    Text("No windows are open on \(host.name) right now.")
-                        .foregroundStyle(.secondary)
+            if sections.isEmpty {
+                // "No windows are open" is a CLAIM ABOUT THE MAC, so it waits
+                // until a tree has actually arrived to support it. While the
+                // session is still connecting, handshaking, or waiting for its
+                // first tree, the honest thing on screen is that work in
+                // progress — the old emptiness test said the false thing for
+                // the whole normal connect sequence, and permanently on a
+                // phone with no signal.
+                if let progress = progressLabel {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text(progress)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else if session.tree != nil {
+                    Section {
+                        Text("No windows are open on \(host.name) right now.")
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -111,16 +133,41 @@ struct TreeView: View {
         return "Serial panes can't be attached yet."
     }
 
-    private var statusBanner: String? {
+    /// What this screen is waiting for, when it has no tree to show yet.
+    /// `nil` once there is nothing left to wait for — either a tree arrived or
+    /// a banner above is already explaining why one will not.
+    private var progressLabel: String? {
+        switch session.phase {
+        case .idle, .connecting:
+            return "Connecting to \(host.name)…"
+        case .handshaking:
+            return "Checking this Mac's identity…"
+        case .ready, .attached:
+            return session.tree == nil ? "Asking \(host.name) what's open…" : nil
+        case .offline, .unreachable, .failed:
+            return nil
+        }
+    }
+
+    /// The icon matters as much as the sentence: an orange "no Wi-Fi" symbol
+    /// next to "This Mac no longer allows this device" sends the person to
+    /// check their network for a permission problem.
+    private var statusBanner: (text: String, icon: String)? {
         switch session.phase {
         case .offline(let since):
             if let since {
-                return "\(host.name) has been offline since \(since.formatted(date: .omitted, time: .shortened))."
+                return ("\(host.name) has been offline since \(since.formatted(date: .omitted, time: .shortened)).",
+                        "moon.zzz")
             }
-            return "\(host.name) is offline."
+            return ("\(host.name) is offline.", "moon.zzz")
+        case .unreachable:
+            // The transport's own error text is deliberately not shown: it is
+            // jargon at best, and a sentence the person can act on is the
+            // whole point. The kit is already retrying.
+            return ("Can't reach the relay for \(host.name). Still trying…", "wifi.slash")
         case .failed(let reason):
-            return reason
-        default:
+            return (reason, "exclamationmark.triangle")
+        case .idle, .connecting, .handshaking, .ready, .attached:
             return nil
         }
     }

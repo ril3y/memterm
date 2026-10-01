@@ -17,5 +17,20 @@ public final class FakeScheduler {
             if !item.isCancelled { item.perform(); return }
         }
     }
+    /// Runs and removes the earliest pending, uncancelled item scheduled at
+    /// `delay`, leaving every other entry queued — so a test can name the
+    /// timer it means instead of counting past whichever others happen to be
+    /// armed (a connection's 30 s ping sits in this same queue alongside a
+    /// caller's own timeouts). Returns false when there is no such item.
+    @discardableResult
+    public func fire(delay: TimeInterval) -> Bool {
+        guard let index = queue.firstIndex(where: { !$0.item.isCancelled && $0.delay == delay }) else {
+            return false
+        }
+        let (_, item) = queue.remove(at: index)
+        item.perform()
+        return true
+    }
+
     public var pendingDelays: [TimeInterval] { queue.filter { !$0.item.isCancelled }.map(\.delay) }
 }

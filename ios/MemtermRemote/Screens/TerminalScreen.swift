@@ -16,6 +16,14 @@ struct TerminalScreen: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var handle = TerminalViewHost.Handle()
+    /// Set by the two ways the PERSON leaves this screen — the Back button and
+    /// the swipe-back gesture — both of which detach and therefore land on
+    /// `.ready`, exactly like the Mac closing the pane. Without it, whether
+    /// `TreeView` showed "That pane was closed" after pressing Back depended
+    /// on SwiftUI's update batching racing `dismiss()`, so the notice meant to
+    /// distinguish those two cases appeared intermittently in the one case it
+    /// exists to rule out.
+    @State private var isLeavingOnPurpose = false
 
     var body: some View {
         TerminalViewHost(session: session, handle: handle)
@@ -36,7 +44,7 @@ struct TerminalScreen: View {
                 // show, so leave on its own rather than freezing on a dead
                 // screen waiting for the person to notice and press Back.
                 if case .ready = phase {
-                    onPaneClosedByHost()
+                    if !isLeavingOnPurpose { onPaneClosedByHost() }
                     dismiss()
                 }
             }
@@ -45,8 +53,13 @@ struct TerminalScreen: View {
                 // the Back button (and therefore `back()`) entirely. Guarded
                 // on `.attached` so this never sends a second, redundant
                 // detach after `back()` or the Mac-closed-it path above has
-                // already moved the phase off `.attached`.
-                if case .attached = session.phase { session.detach() }
+                // already moved the phase off `.attached`. The flag is set
+                // BEFORE detaching, so the `.ready` that detach produces can
+                // never be read as the Mac having closed the pane.
+                if case .attached = session.phase {
+                    isLeavingOnPurpose = true
+                    session.detach()
+                }
             }
     }
 
@@ -57,14 +70,19 @@ struct TerminalScreen: View {
             StatusBanner(text: since.map {
                 "This Mac has been offline since \($0.formatted(date: .omitted, time: .shortened))."
             } ?? "This Mac is offline.")
+        case .unreachable:
+            // The transport's own description is not shown: the person needs a
+            // fact they can act on, and the kit is already retrying.
+            StatusBanner(text: "Can't reach the relay. Still trying…")
         case .failed(let reason):
             StatusBanner(text: reason)
-        default:
+        case .idle, .connecting, .handshaking, .ready, .attached:
             EmptyView()
         }
     }
 
     private func back() {
+        isLeavingOnPurpose = true
         if case .attached = session.phase { session.detach() }
         dismiss()
     }
