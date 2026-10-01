@@ -105,6 +105,43 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertFalse(flow.scanned(URL(string: "https://example.com/")!))
     }
 
+    func testUnparsableQRPayloadIsRefusedWithoutDialling() {
+        // Valid base64url, but the bytes it decodes to are not the expected
+        // JSON object at all — a QR code from some other app, say.
+        var components = URLComponents(url: link(), resolvingAgainstBaseURL: false)!
+        let notPayloadJSON = Data("hello world".utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        components.fragment = "pair=" + notPayloadJSON
+        XCTAssertFalse(flow.scanned(components.url!))
+        guard case .refused(let why) = flow.phase else { return XCTFail("expected .refused") }
+        XCTAssertFalse(why.isEmpty)
+        XCTAssertTrue(factory.made.isEmpty, "an unparsable payload opens no socket")
+    }
+
+    func testWrongSizeTokenIsRefusedWithoutDialling() {
+        // `token` must be exactly `RemotePairing.routingTokenLength` characters
+        // (the fixed 16-byte routing half) — anything else is not a code this
+        // app's proof scheme understands, and must not be dialled.
+        var components = URLComponents(url: link(), resolvingAgainstBaseURL: false)!
+        let json = try! JSONSerialization.data(withJSONObject: [
+            "relay": "wss://relay.example.test", "hostId": mac.id,
+            "hostPublicKey": mac.publicKeySPKI.base64EncodedString(),
+            "token": "short",
+            "secret": secret.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: ""),
+            "expiresAt": Int(Date().addingTimeInterval(120).timeIntervalSince1970 * 1000),
+        ])
+        components.fragment = "pair=" + json.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        XCTAssertFalse(flow.scanned(components.url!))
+        guard case .refused(let why) = flow.phase else { return XCTFail("expected .refused") }
+        XCTAssertFalse(why.isEmpty)
+        XCTAssertTrue(factory.made.isEmpty, "a wrong-size token opens no socket")
+    }
+
     func testInsecureRelayIsRefusedWithoutDialling() {
         // A code naming ws:// (not wss://) must not be dialled from a device.
         var components = URLComponents(url: link(), resolvingAgainstBaseURL: false)!
