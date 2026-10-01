@@ -20,6 +20,25 @@ public struct PairingPayload: Codable, Equatable {
         self.relay = relay; self.hostId = hostId; self.hostPublicKey = hostPublicKey
         self.token = token; self.secret = secret; self.expiresAt = expiresAt
     }
+
+    /// Long enough for a real `wss://host:port` relay, short enough that it
+    /// cannot push the rest of the confirm screen's text out of view.
+    public static let relayDisplayLimit = 64
+
+    /// The relay as the confirm screen shows it. Every field of this payload
+    /// came out of a QR code that may not be the one on this person's Mac, and
+    /// the confirm screen is the one place they are asked to make a trust
+    /// decision — so the relay is bounded and stripped of anything that could
+    /// forge a second line of text before it is displayed, by the same
+    /// sanitizer and for the same reason as a device name (security review
+    /// L1). `hostId` needs no equivalent: `PairingFlow.scanned` refuses a
+    /// payload whose `hostId` is not the base32 hash of its own
+    /// `hostPublicKey`, so by the time a payload can be displayed at all, its
+    /// id is provably 16 characters of `[a-z2-7]`.
+    public var relayForDisplay: String {
+        RemotePairing.sanitizedDeviceName(relay, fallback: "an unnamed relay",
+                                          limit: Self.relayDisplayLimit)
+    }
 }
 
 /// Drives one scan-to-paired attempt. This is the security-critical half of
@@ -47,6 +66,10 @@ public final class PairingFlow: ObservableObject {
     private let store: PairedHostStoring
     private let makeConnection: (URL, RelayConnection.Events) -> RelayConnection
     private let now: () -> Date
+    /// What to call this device in the Mac's "Allow ‹name›?" prompt, read
+    /// fresh at each `pair` (a person can rename their phone between
+    /// attempts). The result is sanitized here, not trusted from the caller.
+    private let deviceName: () -> String
 
     private var connection: RelayConnection?
     /// The payload the current attempt was scanned from — the single source
@@ -60,13 +83,20 @@ public final class PairingFlow: ObservableObject {
     /// read off the wire.
     private var confirmedName = "Mac"
 
+    /// - Parameter deviceName: This device's name for the Mac's Allow prompt.
+    ///   Defaults to the Foundation-only stand-in this module can reach on its
+    ///   own; the iOS app passes `UIDevice.current.name`, which is the name the
+    ///   person actually recognises. The UIKit call stays in the app target, so
+    ///   the extension firewall over this module is untouched.
     public init(signer: RemoteSigner, store: PairedHostStoring,
                 makeConnection: @escaping (URL, RelayConnection.Events) -> RelayConnection,
-                now: @escaping () -> Date = Date.init) {
+                now: @escaping () -> Date = Date.init,
+                deviceName: @escaping () -> String = PairingFlow.foundationDeviceName) {
         self.signer = signer
         self.store = store
         self.makeConnection = makeConnection
         self.now = now
+        self.deviceName = deviceName
     }
 
     /// Shown next to the Mac's "Allow ‹name›?" prompt so the person can
@@ -108,6 +138,18 @@ public final class PairingFlow: ObservableObject {
             RemoteIdentity.x963(fromSPKI: hostKeySPKI) != nil
         else {
             phase = .refused("That pairing code's Mac key is not something this app understands.")
+            return false
+        }
+        // The id and the key must belong together, checked here rather than
+        // only later in `handlePaired`. Two reasons, and the second is the one
+        // that made this worth a guard of its own: a code whose id and key do
+        // not match cannot possibly pair, so refusing now saves dialling a
+        // relay for it at all; and the confirm screen puts `hostId` in front
+        // of the person as the Mac they are about to trust, so that id has to
+        // be provably the base32 hash of this very key — 16 characters of
+        // `[a-z2-7]` — and not arbitrary text a QR code chose.
+        guard RemoteIdentity.peerId(forSPKI: hostKeySPKI) == payload.hostId else {
+            phase = .refused("That pairing code's Mac name and key do not match each other.")
             return false
         }
         guard payload.expiresAt > Int(now().timeIntervalSince1970 * 1000) else {
@@ -209,7 +251,13 @@ public final class PairingFlow: ObservableObject {
             "type": "pair",
             "token": payload.token,
             "publicKey": signer.publicKeySPKI.base64EncodedString(),
-            "name": Self.deviceName(),
+            // The Mac sanitizes again on its side (security review L1), but a
+            // viewer should not send it junk in the first place — and the name
+            // now comes from outside this module, so sanitizing here is what
+            // keeps that true. `RemotePairing.sanitizedDeviceName` is the one
+            // place both ends agree on what "junk" means: control characters
+            // and newlines stripped, capped at `RemotePairing.deviceNameLimit`.
+            "name": RemotePairing.sanitizedDeviceName(deviceName()),
             "proof": proof.base64EncodedString(),
         ])
         phase = .waiting
@@ -242,6 +290,13 @@ public final class PairingFlow: ObservableObject {
         let host = PairedHost(id: hostId, publicKeySPKI: spki, relay: relayURL,
                                name: confirmedName, pairedAt: now())
         store.add(host)
+        // This attempt is over: the pairing socket has nothing left to carry,
+        // and leaving it open with `scannedPayload` still live meant every
+        // further `paired` frame was re-processed and re-stored. Harmless
+        // given the re-validation above and the store's upsert, but a
+        // connection with no remaining purpose should not stay open.
+        teardownConnection()
+        scannedPayload = nil
         phase = .paired(host)
     }
 
@@ -258,19 +313,20 @@ public final class PairingFlow: ObservableObject {
         }
     }
 
-    /// This device's name, for the Mac's "Allow ‹name›?" prompt. The Mac
-    /// sanitizes again on its side (security review L1), but a viewer should
-    /// not send it junk in the first place — `RemotePairing.sanitizedDeviceName`
-    /// is the one place both ends agree on what "junk" means (control
-    /// characters and newlines stripped, capped at
-    /// `RemotePairing.deviceNameLimit` characters).
-    ///
-    /// `Sources/MemtermRemoteApp` is Foundation/CryptoKit/MemtermRemoteKit
-    /// only (the extension firewall), so this cannot reach `UIDevice.current.name`
-    /// the way the real iOS app would want to — `ProcessInfo.hostName` is the
-    /// nearest Foundation-only stand-in. Task 3's UI layer may replace this
-    /// with the real device name without changing anything checked here.
-    static func deviceName() -> String {
-        RemotePairing.sanitizedDeviceName(ProcessInfo.processInfo.hostName)
+    /// The default `deviceName`: `Sources/MemtermRemoteApp` is
+    /// Foundation/CryptoKit/MemtermRemoteKit only (the extension firewall), so
+    /// it cannot reach `UIDevice.current.name` itself, and
+    /// `ProcessInfo.hostName` is the nearest Foundation-only stand-in. On iOS
+    /// that is not a name anyone recognises, which matters: the Allow prompt
+    /// and the key-id callout are the person's two defences at pairing time,
+    /// and a name they do not recognise makes the prompt harder to act on
+    /// correctly. So the real app injects the real name through
+    /// `init(…deviceName:)` — this is only what a test, or a caller with no UI
+    /// to ask, falls back to.
+    /// `nonisolated`: this reads one process-wide value and touches nothing of
+    /// the flow's, and it is used as a default argument — which has to be a
+    /// plain `() -> String`, not a main-actor-isolated one.
+    public nonisolated static func foundationDeviceName() -> String {
+        ProcessInfo.processInfo.hostName
     }
 }

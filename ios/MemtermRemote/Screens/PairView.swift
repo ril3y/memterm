@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 import VisionKit
 import MemtermRemoteApp
@@ -13,7 +14,7 @@ struct PairView: View {
         NavigationStack {
             Group {
                 if let flow = model.pairingFlow() {
-                    PairFlowContent(flow: flow, dismiss: dismiss)
+                    PairFlowContent(flow: flow, model: model, dismiss: dismiss)
                 } else {
                     ContentUnavailableView(
                         "Can't Sign With This Device",
@@ -35,6 +36,13 @@ struct PairView: View {
 /// only needs `model` to fetch the flow once.
 private struct PairFlowContent: View {
     @ObservedObject var flow: PairingFlow
+    /// Only so a completed pairing can republish the host list: `PairingFlow`
+    /// writes the new Mac straight to the Keychain, and `AppModel.hosts` is
+    /// only ever written by `reloadHosts()`. `MacsView`'s `.onAppear` is on its
+    /// `NavigationStack`, which never disappeared while this sheet was up, so
+    /// without this the person finishes pairing and lands back on "No Paired
+    /// Macs".
+    @ObservedObject var model: AppModel
     let dismiss: DismissAction
 
     /// Defaults to "Mac", same as a freshly paired host before anyone
@@ -46,7 +54,10 @@ private struct PairFlowContent: View {
     var body: some View {
         content
             .onChange(of: flow.phase) { _, phase in
-                if case .paired = phase { dismiss() }
+                if case .paired = phase {
+                    model.reloadHosts()
+                    dismiss()
+                }
             }
     }
 
@@ -120,7 +131,12 @@ private struct ConfirmPairView: View {
                 }
 
                 LabeledContent("Relay") {
-                    Text(payload.relay)
+                    // Bounded and stripped: every field on this screen came
+                    // out of a QR code that may not be the one on this
+                    // person's Mac. `hostId` above needs no equivalent —
+                    // `PairingFlow.scanned` has already refused any payload
+                    // whose id is not the base32 hash of its own key.
+                    Text(payload.relayForDisplay)
                         .font(.system(.body, design: .monospaced))
                 }
 
@@ -184,8 +200,26 @@ private struct QRScannerView: UIViewControllerRepresentable {
     let onScan: (URL) -> Void
 
     func makeUIViewController(context: Context) -> UIViewController {
+        // `isAvailable` is false for a DENIED camera permission as well as for
+        // hardware that cannot scan, and reporting the second when it is the
+        // first both states the wrong cause and hides the fix. The permission
+        // is checked first, so "isn't available on this device" is only ever
+        // said about a device.
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .denied, .restricted:
+            return UnavailableScannerViewController(
+                message: "memterm needs camera access to scan the pairing code. Turn it on in Settings › Privacy & Security › Camera.")
+        case .authorized, .notDetermined:
+            // `.notDetermined` falls through: `DataScannerViewController` asks
+            // for the permission itself, which is the right moment to ask —
+            // the person is looking at a camera view they asked for.
+            break
+        @unknown default:
+            break
+        }
         guard DataScannerViewController.isSupported, DataScannerViewController.isAvailable else {
-            return UnavailableScannerViewController()
+            return UnavailableScannerViewController(
+                message: "Camera scanning isn't available on this device.")
         }
         let scanner = DataScannerViewController(
             recognizedDataTypes: [.barcode(symbologies: [.qr])],
@@ -197,7 +231,16 @@ private struct QRScannerView: UIViewControllerRepresentable {
             isHighlightingEnabled: false
         )
         scanner.delegate = context.coordinator
-        try? scanner.startScanning()
+        do {
+            try scanner.startScanning()
+        } catch {
+            // Discarding this left a black camera view and no explanation —
+            // a screen that looks broken rather than one that says what went
+            // wrong.
+            NSLog("memterm: the QR scanner would not start: \(error.localizedDescription)")
+            return UnavailableScannerViewController(
+                message: "The camera could not be started. Close this and try again.")
+        }
         return scanner
     }
 
@@ -227,11 +270,21 @@ private struct QRScannerView: UIViewControllerRepresentable {
 }
 
 private final class UnavailableScannerViewController: UIViewController {
+    private let message: String
+
+    init(message: String) {
+        self.message = message
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         let label = UILabel()
-        label.text = "Camera scanning isn't available on this device."
+        label.text = message
         label.numberOfLines = 0
         label.textAlignment = .center
         label.textColor = .secondaryLabel

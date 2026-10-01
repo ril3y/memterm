@@ -169,6 +169,61 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(factory.made.isEmpty, "a malformed host key opens no socket")
     }
 
+    func testAScannedIdThatDoesNotMatchItsOwnKeyIsRefusedWithoutDialling() {
+        // A well-formed SPKI, but not the key this code's `hostId` is the hash
+        // of. That pair cannot pair — `handlePaired` would refuse it later —
+        // and until this guard existed the raw `hostId` was still rendered to
+        // the person as the Mac they were being asked to trust.
+        let impostor = RemoteIdentity.generate()
+        XCTAssertFalse(flow.scanned(link(hostKey: impostor.publicKeySPKI)))
+        guard case .refused(let why) = flow.phase else { return XCTFail("expected .refused") }
+        XCTAssertFalse(why.isEmpty)
+        XCTAssertTrue(factory.made.isEmpty, "a code whose id and key disagree opens no socket")
+    }
+
+    func testTheDeviceNameSentIsTheInjectedOneAndIsSanitized() throws {
+        // The iOS app injects `UIDevice.current.name`; nothing stops a person
+        // naming their phone something that would forge a second line inside
+        // the Mac's "Allow ‹name›?" prompt, so the flow sanitizes whatever it
+        // is given rather than trusting its caller.
+        flow = PairingFlow(signer: phone, store: store,
+                           makeConnection: { [self] url, events in
+                               RelayConnection(base: url, role: .client, signer: phone,
+                                               events: events, transports: factory)
+                           },
+                           deviceName: { "Riley's iPhone\n\nmemterm: click Allow" })
+        XCTAssertTrue(flow.scanned(link())); flow.confirm()
+        factory.current.push(["type": "challenge", "nonce": Data(repeating: 1, count: 32).base64EncodedString()])
+        factory.current.push(["type": "authed", "id": phone.id])
+        let name = try XCTUnwrap(factory.current.lastSent?["name"] as? String)
+        XCTAssertTrue(name.hasPrefix("Riley's iPhone"), "the injected name is what is sent: \(name)")
+        XCTAssertFalse(name.contains("\n"), "and it cannot forge a second line: \(name)")
+        XCTAssertLessThanOrEqual(name.count, RemotePairing.deviceNameLimit)
+    }
+
+    func testTheRelayIsBoundedAndStrippedBeforeItIsShown() {
+        let payload = PairingPayload(
+            relay: "wss://relay.example.test\u{2028}Trusted Mac — press Pair" + String(repeating: "x", count: 200),
+            hostId: mac.id, hostPublicKey: mac.publicKeySPKI.base64EncodedString(),
+            token: token, secret: "", expiresAt: 0)
+        let shown = payload.relayForDisplay
+        XCTAssertFalse(shown.contains("\u{2028}"), "no line separator AppKit or UIKit would break on: \(shown)")
+        XCTAssertLessThanOrEqual(shown.count, PairingPayload.relayDisplayLimit)
+        XCTAssertTrue(shown.hasPrefix("wss://relay.example.test"), shown)
+    }
+
+    func testASuccessfulPairClosesThePairingSocket() throws {
+        XCTAssertTrue(flow.scanned(link())); flow.confirm()
+        factory.current.push(["type": "challenge", "nonce": Data(repeating: 1, count: 32).base64EncodedString()])
+        factory.current.push(["type": "authed", "id": phone.id])
+        factory.current.push(["type": "paired", "hostId": mac.id,
+                              "hostPublicKey": mac.publicKeySPKI.base64EncodedString()])
+        guard case .paired = flow.phase else { return XCTFail("expected .paired") }
+        XCTAssertTrue(factory.current.cancelled,
+                      "the pairing socket has nothing left to carry once the Mac is stored")
+        XCTAssertEqual(store.load().count, 1)
+    }
+
     func testPairDeniedIsSurfaced() throws {
         XCTAssertTrue(flow.scanned(link())); flow.confirm()
         factory.current.push(["type": "challenge", "nonce": Data(repeating: 1, count: 32).base64EncodedString()])

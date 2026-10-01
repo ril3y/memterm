@@ -24,6 +24,17 @@ struct MacsView: View {
                     )
                 } else {
                     List {
+                        // The one thing this app can detect but not fix: the
+                        // identity key every Mac below was paired against is
+                        // gone, so they will all refuse this device until it is
+                        // paired again. Without this the person sees only
+                        // handshakes that fail for no stated reason.
+                        if let notice = model.identityNotice {
+                            Section {
+                                Label(notice, systemImage: "key.slash")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                         ForEach(model.hosts) { host in
                             NavigationLink {
                                 MacSessionHost(model: model, host: host)

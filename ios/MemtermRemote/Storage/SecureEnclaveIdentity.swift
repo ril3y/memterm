@@ -9,7 +9,10 @@ import Security
 /// Built by the iOS app target only, so `swift test` never exercises it:
 /// its proof is the app building and running, plus the device checklist —
 /// the Enclave itself is unavailable in a simulator, where the software
-/// fallback below takes over.
+/// fallback below takes over. That fallback is compiled for the Simulator
+/// only (`#if targetEnvironment(simulator)`): a device build that somehow
+/// found no Enclave throws instead, because an exportable key would make this
+/// type's whole claim silently false.
 ///
 /// No biometry or passcode gate: this key signs the relay's challenge on
 /// EVERY connect (`RelayConnection.handleFrame`'s `"challenge"` case), which
@@ -24,6 +27,11 @@ import Security
 /// hold, biometry-gated or not; and ThisDeviceOnly keeps the key out of an
 /// iCloud Keychain backup, where the Secure Enclave anchor would not go with
 /// it.
+/// `@MainActor`, so `cached` — mutable state reachable from a connection
+/// callback — is single-threaded by construction rather than by the fact that
+/// every call happens to come from the main queue today. `PhoneIdentityStoring`
+/// is called from `AppModel`, which is itself main-actor.
+@MainActor
 public final class SecureEnclaveIdentity: PhoneIdentityStoring {
     private static let service = "com.memterm.remote"
     private static let account = "device-identity"
@@ -33,42 +41,75 @@ public final class SecureEnclaveIdentity: PhoneIdentityStoring {
     /// is current does not change mid-launch.
     private var cached: RemoteSigner?
 
+    /// Set when a stored identity could not be read and had to be replaced.
+    /// Every Mac this device was paired with allows the OLD key, so they are
+    /// all orphaned at once — and a person seeing only "handshake failed" has
+    /// no way to know that re-pairing is the fix. `AppModel` reads this to say
+    /// so. False on a first launch, where there was no identity to lose.
+    public private(set) var replacedUnreadableIdentity = false
+
     public init() {}
 
     public func identity() throws -> RemoteSigner {
         if let cached { return cached }
-        let signer = try Self.loadOrCreate()
+        let signer = try loadOrCreate()
         cached = signer
         return signer
     }
 
-    private static func loadOrCreate() throws -> RemoteSigner {
+    private func loadOrCreate() throws -> RemoteSigner {
+        let stored = Self.keychainRead()
         if SecureEnclave.isAvailable {
-            if let data = keychainRead(),
-               let key = try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: data) {
-                return EnclaveSigner(key: key)
+            if let stored {
+                if let key = try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: stored) {
+                    return EnclaveSigner(key: key)
+                }
+                noteReplacedIdentity()
             }
             guard let access = SecAccessControlCreateWithFlags(
                 nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], nil)
             else { throw IdentityError.accessControl }
             let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: access)
-            keychainWrite(key.dataRepresentation)
+            Self.keychainWrite(key.dataRepresentation)
             return EnclaveSigner(key: key)
         }
-        // The simulator (and any other device CryptoKit reports as having no
-        // Secure Enclave): fall back to an ordinary software P-256 key so
-        // pairing and handshakes still work end to end there. Real devices
-        // always take the branch above.
-        if let data = keychainRead(), let key = try? P256.Signing.PrivateKey(rawRepresentation: data) {
-            return RemoteIdentity(privateKey: key)
+        #if targetEnvironment(simulator)
+        // The Simulator, which has no Secure Enclave: fall back to an ordinary
+        // software P-256 key so pairing and handshakes still work end to end
+        // there. Compiled for the Simulator ONLY, which is what makes the
+        // branch's global constraint — the phone's identity key is generated
+        // in the Secure Enclave and never leaves it — true by construction on
+        // every build that can reach a real device, rather than true because
+        // today's hardware happens never to take this path.
+        if let stored {
+            if let key = try? P256.Signing.PrivateKey(rawRepresentation: stored) {
+                return RemoteIdentity(privateKey: key)
+            }
+            noteReplacedIdentity()
         }
         let key = P256.Signing.PrivateKey()
-        keychainWrite(key.rawRepresentation)
+        Self.keychainWrite(key.rawRepresentation)
         return RemoteIdentity(privateKey: key)
+        #else
+        // A real device that reports no Secure Enclave: refuse rather than
+        // silently minting an exportable key and claiming otherwise. There is
+        // no iOS 17 device where this happens, so this is the constraint
+        // stated in the type system, not a case anyone is expected to hit.
+        throw IdentityError.noSecureEnclave
+        #endif
+    }
+
+    /// The old key is gone either way — nothing here can recover it — so the
+    /// app mints a replacement and says what happened, rather than looking
+    /// like a device every Mac has quietly stopped trusting.
+    private func noteReplacedIdentity() {
+        replacedUnreadableIdentity = true
+        NSLog("memterm: this device's stored identity could not be read; minting a new one. Paired Macs must be paired again.")
     }
 
     enum IdentityError: Error {
         case accessControl
+        case noSecureEnclave
     }
 
     #if DEBUG

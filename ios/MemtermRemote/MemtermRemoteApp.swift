@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import SwiftUI
+import UIKit
 import MemtermRemoteApp
 import MemtermRemoteKit
 
@@ -48,7 +49,17 @@ final class AppModel: ObservableObject {
     /// Mac side already keeps for its own attach state.
     @Published private(set) var session: HostSession?
 
-    private let identityStore: PhoneIdentityStoring = SecureEnclaveIdentity()
+    /// One sentence to put at the top of the Macs list, for the one condition
+    /// this app can detect but not fix: this device's stored identity key was
+    /// unreadable and had to be replaced, which orphans every Mac that was
+    /// paired with the old one.
+    @Published private(set) var identityNotice: String?
+
+    /// Concretely typed, not `PhoneIdentityStoring`: the protocol exists so the
+    /// tested brain can be driven without a Keychain, while this class is the
+    /// app target's own wiring and does read one thing the protocol has no
+    /// business carrying (`replacedUnreadableIdentity`).
+    private let identityStore = SecureEnclaveIdentity()
     private let hostStore: PairedHostStoring = KeychainHostStore()
 
     /// Reused across scans — `PairingFlow` is documented as good for
@@ -91,6 +102,14 @@ final class AppModel: ObservableObject {
         }
         #endif
         reloadHosts()
+        // Resolved here rather than lazily at the first tap, so that if the
+        // stored identity was unreadable the person is told on the screen that
+        // lists the Macs it just orphaned, instead of discovering it as a
+        // handshake that fails for no stated reason.
+        _ = try? identityStore.identity()
+        if identityStore.replacedUnreadableIdentity && !hosts.isEmpty {
+            identityNotice = "This device's identity key had to be replaced, so the Macs below no longer recognise it. Pair with each one again."
+        }
     }
 
     func reloadHosts() {
@@ -109,9 +128,18 @@ final class AppModel: ObservableObject {
     func pairingFlow() -> PairingFlow? {
         if let cachedFlow { return cachedFlow }
         guard let signer = try? identityStore.identity() else { return nil }
-        let flow = PairingFlow(signer: signer, store: hostStore) { url, events in
-            RelayConnection(base: url, role: .client, signer: signer, events: events)
-        }
+        let flow = PairingFlow(
+            signer: signer, store: hostStore,
+            makeConnection: { url, events in
+                RelayConnection(base: url, role: .client, signer: signer, events: events)
+            },
+            // The name the Mac's "Allow ‹name›?" prompt shows. `PairingFlow`
+            // cannot reach this itself (it is Foundation-only by the extension
+            // firewall) and its Foundation stand-in, `ProcessInfo.hostName`, is
+            // not a name anyone recognises on iOS — which matters, because that
+            // prompt is one of the person's two defences at pairing time.
+            // `PairingFlow` still sanitizes whatever this returns.
+            deviceName: { UIDevice.current.name })
         cachedFlow = flow
         return flow
     }

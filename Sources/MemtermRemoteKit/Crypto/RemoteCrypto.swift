@@ -231,7 +231,17 @@ public enum RemotePairing {
     /// Mac the person just stood in front of ("Mac"). Same rules either way —
     /// the string ends up in a Keychain item and in a list row, so it is
     /// bounded and free of anything that could forge a second line of text.
-    public static func sanitizedDeviceName(_ raw: String, fallback: String = "Device") -> String {
+    ///
+    /// `limit` exists because the same two rules — no second line, no
+    /// unbounded length — are what any attacker-supplied string needs before
+    /// it goes on a screen where someone is making a trust decision, and not
+    /// every such string is a name: a pairing code's relay URL gets the same
+    /// treatment at a length a URL can actually fit in
+    /// (`PairingPayload.relayForDisplay`). Everything that does name a device
+    /// leaves this at `deviceNameLimit`, which is what the Mac's prompt is
+    /// sized for.
+    public static func sanitizedDeviceName(_ raw: String, fallback: String = "Device",
+                                           limit: Int = deviceNameLimit) -> String {
         // `.newlines` as well as `.controlCharacters`: the latter covers
         // CR/LF and the C0/C1 ranges, the former adds U+2028/U+2029, which
         // AppKit also breaks a line on.
@@ -239,7 +249,7 @@ public enum RemotePairing {
         let stripped = String(String.UnicodeScalarView(
             raw.unicodeScalars.filter { !forbidden.contains($0) }))
         let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
-        let capped = String(trimmed.prefix(deviceNameLimit))
+        let capped = String(trimmed.prefix(max(0, limit)))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return capped.isEmpty ? fallback : capped
     }
