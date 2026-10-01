@@ -14,6 +14,13 @@ edit `MemtermRemote.xcodeproj`, and never commit it (it's gitignored).
 brew install xcodegen          # once
 xcodegen generate --spec ios/project.yml --project ios
 open ios/MemtermRemote.xcodeproj
+
+# or from the command line, from ios/ — `-scheme` is NOT optional: without it
+# xcodebuild builds the target without building the SwiftPM packages it links,
+# and the first build on a fresh machine fails on `unable to resolve module
+# dependency: 'MemtermRemoteApp'`.
+xcodebuild -scheme MemtermRemote -skipPackagePluginValidation \
+    -destination 'generic/platform=iOS' build
 ```
 
 Re-run `xcodegen generate` any time `project.yml` changes, or whenever Xcode

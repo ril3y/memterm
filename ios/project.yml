@@ -9,11 +9,18 @@ packages:
     path: ..
   # XcodeGen needs every package a target links declared here, even one the
   # root package already depends on (Package.swift) — it does not resolve
-  # transitively through "memterm". Same URL and branch as Package.swift's
-  # own dependency, so both ends resolve the identical commit.
+  # transitively through "memterm". Same URL as Package.swift's own dependency.
+  #
+  # Pinned by REVISION, not by branch. The generated project is gitignored and
+  # resolves its own graph into a Package.resolved inside the .xcodeproj, so a
+  # moving branch here meant two people building this same commit could ship
+  # different SwiftTerm than the Mac app does — a reproducibility gap in a
+  # signed client, not a nicety. This revision is the one the committed
+  # Package.resolved names for swiftterm; the two must be changed together,
+  # which is the point.
   SwiftTerm:
     url: https://github.com/ril3y/SwiftTerm.git
-    branch: feature/translucent-cell-backgrounds
+    revision: 968fa6fd38f0efed7e614d470a6dee9326924088
 targets:
   MemtermRemote:
     type: application
@@ -26,6 +33,14 @@ targets:
         CFBundleDisplayName: memterm
         UILaunchScreen: {}
         NSCameraUsageDescription: Scanning the pairing code memterm shows on your Mac.
+        # Without this, App Store Connect holds every build behind a manual
+        # export-compliance questionnaire before it can reach a tester. The app
+        # does use encryption, but only through Apple's own platform
+        # cryptography (CryptoKit's P-256, HKDF and AES-GCM, plus the Secure
+        # Enclave and TLS) — which is the exemption this key declares. It is a
+        # statement about the app, so it changes if the app ever ships
+        # cryptography of its own.
+        ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
@@ -40,6 +55,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.memterm.remote
+        # The asset catalog under `sources` carries the 1024x1024 marketing
+        # icon App Store Connect requires; naming it here is what makes the
+        # build actually use it.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         DEVELOPMENT_TEAM: YJ6Y72HALX
         TARGETED_DEVICE_FAMILY: "1,2"      # iPhone and iPad
         SWIFT_VERSION: "5.10"

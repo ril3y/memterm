@@ -14,11 +14,19 @@ Read the marker on every line before trusting a checkmark:
 
 ## Build
 
-- [x] **[sim]** `swift test` — 526 tests pass.
+- [x] **[sim]** `swift test` — 545 tests pass.
 - [x] **[sim]** `scripts/check-extension-firewall.sh` — `FIREWALL-PASS`.
 - [x] **[sim]** `xcodegen generate --spec ios/project.yml --project ios`, then
-      `xcodebuild -skipPackagePluginValidation -destination 'generic/platform=iOS' build`
+      `xcodebuild -scheme MemtermRemote -skipPackagePluginValidation -destination 'generic/platform=iOS' build`
       — `BUILD SUCCEEDED`, zero warnings from this task's own files.
+      **`-scheme` is required, and this line used to omit it.** Without it,
+      `xcodebuild` builds the target without building the SwiftPM packages it
+      links, so the first build on a machine with no DerivedData for this
+      project fails with `unable to resolve module dependency:
+      'MemtermRemoteApp'` and a missing `SwiftTerm_SwiftTerm.bundle`. It
+      passed before only because a previous build had already populated
+      DerivedData — which is exactly the kind of thing this checklist exists
+      to stop anyone believing.
 - [x] **[sim]** Simulator build (`platform=iOS Simulator`) — `BUILD SUCCEEDED`.
 - [x] **[sim]** Install + launch on an iPhone 17 Pro simulator (iOS 26.5,
       runtime actually installed on this Mac — there is no iPhone 16 Pro

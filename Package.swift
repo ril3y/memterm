@@ -21,8 +21,19 @@ let package = Package(
         // ril3y/SwiftTerm = upstream 1.20.0 + translucentCellBackgrounds
         // (explicit cell backgrounds follow window opacity, iTerm2-style —
         // founder ask 2026-09-09; PR'd upstream). Back to upstream once merged.
+        //
+        // By REVISION, not by the `feature/translucent-cell-backgrounds`
+        // branch it is the tip of. The iOS app is a second, separately
+        // resolved consumer of this package whose own resolution file lives
+        // inside a gitignored `.xcodeproj`, so while this moved with a branch,
+        // two people building the same commit could ship different SwiftTerm
+        // in a signed client — and SwiftPM refuses outright to resolve one
+        // package by branch here and by revision there. Pinning both ends to
+        // the same revision is what makes "the Mac app and the iOS app build
+        // the same code" a fact rather than a hope. Bump this and
+        // `ios/project.yml` together.
         .package(url: "https://github.com/ril3y/SwiftTerm.git",
-                 branch: "feature/translucent-cell-backgrounds"),
+                 revision: "968fa6fd38f0efed7e614d470a6dee9326924088"),
         // Self-update (iTerm2-style): Sparkle 2 via its SwiftPM binary
         // distribution. Feed URL + EdDSA public key live in the app's
         // Info.plist (scripts/make-app.sh); release.yml signs each DMG.

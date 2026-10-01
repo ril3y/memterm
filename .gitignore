@@ -5,3 +5,8 @@ Sources/memterm/BuildStamp.generated.swift
 .swiftpm/xcode/package.xcworkspace/xcuserdata/
 .superpowers/
 ios/*.xcodeproj
+# `xcodebuild` from ios/ with no -derivedDataPath drops its products here (and
+# a root build/ for the package it links), so these would otherwise show up as
+# hundreds of untracked files after every build of the iOS app.
+ios/build/
+/build/
