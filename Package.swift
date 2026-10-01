@@ -12,7 +12,10 @@ let package = Package(
     products: [
         // The iPhone/iPad client links this from ios/MemtermRemote.xcodeproj
         // (spec 2026-09-28 §3.7); a bare target is not visible outside the package.
-        .library(name: "MemtermRemoteKit", targets: ["MemtermRemoteKit"])
+        .library(name: "MemtermRemoteKit", targets: ["MemtermRemoteKit"]),
+        // Same reason, same shape: the app shell target in
+        // ios/MemtermRemote.xcodeproj (task 3) links this directly.
+        .library(name: "MemtermRemoteApp", targets: ["MemtermRemoteApp"])
     ],
     dependencies: [
         // ril3y/SwiftTerm = upstream 1.20.0 + translucentCellBackgrounds

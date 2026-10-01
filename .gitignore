@@ -4,3 +4,4 @@ dist/
 Sources/memterm/BuildStamp.generated.swift
 .swiftpm/xcode/package.xcworkspace/xcuserdata/
 .superpowers/
+ios/*.xcodeproj

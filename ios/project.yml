@@ -1,0 +1,52 @@
+name: MemtermRemote
+options:
+  bundleIdPrefix: com.memterm
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  memterm:
+    path: ..
+  # XcodeGen needs every package a target links declared here, even one the
+  # root package already depends on (Package.swift) — it does not resolve
+  # transitively through "memterm". Same URL and branch as Package.swift's
+  # own dependency, so both ends resolve the identical commit.
+  SwiftTerm:
+    url: https://github.com/ril3y/SwiftTerm.git
+    branch: feature/translucent-cell-backgrounds
+targets:
+  MemtermRemote:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [MemtermRemote]
+    info:
+      path: MemtermRemote/Info.plist
+      properties:
+        CFBundleDisplayName: memterm
+        UILaunchScreen: {}
+        NSCameraUsageDescription: Scanning the pairing code memterm shows on your Mac.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: MemtermRemote/MemtermRemote.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.memterm.remote
+        DEVELOPMENT_TEAM: YJ6Y72HALX
+        TARGETED_DEVICE_FAMILY: "1,2"      # iPhone and iPad
+        SWIFT_VERSION: "5.10"
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - package: memterm
+        product: MemtermRemoteKit
+      - package: memterm
+        product: MemtermRemoteApp
+      - package: SwiftTerm

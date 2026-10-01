@@ -121,6 +121,17 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(factory.made.isEmpty)
     }
 
+    func testMalformedHostKeyIsRefusedAtScanTimeNotDuringHandshake() {
+        // Right length but zero bytes: not the fixed DER SPKI header this
+        // app's identities always wrap a key in, so `RemoteIdentity.x963(fromSPKI:)`
+        // must reject it.
+        let malformed = Data(repeating: 0, count: 91)
+        XCTAssertFalse(flow.scanned(link(hostKey: malformed)))
+        guard case .refused(let why) = flow.phase else { return XCTFail("expected .refused") }
+        XCTAssertFalse(why.isEmpty)
+        XCTAssertTrue(factory.made.isEmpty, "a malformed host key opens no socket")
+    }
+
     func testPairDeniedIsSurfaced() throws {
         XCTAssertTrue(flow.scanned(link())); flow.confirm()
         factory.current.push(["type": "challenge", "nonce": Data(repeating: 1, count: 32).base64EncodedString()])

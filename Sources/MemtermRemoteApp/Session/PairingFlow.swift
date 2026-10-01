@@ -53,6 +53,12 @@ public final class PairingFlow: ObservableObject {
     /// of truth a `paired` reply is checked against. Never replaced by
     /// anything that arrives over the wire.
     private var scannedPayload: PairingPayload?
+    /// The name the person gave this Mac on the confirm screen (Task 2
+    /// review finding: the QR payload and the relay's `paired` reply carry
+    /// no name at all, so the phone is the only place one can come from).
+    /// Set by `confirm(name:)`, consumed by `handlePaired` — never anything
+    /// read off the wire.
+    private var confirmedName = "Mac"
 
     public init(signer: RemoteSigner, store: PairedHostStoring,
                 makeConnection: @escaping (URL, RelayConnection.Events) -> RelayConnection,
@@ -92,6 +98,18 @@ public final class PairingFlow: ObservableObject {
             phase = .refused("That QR code could not be read.")
             return false
         }
+        // Refuse a malformed host key here, at decode time, rather than
+        // letting it fail later and confusingly during the handshake
+        // (Task 2 review finding). `RemoteIdentity.x963(fromSPKI:)` is the
+        // kit's own well-formedness check (length + DER header) — reused
+        // rather than re-deriving those constants in this module.
+        guard
+            let hostKeySPKI = Data(base64Encoded: payload.hostPublicKey),
+            RemoteIdentity.x963(fromSPKI: hostKeySPKI) != nil
+        else {
+            phase = .refused("That pairing code's Mac key is not something this app understands.")
+            return false
+        }
         guard payload.expiresAt > Int(now().timeIntervalSince1970 * 1000) else {
             phase = .refused("This pairing code has expired. Ask for a new one.")
             return false
@@ -126,9 +144,17 @@ public final class PairingFlow: ObservableObject {
     /// ONLY that relay — never the scanned page's own origin) and let the
     /// challenge/auth handshake run. The actual `pair` request is sent once
     /// `authed` arrives — see `handleControl`.
-    public func confirm() {
+    ///
+    /// - Parameter name: What to call this Mac once paired, as typed on the
+    ///   confirm screen (defaulting to "Mac" — the same placeholder a
+    ///   freshly paired device showed before this parameter existed, so
+    ///   existing callers and tests keep compiling). Blank or
+    ///   whitespace-only input falls back to "Mac" too.
+    public func confirm(name: String = "Mac") {
         guard case .confirming(let payload) = phase, let relayURL = URL(string: payload.relay) else { return }
         teardownConnection()
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        confirmedName = trimmed.isEmpty ? "Mac" : trimmed
 
         var events = RelayConnection.Events()
         events.onControl = { [weak self] object in self?.handleControl(object) }
@@ -207,11 +233,11 @@ public final class PairingFlow: ObservableObject {
             phase = .refused("This Mac's reply did not match the code you scanned.")
             return
         }
-        // The Mac does not send a display name over this reply; "Mac" is a
-        // placeholder the UI can let the person rename, the same way a newly
-        // paired device looks on the Mac's own list before it is renamed.
+        // The Mac does not send a display name over this reply — the name
+        // the person gave this Mac on the confirm screen (`confirmedName`)
+        // is the only one there is.
         let host = PairedHost(id: hostId, publicKeySPKI: spki, relay: relayURL,
-                               name: "Mac", pairedAt: now())
+                               name: confirmedName, pairedAt: now())
         store.add(host)
         phase = .paired(host)
     }

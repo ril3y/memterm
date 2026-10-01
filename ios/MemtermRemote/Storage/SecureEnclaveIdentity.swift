@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import MemtermRemoteApp
 import MemtermRemoteKit
 import Security
 

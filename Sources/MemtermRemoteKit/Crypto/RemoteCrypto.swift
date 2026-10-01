@@ -94,7 +94,14 @@ public struct RemoteIdentity {
 
     /// Unwraps an SPKI back to the raw point. Peer SPKIs arrive over the
     /// network, so anything that is not our exact 91-byte shape is rejected.
-    static func x963(fromSPKI spki: Data) -> Data? {
+    ///
+    /// Public so a caller holding an untrusted SPKI it has not yet verified a
+    /// signature with — a QR payload's `hostPublicKey`, say — can ask "is
+    /// this even a well-formed key?" without re-deriving the length and
+    /// header this module already pins (task 3). Returning `nil` IS that
+    /// validity check; callers that only need a yes/no should not re-inspect
+    /// the bytes this unwraps.
+    public static func x963(fromSPKI spki: Data) -> Data? {
         guard spki.count == spkiLength, spki.prefix(spkiHeader.count) == spkiHeader else { return nil }
         return Data(spki.suffix(x963Length))
     }
