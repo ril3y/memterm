@@ -1,5 +1,6 @@
 import XCTest
 @testable import MemtermRemoteKit
+import MemtermRemoteKitTesting
 
 final class RelayConnectionTests: XCTestCase {
     private var factory: FakeTransportFactory!

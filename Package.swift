@@ -38,6 +38,27 @@ let package = Package(
             name: "MemtermRemoteKit",
             path: "Sources/MemtermRemoteKit"
         ),
+        // Fakes shared by the kit's tests and the app's tests: a transport
+        // the test drives by hand and a scheduler that only fires when told.
+        // A separate target rather than a Testing/ folder in the kit, so no
+        // test double ever links into a shipping app.
+        .target(
+            name: "MemtermRemoteKitTesting",
+            dependencies: ["MemtermRemoteKit"],
+            path: "Sources/MemtermRemoteKitTesting"
+        ),
+        // The iPhone/iPad client's brain (spec 2026-09-28 §3.2): models, the
+        // per-Mac session state machine, storage contracts. Foundation +
+        // CryptoKit only (the phone speaks first in the handshake, and
+        // building its own Hello needs an ephemeral ECDH key — see
+        // HostSession's header comment) — the SwiftUI screens, Keychain and
+        // SwiftTerm live in ios/, so all of this is unit-tested headlessly
+        // with `swift test` on a Mac.
+        .target(
+            name: "MemtermRemoteApp",
+            dependencies: ["MemtermRemoteKit"],
+            path: "Sources/MemtermRemoteApp"
+        ),
         // Pure logic (config, state store, adapters, restore helpers) —
         // AppKit-free so it is testable headlessly.
         .target(
@@ -104,8 +125,13 @@ let package = Package(
         // against a fake transport. Headless, no app, no relay process.
         .testTarget(
             name: "MemtermRemoteKitTests",
-            dependencies: ["MemtermRemoteKit"],
+            dependencies: ["MemtermRemoteKit", "MemtermRemoteKitTesting"],
             path: "Tests/MemtermRemoteKitTests"
+        ),
+        .testTarget(
+            name: "MemtermRemoteAppTests",
+            dependencies: ["MemtermRemoteApp", "MemtermRemoteKitTesting"],
+            path: "Tests/MemtermRemoteAppTests"
         ),
         // Kit contract tests: the Host surface against a mock implementation
         // (pins the API shape and the archive-stub contract).

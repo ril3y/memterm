@@ -52,6 +52,10 @@ check_dir() {  # check_dir <dir> <allowed-regex> <label>
 # -- 1. Kit purity -----------------------------------------------------------
 check_dir "Sources/MemtermExtensionKit" "Foundation|AppKit" "kit"
 check_dir "Sources/MemtermRemoteKit" "Foundation|CryptoKit" "remote-kit"
+# The iPhone client's brain speaks first in the handshake (HostSession),
+# which means building its own Hello needs an ephemeral ECDH key — the same
+# CryptoKit allowance the kit itself gets, for the same reason.
+check_dir "Sources/MemtermRemoteApp" "Foundation|CryptoKit|MemtermRemoteKit" "remote-app"
 
 # -- 2. Extension targets ----------------------------------------------------
 EXT_DIRS=""
