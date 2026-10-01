@@ -348,12 +348,71 @@ final class HostSessionTests: XCTestCase {
         XCTAssertEqual(session.phase, .ready, "the live ephemeral was not spent on the forgery")
     }
 
-    func testAnOnlineFrameDoesNotTearDownALiveSession() throws {
-        _ = try attachedSession()
+    func testAnOnlineFrameProbesALiveSessionInsteadOfTearingItDownOrIgnoringIt() throws {
+        let keys = try attachedSession()
         let connections = factory.made.count
         factory.current.push(["type": "online", "hostId": hostIdentity.id])
         XCTAssertEqual(session.phase, .attached(paneId: "p1"), "a working session is left alone")
         XCTAssertEqual(factory.made.count, connections, "and nothing reconnects behind it")
+        XCTAssertEqual(try sentMessages(with: keys).last, .list,
+                       "but the frame is not simply ignored either — it asks the Mac to prove it")
+
+        // The Mac answers, so the probe's question is settled and its timer
+        // must not still be able to restart a working session.
+        try send(.tree(tree(panes: ["p1"])), with: keys)
+        XCTAssertEqual(session.phase, .attached(paneId: "p1"), "answering keeps the attach")
+        XCTAssertFalse(scheduler.fire(delay: HostSession.livenessProbeTimeout),
+                       "an answered probe leaves no armed timer behind")
+        XCTAssertEqual(factory.made.count, connections, "and still nothing reconnected")
+    }
+
+    /// The regression this probe exists for. The relay sends `online` with no
+    /// preceding `offline` when a host re-authenticates (it closes the old
+    /// socket with 4005 and that close deliberately sends nothing), so a Mac
+    /// that died ungracefully and relaunched leaves this session holding keys
+    /// for a session the Mac no longer has. Every record it sends is silently
+    /// dropped, and no other timeout covers `.attached`.
+    func testAnUnansweredProbeRestartsASessionWhoseMacForgotIt() throws {
+        _ = try attachedSession()
+        let connections = factory.made.count
+        factory.current.push(["type": "online", "hostId": hostIdentity.id])
+        XCTAssertEqual(session.phase, .attached(paneId: "p1"))
+
+        // Silence: the Mac no longer holds a session for this device.
+        XCTAssertTrue(scheduler.fire(delay: HostSession.livenessProbeTimeout))
+        XCTAssertEqual(session.phase, .connecting,
+                       "silence is the evidence — the session restarts rather than stalling")
+        XCTAssertEqual(factory.made.count, connections + 1)
+    }
+
+    /// `pendingHandshakes` is correlated POSITIONALLY (replies carry no request
+    /// id), so trimming the queue to bound it shifts every later reply onto the
+    /// wrong entry. Resetting keeps the invariant.
+    func testAFloodOfAuthedFramesRestartsRatherThanTrimmingTheQueue() throws {
+        session.start()
+        authenticate()
+        let connections = factory.made.count
+        // One Hello is already outstanding from `authenticate()`; fill the
+        // queue to its cap without exceeding it.
+        for _ in 1 ..< HostSession.maxPendingHandshakes {
+            factory.current.push(["type": "authed", "id": phoneIdentity.id])
+        }
+        XCTAssertEqual(factory.made.count, connections,
+                       "a full queue is not yet a reason to reconnect")
+        XCTAssertEqual(session.phase, .handshaking)
+
+        // One past the cap.
+        factory.current.push(["type": "authed", "id": phoneIdentity.id])
+        XCTAssertEqual(factory.made.count, connections + 1,
+                       "the queue is bounded by resetting the session, not by dropping entries")
+        XCTAssertEqual(session.phase, .connecting)
+
+        // And the reset session still completes a handshake, which is the
+        // property trimming would have broken.
+        authenticate()
+        let keys = try completeHandshake()
+        try send(.tree(tree(panes: ["p1"])), with: keys)
+        XCTAssertEqual(session.phase, .ready)
     }
 
     func testOnlineForAnotherMacIsIgnoredAndOurOwnRestartIsThrottled() throws {

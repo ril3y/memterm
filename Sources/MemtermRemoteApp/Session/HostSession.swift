@@ -61,9 +61,18 @@ public final class HostSession: ObservableObject {
     /// every restart it causes makes the Mac run `endSession`. At most one
     /// restart per this interval.
     public static let onlineRestartInterval: TimeInterval = 5
+    /// How long a liveness probe's `.list` may go unanswered before this
+    /// session concludes the Mac is not the one it is still holding keys with
+    /// and restarts. Shorter than `handshakeTimeout` on purpose: by the time a
+    /// probe is sent, the relay has authenticated us AND a handshake has
+    /// already completed, so the Mac has demonstrably answered quickly once
+    /// already. It is also a distinct value so a test can name which timer it
+    /// means.
+    public static let livenessProbeTimeout: TimeInterval = 10
     /// `pendingHandshakes` is fed by a relay-sent frame (`authed`), so it
-    /// needs a ceiling. Only the newest generation can ever succeed, so the
-    /// entries this drops are already dead.
+    /// needs a ceiling. Reaching it restarts the session rather than trimming
+    /// the queue — see `beginHandshake`, which explains why dropping entries
+    /// is not a safe way to bound this.
     static let maxPendingHandshakes = 8
     /// Bounds on a `lastSeen` this app is willing to put in a sentence.
     static let lastSeenFutureSlack: TimeInterval = 60 * 60
@@ -91,7 +100,8 @@ public final class HostSession: ObservableObject {
     private var pendingHandshakes: [(ephemeral: P256.KeyAgreement.PrivateKey, generation: Int)] = []
     private var handshakeGeneration = 0
     private var handshakeTimeoutWork: DispatchWorkItem?
-    private var lastOnlineRestart: Date?
+    private var livenessProbeWork: DispatchWorkItem?
+    private var lastOnlineAction: Date?
 
     private var attachedPaneId: String?
     /// Survives a background/foreground cycle so the viewer comes back to
@@ -126,6 +136,7 @@ public final class HostSession: ObservableObject {
         keys = nil
         pendingHandshakes.removeAll()
         cancelHandshakeTimeout()
+        cancelLivenessProbe()
         attachedPaneId = nil
         notice = nil
         phase = .connecting
@@ -149,6 +160,7 @@ public final class HostSession: ObservableObject {
         keys = nil
         pendingHandshakes.removeAll()
         cancelHandshakeTimeout()
+        cancelLivenessProbe()
         attachedPaneId = nil
         // A tree kept across a teardown is a tree that gets rendered again on
         // the way back in, before any fresh data has arrived — panes that may
@@ -228,9 +240,21 @@ public final class HostSession: ObservableObject {
             guard isAboutThisHost(object) else { return }
             phase = .offline(since: plausibleDate(fromEpochMilliseconds: object["lastSeen"] as? Double))
         case "online":
-            guard isAboutThisHost(object), shouldRestartOnOnline() else { return }
-            lastOnlineRestart = now()
-            start()
+            guard isAboutThisHost(object), !isThrottled() else { return }
+            switch phase {
+            case .offline, .unreachable:
+                // Nothing to lose: there is no session worth protecting.
+                lastOnlineAction = now()
+                start()
+            case .ready, .attached:
+                lastOnlineAction = now()
+                probeLiveness()
+            case .idle, .connecting, .handshaking, .failed:
+                // `.idle` is a stopped session, `.failed` is a verdict this
+                // frame cannot overturn, and the middle two are already on
+                // their way with their own timeout armed.
+                break
+            }
         case "refused":
             let reason = object["reason"] as? String ?? ""
             if reason == "not-allowed" {
@@ -255,23 +279,62 @@ public final class HostSession: ObservableObject {
         (object["hostId"] as? String) == hostId
     }
 
-    /// `online` is a hint from an untrusted party, not a command. Acting on it
-    /// unconditionally let a relay drive an unbounded reconnect loop — each
-    /// `start()` closes the socket and makes the Mac run `endSession`,
-    /// dropping its viewer attach — so a restart happens only when this
-    /// session is in a state a restart would actually improve, and at most
-    /// once per `onlineRestartInterval`.
-    private func shouldRestartOnOnline() -> Bool {
-        switch phase {
-        case .offline, .unreachable:
-            break
-        case .idle, .connecting, .handshaking, .ready, .attached, .failed:
-            return false
+    /// `online` is a hint from an untrusted party, not a command, so no path
+    /// out of it may be unbounded: at most one action per
+    /// `onlineRestartInterval`, whichever action it is.
+    private func isThrottled() -> Bool {
+        guard let lastOnlineAction else { return false }
+        return now().timeIntervalSince(lastOnlineAction) < Self.onlineRestartInterval
+    }
+
+    /// An `online` frame while this session believes it is working is the one
+    /// case that needs care, and the first version of this gate got it wrong
+    /// by ignoring the frame outright.
+    ///
+    /// Restarting unconditionally was the original bug: every `start()` closes
+    /// the socket and makes the Mac run `endSession`, dropping its viewer
+    /// attach, so a relay could churn a healthy session at will. But ignoring
+    /// the frame drops a recovery that used to work. The relay sends `online`
+    /// with no preceding `offline` when a host re-authenticates — it closes
+    /// the previous socket with 4005 "replaced", and that socket's own close
+    /// handler returns early precisely so no `offline` goes out
+    /// (`relay/src/server.ts`). If the Mac died ungracefully and relaunched
+    /// before the heartbeat reaped its stale socket, the Mac's in-memory
+    /// session for this device is gone, these keys are dead, and the only
+    /// frame this session will ever receive about it is that `online`. The
+    /// Mac silently drops records from a device it no longer has a session
+    /// for, and no timeout covers `.ready` or `.attached` — so the person sits
+    /// watching a terminal that has quietly stopped. That silent stall is the
+    /// exact defect class this app has already shipped once and been bitten
+    /// by.
+    ///
+    /// So treat the frame as neither: probe. Ask for the tree, which any live
+    /// Mac answers in milliseconds, and let the absence of an answer be the
+    /// evidence. A `.tree` cancels the timer and costs one small message;
+    /// silence restarts. A hostile relay gains nothing it did not already
+    /// have — it can drop frames whenever it likes — and a working session is
+    /// never torn down on a stranger's say-so.
+    private func probeLiveness() {
+        cancelLivenessProbe()
+        send(.list)
+        livenessProbeWork = schedule(Self.livenessProbeTimeout) { [weak self] in
+            guard let self else { return }
+            switch self.phase {
+            case .ready, .attached:
+                // Still no tree. The keys this session holds are for a
+                // session the Mac no longer has.
+                self.start()
+            case .idle, .connecting, .handshaking, .offline, .unreachable, .failed:
+                // Something already moved this session on; the probe's
+                // question is moot.
+                break
+            }
         }
-        if let lastOnlineRestart, now().timeIntervalSince(lastOnlineRestart) < Self.onlineRestartInterval {
-            return false
-        }
-        return true
+    }
+
+    private func cancelLivenessProbe() {
+        livenessProbeWork?.cancel()
+        livenessProbeWork = nil
     }
 
     /// A `lastSeen` is formatted straight into a sentence the person reads,
@@ -294,14 +357,31 @@ public final class HostSession: ObservableObject {
     /// kit's shared implementations — the same ones the Mac host and the
     /// headless probe client use — so there is exactly one wire format.
     private func beginHandshake() {
+        // The cap is reached only when the relay has sent more `authed` frames
+        // than the Mac has sent replies, so bound it by resetting, not by
+        // trimming.
+        //
+        // Trimming looked safe and was not. Replies carry no request id, so
+        // `removeFirst()` IS the correlation: the Mac answers each Hello once,
+        // in order. Dropping from the front shifts every later reply onto the
+        // wrong entry, so the live reply pops a stale entry, fails the
+        // generation check, and is discarded — the handshake that would have
+        // succeeded is thrown away, and the session waits out its timeout
+        // instead. (The generation check keeps that merely wasteful rather
+        // than dangerous: a mismatched pairing is refused, never used to
+        // derive keys. It is still the wrong outcome.)
+        //
+        // `start()` clears the queue and the socket together, which keeps the
+        // positional invariant intact instead of quietly breaking it.
+        if pendingHandshakes.count >= Self.maxPendingHandshakes {
+            start()
+            return
+        }
         handshakeGeneration += 1
         let generation = handshakeGeneration
         guard let (hello, ephemeral) = try? RemoteHandshake.makeHello(signer: signer) else {
             phase = .failed("Could not sign the handshake.")
             return
-        }
-        if pendingHandshakes.count >= Self.maxPendingHandshakes {
-            pendingHandshakes.removeFirst(pendingHandshakes.count - Self.maxPendingHandshakes + 1)
         }
         pendingHandshakes.append((ephemeral: ephemeral, generation: generation))
         phase = .handshaking
@@ -410,6 +490,9 @@ public final class HostSession: ObservableObject {
     private func handle(_ message: RemoteMessage) {
         switch message {
         case .tree(let newTree):
+            // Any tree answers a liveness probe: it proves the Mac still holds
+            // this session, which is the only question the probe asked.
+            cancelLivenessProbe()
             tree = newTree
             if let current = attachedPaneId {
                 if !ViewerTree.contains(paneId: current, in: newTree) {

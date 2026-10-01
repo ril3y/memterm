@@ -31,12 +31,16 @@ struct TreeView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            // `closedPaneNotice` is this screen's own (the pane left the tree
-            // while its terminal was up); `session.notice` is the Mac's answer
-            // to something it would not do. At most one of the two is ever
-            // standing, and they say the same kind of thing, so they share a
-            // row.
-            if let notice = closedPaneNotice ?? session.notice {
+            // `closedPaneNotice` is this screen's own inference (the pane left
+            // the tree while its terminal was up); `session.notice` is the
+            // Mac's own answer to something it would not do. Both CAN be
+            // standing at once — `returnToTree(saying:)` sets the notice and
+            // moves the phase to `.ready`, and that `.ready` is exactly what
+            // makes `TerminalScreen` auto-pop and set the other one. So the
+            // Mac's specific answer wins: told "that workspace is locked",
+            // this screen must not overwrite it with its own guess that the
+            // pane was closed, which in that case is not even true.
+            if let notice = session.notice ?? closedPaneNotice {
                 Section {
                     Text(notice)
                         .foregroundStyle(.secondary)

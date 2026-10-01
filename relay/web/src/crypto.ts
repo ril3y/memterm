@@ -173,7 +173,19 @@ export async function verifyHello(hello: Hello, peerSPKI: Uint8Array): Promise<b
   }
 }
 
-/** Wire encoding for a Hello: UTF-8 JSON `{"hs":"hello","eph":...,"sig":...}`. */
+/**
+ * Wire encoding for a Hello: UTF-8 JSON `{"hs":"hello","eph":...,"sig":...}`.
+ *
+ * The contract with the Swift side (`HelloWire.swift`) is the field names, the
+ * `hs` tag and standard base64 — NOT the bytes. Swift sorts its keys and
+ * escapes the forward slash in base64, so it emits `eph, hs, sig` and `+\/++`
+ * where this emits `hs, eph, sig` and `+/++`. Both are correct and they have
+ * always interoperated: every consumer parses JSON and reads by name, and a
+ * Hello's signature covers the labelled ephemeral point, never this JSON. So
+ * do not change this to match a Swift byte literal, and do not add a
+ * cross-language byte assertion — see the long note on
+ * `testHelloWireBytes...` in `RemoteCryptoTests.swift`.
+ */
 export function encodeHello(hello: Hello): string {
   return JSON.stringify({ hs: "hello", eph: hello.ephemeralRaw, sig: hello.signature });
 }
