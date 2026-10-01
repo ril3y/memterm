@@ -114,7 +114,7 @@ final class RemoteCryptoTests: XCTestCase {
     func testSignatureIsRaw64ByteRS() throws {
         let identity = RemoteIdentity.generate()
         let message = Data("attach please".utf8)
-        let signature = identity.sign(message)
+        let signature = try identity.sign(message)
         XCTAssertEqual(signature.count, 64)
 
         let publicKey = try P256.Signing.PublicKey(
@@ -126,7 +126,7 @@ final class RemoteCryptoTests: XCTestCase {
 
     func testSignatureFailsForTamperedMessage() throws {
         let identity = RemoteIdentity.generate()
-        let signature = identity.sign(Data("attach please".utf8))
+        let signature = try identity.sign(Data("attach please".utf8))
         let publicKey = try P256.Signing.PublicKey(
             x963Representation: identity.privateKey.publicKey.x963Representation
         )
@@ -222,7 +222,7 @@ final class RemoteCryptoTests: XCTestCase {
 
         let unlabelled = RemoteHandshake.Hello(
             ephemeralRaw: hello.ephemeralRaw,
-            signature: identity.sign(hello.ephemeralRaw)
+            signature: try identity.sign(hello.ephemeralRaw)
         )
         XCTAssertFalse(
             RemoteHandshake.verifyHello(unlabelled, peerSPKI: identity.publicKeySPKI),
@@ -269,6 +269,41 @@ final class RemoteCryptoTests: XCTestCase {
         XCTAssertThrowsError(try keys.open(record)) { error in
             XCTAssertEqual(error as? RemoteCryptoError, .malformed)
         }
+    }
+
+    /// `HelloWire` is the one Swift definition of the handshake's clear-text
+    /// frame, and a TypeScript client this repository cannot change parses the
+    /// same bytes. The consolidation that produced it was verified by
+    /// inspection; this pins it, so a renamed field, a changed tag, or a
+    /// different `Data` strategy cannot drift the format out from under the
+    /// browser without a failing test.
+    ///
+    /// Deliberately NOT a whole-string byte comparison, and that is worth
+    /// writing down: `HelloWire.encode` uses a bare `JSONEncoder()`, and
+    /// Darwin's does not promise the same key order across two encodes of one
+    /// value. An `==` against a literal `{"hs":…,"eph":…,"sig":…}` passes in
+    /// isolation and fails in a full run — measured here, not feared. That
+    /// instability is also why key order cannot be part of this contract, and
+    /// it costs nothing: order reaches no parser (every consumer reads by
+    /// name), no signature (a Hello's covers the labelled ephemeral point,
+    /// never this JSON), and no stored vector. What every consumer DOES depend
+    /// on byte for byte is each field's spelling, the tag's value, and base64
+    /// rather than an array of numbers — so that is what is pinned, and pinned
+    /// order-independently.
+    func testHelloWireFieldNamesTagAndBase64AreThePinnedContract() throws {
+        // A signature whose base64 needs `+` and `/` from the standard
+        // alphabet, so a switch to base64url would be visible right here.
+        let hello = RemoteHandshake.Hello(ephemeralRaw: Data([0x04, 0x01, 0x02]),
+                                          signature: Data([0xFB, 0xFF, 0xBE]))
+        let encoded = HelloWire.encode(hello)
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(Set(json.keys), ["hs", "eph", "sig"], "exactly these three field names")
+        XCTAssertEqual(json["hs"] as? String, "hello", "the tag that tells a Hello from a sealed record")
+        XCTAssertEqual(json["eph"] as? String, "BAEC", "standard base64, not base64url, not an array")
+        XCTAssertEqual(json["sig"] as? String, "+/++")
+        XCTAssertEqual(HelloWire.decode(encoded), hello, "and it round-trips")
+        XCTAssertNil(HelloWire.decode(Data(#"{"hs":"bye","eph":"BAEC","sig":"+/++"}"#.utf8)),
+                     "a frame not tagged as a Hello is not one")
     }
 
     // MARK: - (d) Replay

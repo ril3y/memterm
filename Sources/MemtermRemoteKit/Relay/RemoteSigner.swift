@@ -9,11 +9,15 @@ public protocol RemoteSigner {
     func sign(_ data: Data) throws -> Data
 }
 
-// RemoteIdentity's existing non-throwing `sign` satisfies this throwing
-// requirement unchanged (a non-throwing function is a valid witness for a
-// throwing requirement), so the conformance body stays empty. On the Mac
-// that sign never actually throws — but a Secure Enclave key on the phone
-// fails for ordinary reasons (locked device, cancelled biometric prompt,
-// timeout), and this seam is what lets that failure be reported instead of
-// silently becoming an empty signature on the wire.
+// `RemoteIdentity.sign` matches this signature exactly, so the conformance
+// body is empty. It is worth saying why that signature is throwing on BOTH
+// implementations and not just the phone's: a Secure Enclave key fails for
+// ordinary reasons (locked device, cancelled biometric prompt, timeout), while
+// a software key on the Mac fails only on a hardware or entropy fault — but a
+// non-throwing witness also satisfies a throwing requirement, so while
+// `RemoteIdentity.sign` swallowed its own failure into `Data()` nothing
+// downstream could ever observe one, `RemoteHost`'s guard against a Hello it
+// could not sign was unreachable, and a 0-byte signature could still reach the
+// wire. Throwing at the source is what makes the seam real rather than
+// decorative.
 extension RemoteIdentity: RemoteSigner {}

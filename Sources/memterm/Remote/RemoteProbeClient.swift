@@ -148,7 +148,20 @@ final class RemoteProbeClient {
     /// ephemeral, signed and sent in the clear inside an envelope, kept
     /// around until the host's own Hello comes back.
     private func sendHello() {
-        guard let (hello, ephemeral) = try? RemoteHandshake.makeHello(signer: identity) else { return }
+        let hello: RemoteHandshake.Hello
+        let ephemeral: P256.KeyAgreement.PrivateKey
+        do {
+            (hello, ephemeral) = try RemoteHandshake.makeHello(signer: identity)
+        } catch {
+            // `RemoteHost` logs the same condition (`RemoteHost.swift`'s
+            // startSession). The silent one was in the tool used to DIAGNOSE
+            // this protocol, where a handshake that simply never starts is the
+            // worst possible thing to have no line about. stderr, so it cannot
+            // land in the middle of the UIPROBE output the probe legs parse.
+            FileHandle.standardError.write(
+                Data("memterm probe-client: could not build a Hello: \(error)\n".utf8))
+            return
+        }
         myEphemeral = ephemeral
         sendEnvelope(to: hostId, payload: HelloWire.encode(hello))
     }

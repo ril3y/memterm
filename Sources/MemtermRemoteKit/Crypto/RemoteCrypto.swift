@@ -64,11 +64,20 @@ public struct RemoteIdentity {
     /// ECDSA P-256 with SHA-256 in WebCrypto's raw format: 64 bytes r‖s.
     /// CryptoKit's `rawRepresentation` is already that layout — the DER form
     /// would be rejected by `crypto.subtle.verify`.
-    public func sign(_ data: Data) -> Data {
-        // P256 signing only fails on a hardware/entropy fault, and there is
-        // no sensible recovery at a call site that must produce a Hello.
-        guard let signature = try? privateKey.signature(for: data) else { return Data() }
-        return signature.rawRepresentation
+    ///
+    /// Throwing, so a failure cannot become a 0-byte signature on the wire.
+    /// Software P-256 signing only fails on a hardware/entropy fault, so in
+    /// practice this never throws on the Mac — but it used to swallow that
+    /// fault into `Data()`, and because a non-throwing witness satisfies
+    /// `RemoteSigner`'s throwing requirement, `try? RemoteHandshake.makeHello`
+    /// could never fail either. That made `RemoteHost`'s guard against exactly
+    /// this dead code, and `makeHello`'s promise — a signing failure surfaces
+    /// as a failed handshake, never as a Hello carrying an empty signature —
+    /// false on the one implementation that actually ships. A peer would have
+    /// rejected the empty signature as a bad one, with no diagnostic at either
+    /// end.
+    public func sign(_ data: Data) throws -> Data {
+        try privateKey.signature(for: data).rawRepresentation
     }
 
     // MARK: - SPKI
