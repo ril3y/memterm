@@ -829,68 +829,89 @@ extension MemtermAppDelegate {
             }))
 
         // ---------------------------------------------------------------
-        // Founder 2026-09-21: a plain click on a PARKED chip must not
-        // unpark it. Parking is deliberate; reopening is right-click ▸
-        // Reopen (or the timeline card). Drives the chip's REAL mouseDown.
+        // Founder 2026-10-02: a parked workspace leaves the bar entirely and
+        // lives under Parked in the workspace menu.
+        //
+        // This leg replaces "parked-chip-click-ignored", which drove a real
+        // mouseDown on a parked chip to prove a click did not unpark it
+        // (founder 2026-09-21). That defect is now unreachable rather than
+        // guarded: there is no parked chip to click. The assertion below is
+        // the stronger one, so the older leg would be redundant even if a
+        // parked chip still existed to drive.
         // ---------------------------------------------------------------
-        final class ParkedClickProbe {
+        final class ParkedAbsentProbe {
             var workspaceId: String?
-            var settled = false
-            var stillParked = false
-            var activeUnchanged = false
+            var openChipCount = 0
+            var hasChipView = true
+            var inChipFrames = true
+            var listedUnderParked = false
+            var isParkedInStore = false
         }
-        let parkedClick = ParkedClickProbe()
+        let parkedAbsent = ParkedAbsentProbe()
         probe.add(ProbeStep(
-            name: "parked-chip-click-ignored", timeout: 8,
+            name: "parked-workspace-leaves-the-bar", timeout: 8,
             action: { [self] in
-                guard config.workspaceBar else { parkedClick.settled = true; return }
+                guard config.workspaceBar else { return }
                 guard let store = memory?.store else {
-                    probeFail("parked-click leg: no store")
+                    probeFail("parked-absent leg: no store")
                 }
                 let before = activeWorkspaceId
-                guard let id = createWorkspace(named: "ParkClick Probe") else {
-                    probeFail("parked-click leg: could not create a workspace")
+                guard let id = createWorkspace(named: "ParkAbsent Probe") else {
+                    probeFail("parked-absent leg: could not create a workspace")
                 }
-                parkedClick.workspaceId = id
+                parkedAbsent.workspaceId = id
                 if activeWorkspaceId != before { switchToWorkspace(before) }
                 parkWorkspace(id)
-                guard store.listWorkspaces().first(where: { $0.id == id })?.isParked == true else {
-                    probeFail("parked-click leg: workspace did not park")
+                parkedAbsent.isParkedInStore = store.listWorkspaces()
+                    .first(where: { $0.id == id })?.isParked == true
+
+                guard let host = keyHost(), let bar = host.workspaceBar else {
+                    probeFail("parked-absent leg: no workspace bar")
                 }
-                guard let host = keyHost(), let bar = host.workspaceBar,
-                      let chip = bar.probeChipView(id), bar.probeChipIsParked(id) else {
-                    probeFail("parked-click leg: no parked chip for the workspace")
-                }
-                let center = NSPoint(x: chip.bounds.midX, y: chip.bounds.midY)
-                guard let single = probeMouseEvent(.leftMouseDown, in: chip,
-                                                   at: center, clickCount: 1) else {
-                    probeFail("parked-click leg: could not synthesize the event")
-                }
-                chip.mouseDown(with: single)
-                // The (former) switch path hops to the main queue; give it a
-                // few turns so a regression would actually show up here.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-                    parkedClick.stillParked = store.listWorkspaces()
-                        .first(where: { $0.id == id })?.isParked == true
-                    parkedClick.activeUnchanged = (activeWorkspaceId == before)
-                    parkedClick.settled = true
+                // Both views the bar exposes must agree the chip is gone: the
+                // view itself, and the frame list the drag code resolves
+                // drops against. A chip missing from one but not the other
+                // would mean a drop could still target a parked workspace.
+                parkedAbsent.hasChipView = bar.probeChipView(id) != nil
+                let frames = bar.probeChipFrames()
+                parkedAbsent.inChipFrames = frames.contains { $0.id == id }
+                parkedAbsent.openChipCount = frames.count
+
+                // And it must be reachable from the menu, or parking it would
+                // simply lose it. Built through the real menu builder.
+                let menu = makeWorkspacePopUpMenu()
+                if let parkedItem = menu.items.first(where: { $0.title == "Parked" }),
+                   let submenu = parkedItem.submenu {
+                    parkedAbsent.listedUnderParked = submenu.items.contains {
+                        ($0.representedObject as? String) == id
+                    }
                 }
             },
-            condition: { parkedClick.settled },
             assert: { [self] in
-                defer { if let id = parkedClick.workspaceId { forgetWorkspace(id) } }
+                defer { if let id = parkedAbsent.workspaceId { forgetWorkspace(id) } }
                 guard config.workspaceBar else {
-                    probe.skipLine(step: "parked-chip-click-ignored", reason: "workspace_bar=false")
+                    probe.skipLine(step: "parked-workspace-leaves-the-bar", reason: "workspace_bar=false")
                     return
                 }
-                guard parkedClick.stillParked, parkedClick.activeUnchanged else {
-                    throw ProbeFailure("click on a parked chip unparked it: still_parked=\(parkedClick.stillParked) active_unchanged=\(parkedClick.activeUnchanged)")
+                print("UIPROBE-PARKED-ABSENT parked_in_store=\(parkedAbsent.isParkedInStore) chip_view=\(parkedAbsent.hasChipView) in_chip_frames=\(parkedAbsent.inChipFrames) open_chips=\(parkedAbsent.openChipCount) listed_under_parked=\(parkedAbsent.listedUnderParked)")
+                guard parkedAbsent.isParkedInStore else {
+                    throw ProbeFailure("the workspace did not park, so this leg proved nothing")
                 }
-                print("UIPROBE-PARKED-CLICK still_parked=true active_unchanged=true")
+                guard !parkedAbsent.hasChipView, !parkedAbsent.inChipFrames else {
+                    throw ProbeFailure("a parked workspace still has a chip: view=\(parkedAbsent.hasChipView) frames=\(parkedAbsent.inChipFrames)")
+                }
+                // Non-vacuous: the bar still shows the open workspaces, so
+                // this is not passing because the bar is empty.
+                guard parkedAbsent.openChipCount > 0 else {
+                    throw ProbeFailure("the bar lost every chip, not just the parked one")
+                }
+                guard parkedAbsent.listedUnderParked else {
+                    throw ProbeFailure("parking a workspace removed it from the bar without listing it under Parked")
+                }
             },
             onFailure: { [self] in
-                if let id = parkedClick.workspaceId { forgetWorkspace(id) }
-                print("UIPROBE-PARKED-CLICK still_parked=\(parkedClick.stillParked) active_unchanged=\(parkedClick.activeUnchanged)")
+                if let id = parkedAbsent.workspaceId { forgetWorkspace(id) }
+                print("UIPROBE-PARKED-ABSENT parked_in_store=\(parkedAbsent.isParkedInStore) chip_view=\(parkedAbsent.hasChipView) in_chip_frames=\(parkedAbsent.inChipFrames) open_chips=\(parkedAbsent.openChipCount) listed_under_parked=\(parkedAbsent.listedUnderParked)")
             }))
 
         // ---------------------------------------------------------------
@@ -4469,7 +4490,7 @@ extension MemtermAppDelegate {
     // NOT keep their window-sized GPU drawables resident.
 
     /// Cross-phase state for the single `hidden-windows-release-surfaces`
-    /// step (the leg is a timed sequence, like the parked-chip-click leg).
+    /// step (the leg is a timed sequence, unlike most).
     private final class HiddenSurfaceProbe {
         var settled = false
         var skipped = false

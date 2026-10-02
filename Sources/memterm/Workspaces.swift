@@ -415,6 +415,43 @@ extension MemtermAppDelegate {
     /// Council #1: a window sheet (never a screen-centered runModal), with a
     /// title that agrees with its buttons — the choice IS park vs forget, so
     /// the title asks exactly that — and destructive styling on Forget.
+    /// Choosing a workspace under Parked (founder ask 2026-10-02: "clicking
+    /// on one should bring up a question to restore, close etc").
+    ///
+    /// Deliberately NOT `confirmDeleteWorkspace`: that one offers Park, which
+    /// is meaningless for a workspace that is already parked. The verbs here
+    /// are the two things that can still happen to it, and "Forget" is the
+    /// word this app already uses for permanent deletion — including the
+    /// scrollback files — so it keeps that meaning rather than inventing a
+    /// gentler-sounding synonym for the destructive option.
+    func confirmParkedWorkspace(_ id: String) {
+        guard let store = memory?.store,
+              let workspace = store.listWorkspaces().first(where: { $0.id == id }),
+              let window = keyHost()?.window
+        else { return }
+        let alert = NSAlert()
+        alert.messageText = "Restore “\(workspace.name)”?"
+        alert.informativeText = """
+            Restore brings back its tabs, layout, and scrollback and switches \
+            to it. Forget removes them permanently, including the scrollback \
+            files on disk.
+            """
+        alert.addButton(withTitle: "Restore")
+        let forget = alert.addButton(withTitle: "Forget")
+        forget.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            switch response {
+            // Switching to a parked workspace is what un-parks it; that path
+            // already materializes its stored windows.
+            case .alertFirstButtonReturn: self.switchToWorkspace(workspace.id)
+            case .alertSecondButtonReturn: self.forgetWorkspace(workspace.id)
+            default: break
+            }
+        }
+    }
+
     func confirmDeleteWorkspace(_ id: String) {
         guard let store = memory?.store,
               let workspace = store.listWorkspaces().first(where: { $0.id == id }),
@@ -595,6 +632,11 @@ extension MemtermAppDelegate {
         parkWorkspace(id)
     }
 
+    @objc func parkedWorkspaceItem(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        confirmParkedWorkspace(id)
+    }
+
     @objc func reopenWorkspaceItem(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         switchToWorkspace(id)  // switching to a parked workspace reopens it
@@ -630,9 +672,13 @@ extension MemtermAppDelegate {
         guard let store = memory?.store else { return }
         let list = store.listWorkspaces()
 
-        for (i, workspace) in list.enumerated() {
-            let item = NSMenuItem(title: workspace.isParked ? "\(workspace.name) — parked"
-                                                            : workspace.name,
+        // The numbered list is the OPEN workspaces: the same set the bar
+        // shows. Parked ones moved to their own section below (founder ask
+        // 2026-10-02), which also stops ⌃⌘3 meaning "reopen something I
+        // parked" — every number now lands on a workspace that is already
+        // there.
+        for (i, workspace) in WorkspaceVisibility.barRows(list, activeId: activeWorkspaceId).enumerated() {
+            let item = NSMenuItem(title: workspace.name,
                                   action: #selector(switchWorkspaceItem(_:)),
                                   keyEquivalent: i < 9 ? String(i + 1) : "")
             item.keyEquivalentModifierMask = [.control, .command]  // ⌃⌘n (FR-52)
@@ -642,6 +688,30 @@ extension MemtermAppDelegate {
             item.image = Self.chipImage(hex: workspace.color)
             menu.addItem(item)
         }
+        menu.addItem(.separator())
+
+        // Parked: everything the bar no longer shows. Present but disabled
+        // when there are none, so the section does not appear and disappear
+        // under the pointer and a person can see that parking has somewhere
+        // to put things.
+        let parked = WorkspaceVisibility.parkedRows(list, activeId: activeWorkspaceId)
+        let parkedItem = NSMenuItem(title: "Parked", action: nil, keyEquivalent: "")
+        if parked.isEmpty {
+            parkedItem.isEnabled = false
+        } else {
+            let parkedMenu = NSMenu(title: "Parked")
+            for workspace in parked {
+                let item = NSMenuItem(title: workspace.name,
+                                      action: #selector(parkedWorkspaceItem(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.representedObject = workspace.id
+                item.image = Self.chipImage(hex: workspace.color)
+                parkedMenu.addItem(item)
+            }
+            parkedItem.submenu = parkedMenu
+        }
+        menu.addItem(parkedItem)
         menu.addItem(.separator())
 
         let left = String(UnicodeScalar(NSLeftArrowFunctionKey)!)
@@ -694,10 +764,14 @@ extension MemtermAppDelegate {
         let activity = workspaceActivityStates()
         var byId: [String: WorkspaceRow] = [:]
         for workspace in list { byId[workspace.id] = workspace }
+        // `byId` stays built from the FULL list: a host whose own workspace
+        // was just parked still needs its name for the gear tooltip, even
+        // though that workspace no longer has a chip.
+        let barRows = WorkspaceVisibility.barRows(list, activeId: activeWorkspaceId)
         for host in hosts {
             let workspace = host.workspaceId.flatMap { byId[$0] }
             host.updateGearTooltip(workspaceName: workspace?.name ?? "Workspace")
-            host.updateWorkspaceBar(workspaces: list, activeId: activeWorkspaceId,
+            host.updateWorkspaceBar(workspaces: barRows, activeId: activeWorkspaceId,
                                     activity: activity)
         }
         // Remote attach: this runs on every topology change the local chrome

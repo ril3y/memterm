@@ -227,7 +227,7 @@ check "fresh-default-capture-cells" "$LOG/probe-fresh-default.log" "UIPROBE-CAPT
 check "fresh-default-close-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CLOSE-CONFIRM closed=true rows_forgotten=true setting_now=false saved_false=true"
 check "fresh-default-cmdw-confirm" "$LOG/probe-fresh-default.log" "UIPROBE-CMDW-CONFIRM sheet=true cancelled=true tab_alive=true setting_kept_on=true"
 # Founder 2026-09-21: a plain click on a parked chip must not unpark it.
-check "fresh-default-parked-click" "$LOG/probe-fresh-default.log" "UIPROBE-PARKED-CLICK still_parked=true active_unchanged=true"
+check "fresh-default-parked-absent" "$LOG/probe-fresh-default.log" "UIPROBE-PARKED-ABSENT parked_in_store=true chip_view=false in_chip_frames=false open_chips=[1-9][0-9]* listed_under_parked=true"
 # Founder memory spike 2026-09-21: the scrollback flush rebuilds only dirty panes.
 check "fresh-default-scrollback-gate" "$LOG/probe-fresh-default.log" "UIPROBE-SCROLLBACK-GATE settle_calls=[0-9]+ rebuilt=1 of=[0-9]+ clean_after=true"
 # Founder 2026-09-21 (442 MB of IOSurface behind hidden workspace windows):
