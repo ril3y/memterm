@@ -21,15 +21,17 @@ final class AdapterRegistryTests: XCTestCase {
 
     // MARK: Registry shape
 
-    func testRegistryIsExactlyTheFiveCompiledInAdapters() {
-        let names = Adapters.registry(claudeProjectsDir: tempDir).map { type(of: $0).name }
-        XCTAssertEqual(names, ["claude", "ssh", "watcher", "serial", ""],
-                       "compiled-in registry: claude before the generic matchers; " +
+    func testRegistryIsExactlyTheSixCompiledInAdapters() {
+        let names = Adapters.registry(claudeProjectsDir: tempDir, codexSessionsDir: tempDir)
+            .map { type(of: $0).name }
+        XCTAssertEqual(names, ["claude", "codex", "ssh", "watcher", "serial", ""],
+                       "compiled-in registry: the coding agents before the generic matchers; " +
                        "serial + plain-shell registered but never argv-detected")
     }
 
     func testAdapterLookupByJournaledName() {
         XCTAssertTrue(Adapters.adapter(named: "claude") is ClaudeAdapter)
+        XCTAssertTrue(Adapters.adapter(named: "codex") is CodexAdapter)
         XCTAssertTrue(Adapters.adapter(named: "ssh") is SSHAdapter)
         XCTAssertTrue(Adapters.adapter(named: "watcher") is WatcherAdapter)
         XCTAssertTrue(Adapters.adapter(named: SerialAdapter.name) is SerialPaneAdapter)
@@ -39,6 +41,7 @@ final class AdapterRegistryTests: XCTestCase {
 
     func testFidelityClassesAndDegrade() {
         XCTAssertEqual(ClaudeAdapter(projectsDir: tempDir).fidelityClass, .sessionResume)
+        XCTAssertEqual(CodexAdapter(sessionsDir: tempDir).fidelityClass, .sessionResume)
         XCTAssertEqual(SSHAdapter().fidelityClass, .reexec)
         XCTAssertEqual(WatcherAdapter().fidelityClass, .reexec)
         XCTAssertEqual(SerialPaneAdapter().fidelityClass, .reconnect)

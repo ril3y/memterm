@@ -151,6 +151,57 @@ public struct ClaudeAdapter: PaneAdapter {
     }
 }
 
+/// The OpenAI Codex CLI adapter — Claude's sibling: a coding agent whose
+/// sessions resume losslessly by id. Detection recognizes the `codex` binary
+/// and its npm node entrypoint (`node …/bin/codex` / `…/codex.js`, which is
+/// what the pty's foreground job looks like for an npm install); session-id
+/// resolution delegates to the single ~/.codex parsing site on `Adapters`.
+public struct CodexAdapter: PaneAdapter {
+    public static let name = "codex"
+    public var fidelityClass: AdapterFidelity { .sessionResume }
+    public var restoresByReexec: Bool { false }
+
+    /// Injected for tests; defaults to the real ~/.codex/sessions.
+    public let sessionsDir: URL
+
+    public init(sessionsDir: URL = Adapters.defaultCodexSessionsDir) {
+        self.sessionsDir = sessionsDir
+    }
+
+    public func detect(_ context: AdapterDetectContext) -> AdapterState? {
+        guard let first = context.argv.first else { return nil }
+        let base = (first as NSString).lastPathComponent
+        guard base == "codex"
+            || (base == "node" && context.argv.dropFirst().contains {
+                let name = ($0 as NSString).lastPathComponent
+                return name == "codex" || name == "codex.js"
+            })
+        else { return nil }
+        var state: AdapterState = [:]
+        if let cwd = context.cwd,
+           let sessionId = Adapters.codexSessionId(forCwd: cwd, sessionsDir: sessionsDir) {
+            state["sessionId"] = sessionId
+        }
+        return state
+    }
+
+    /// Codex runs its agent in the CURRENT directory (its session id does not
+    /// carry the cwd back the way `claude --resume` does), so on FR-25's
+    /// fallback cwd BOTH offers are suppressed: resuming there would point a
+    /// coding agent at the wrong tree. `codex resume --last` is cwd-filtered
+    /// by Codex itself — "the most recent session here".
+    public func restoreCommand(for snapshot: SnapshotRow, cwdUnavailable: Bool) -> RestoreCommand? {
+        if cwdUnavailable { return nil }
+        if let sessionId = snapshot.adapterState["sessionId"],
+           Adapters.isValidCodexSessionId(sessionId) {
+            return RestoreCommand(label: "codex (\(sessionId.prefix(8))…)",
+                                  command: "codex resume \(sessionId)")
+        }
+        return RestoreCommand(label: "codex (most recent session here)",
+                              command: "codex resume --last")
+    }
+}
+
 /// FR-37 — SSH adapter: capture exact argv; restore by identical re-exec
 /// ("reconnect" — remote session state is honestly not restored). Reconnects
 /// are cwd-independent and survive a fallback cwd (FR-25).
@@ -257,9 +308,11 @@ public enum Adapters {
     /// string-matched; nothing outside this module can register into it).
     /// Detection order = declaration order: claude before the generic
     /// matchers; serial and plain-shell never detect.
-    public static func registry(claudeProjectsDir: URL = defaultClaudeProjectsDir)
+    public static func registry(claudeProjectsDir: URL = defaultClaudeProjectsDir,
+                                codexSessionsDir: URL = defaultCodexSessionsDir)
         -> [any PaneAdapter] {
         [ClaudeAdapter(projectsDir: claudeProjectsDir),
+         CodexAdapter(sessionsDir: codexSessionsDir),
          SSHAdapter(),
          WatcherAdapter(),
          SerialPaneAdapter(),
@@ -275,11 +328,13 @@ public enum Adapters {
 
     /// Classifies a foreground process; returns (adapter, adapter_state) or nil.
     public static func classify(argv: [String], cwd: String?,
-                                claudeProjectsDir: URL = defaultClaudeProjectsDir)
+                                claudeProjectsDir: URL = defaultClaudeProjectsDir,
+                                codexSessionsDir: URL = defaultCodexSessionsDir)
         -> (adapter: String, state: [String: String])? {
         guard let first = argv.first, !first.isEmpty else { return nil }
         let context = AdapterDetectContext(argv: argv, cwd: cwd)
-        for adapter in registry(claudeProjectsDir: claudeProjectsDir) {
+        for adapter in registry(claudeProjectsDir: claudeProjectsDir,
+                                codexSessionsDir: codexSessionsDir) {
             if let state = adapter.detect(context) {
                 return (type(of: adapter).name, state)
             }
@@ -358,6 +413,84 @@ public enum Adapters {
     public static func isValidClaudeSessionId(_ s: String) -> Bool {
         !s.isEmpty && s.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil
             && !s.hasPrefix("-")
+    }
+
+    // MARK: ~/.codex parsing — Codex's ONE version-fragile site
+    //
+    // Codex writes each session to <sessions>/YYYY/MM/DD/rollout-<ts>-<id>.jsonl
+    // whose FIRST line is {"type":"session_meta","payload":{"id":…,"cwd":…}}
+    // (verified against codex-cli 0.154). Parsed defensively like ~/.claude:
+    // a malformed file is skipped, never a crash, never a guess.
+
+    /// MEMTERM_CODEX_DIR/sessions (the probe seam, read per call like
+    /// MEMTERM_CLAUDE_DIR and never set outside automated runs), else
+    /// $CODEX_HOME/sessions when Codex's own override is set, else
+    /// ~/.codex/sessions.
+    public static var defaultCodexSessionsDir: URL {
+        if let dir = ProcessInfo.processInfo.environment["MEMTERM_CODEX_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: dir, isDirectory: true)
+                .appendingPathComponent("sessions")
+        }
+        if let home = ProcessInfo.processInfo.environment["CODEX_HOME"], !home.isEmpty {
+            return URL(fileURLWithPath: home, isDirectory: true)
+                .appendingPathComponent("sessions")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/sessions")
+    }
+
+    /// Rollouts examined per lookup, newest first. Capture polls every 2 s,
+    /// and a live session is always among the most recently written, so the
+    /// cap bounds the per-poll cost on a years-deep sessions tree.
+    static let codexRolloutScanLimit = 64
+
+    /// The id of the most recently written Codex session whose recorded cwd
+    /// is exactly `cwd`.
+    public static func codexSessionId(forCwd cwd: String,
+                                      sessionsDir: URL = defaultCodexSessionsDir) -> String? {
+        guard let walker = FileManager.default.enumerator(
+            at: sessionsDir, includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]) else { return nil }
+        let rollouts = walker.compactMap { $0 as? URL }
+            .filter { $0.pathExtension == "jsonl" && $0.lastPathComponent.hasPrefix("rollout-") }
+            .sorted { mtime($0) > mtime($1) }
+        for url in rollouts.prefix(codexRolloutScanLimit) {
+            guard let line = firstLine(of: url),
+                  let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  object["type"] as? String == "session_meta",
+                  let payload = object["payload"] as? [String: Any],
+                  payload["cwd"] as? String == cwd,
+                  let id = payload["id"] as? String, isValidCodexSessionId(id)
+            else { continue }
+            return id
+        }
+        return nil
+    }
+
+    /// Codex session ids are UUIDs; anything else (shell metacharacters, a
+    /// leading dash that would read as a flag) never reaches a command.
+    public static func isValidCodexSessionId(_ s: String) -> Bool {
+        s.range(of: "^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$",
+                options: .regularExpression) != nil
+    }
+
+    /// The first line of a file, read in chunks (Codex's session_meta line
+    /// carries ~20 KB of base instructions), capped at 1 MB.
+    private static func firstLine(of url: URL) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var buffer = Data()
+        while buffer.count < 1 << 20 {
+            guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else {
+                return buffer.isEmpty ? nil : buffer
+            }
+            if let newline = chunk.firstIndex(of: UInt8(ascii: "\n")) {
+                buffer.append(chunk[chunk.startIndex..<newline])
+                return buffer
+            }
+            buffer.append(chunk)
+        }
+        return nil
     }
 
     // MARK: ~/.claude scanning — SAME one version-fragile site (§8, FR-35)
