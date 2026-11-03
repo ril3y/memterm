@@ -915,6 +915,168 @@ extension MemtermAppDelegate {
             }))
 
         // ---------------------------------------------------------------
+        // Founder ask 2026-10-12: unparking must put every tab back in the
+        // directory it was in, so a coding agent (claude, codex) resumes
+        // against the right tree. Park closes the windows and kills the
+        // processes; unpark runs journal → resurrect. Asserted on KERNEL
+        // truth (the restored shells' real cwds), not the model's own
+        // lastKnownCwd — and the codex tab must come back offering ITS
+        // session, resolved from a fixture tree via the MEMTERM_CODEX_DIR
+        // seam (the founder's real ~/.codex is never read). The "codex"
+        // process is a symlink to /bin/sleep: argv[0] ends in /codex, which
+        // is all detection looks at.
+        // ---------------------------------------------------------------
+        final class ParkCwdProbe {
+            var workspaceId: String?
+            var returnTo: String?
+            var dirs: [String] = []          // realpath'd: kernel cwds are
+            var codexDir = ""                // /private/var/…, never /var/…
+            let codexId = "019e1f2a-3b4c-7d5e-8f60-718293a4b5c6"
+            var restoredCwds: [String] = []
+            var codexOffer: String?
+            var otherOffers: [String] = []
+        }
+        let parkCwd = ParkCwdProbe()
+
+        func realPath(_ url: URL) -> String {
+            guard let resolved = realpath(url.path, nil) else { return url.path }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        func panes(ofWorkspace id: String?) -> [PaneView] {
+            controllers.filter { $0.workspaceId == id }.flatMap { $0.allPanes() }
+        }
+        func kernelCwd(_ pane: PaneView) -> String? {
+            guard let process = pane.process, process.running else { return nil }
+            return ProcessInspector.cwd(of: process.shellPid)
+        }
+        func cleanUpParkCwd() {
+            if let back = parkCwd.returnTo, activeWorkspaceId != back { switchToWorkspace(back) }
+            if let id = parkCwd.workspaceId { forgetWorkspace(id) }
+            parkCwd.workspaceId = nil
+            unsetenv("MEMTERM_CODEX_DIR")
+        }
+
+        probe.addStateful(ProbeStep(
+            name: "park-unpark-setup", timeout: 15,
+            action: { [self] in
+                let fm = FileManager.default
+                let base = MemoryEngine.baseDir
+                    .appendingPathComponent("park-cwd-probe-\(UUID().uuidString.prefix(8))")
+                let alpha = base.appendingPathComponent("alpha dir")   // a space, on purpose
+                let beta = base.appendingPathComponent("beta")
+                let bin = base.appendingPathComponent("bin")
+                do {
+                    for dir in [alpha, beta, bin] {
+                        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                    }
+                    try fm.createSymbolicLink(atPath: bin.appendingPathComponent("codex").path,
+                                              withDestinationPath: "/bin/sleep")
+                } catch {
+                    probeFail("park-unpark leg: fixture dirs: \(error)")
+                }
+                parkCwd.dirs = [realPath(alpha), realPath(beta)]
+                parkCwd.codexDir = parkCwd.dirs[1]
+
+                // Fixture Codex tree: one rollout whose session_meta names
+                // the beta dir — the shape codex-cli writes.
+                let codexRoot = base.appendingPathComponent("codex")
+                let day = codexRoot.appendingPathComponent("sessions/2026/10/12")
+                do {
+                    try fm.createDirectory(at: day, withIntermediateDirectories: true)
+                    let meta = "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"\(parkCwd.codexDir)\",\"id\":\"\(parkCwd.codexId)\"}}\n"
+                    try meta.write(to: day.appendingPathComponent(
+                        "rollout-2026-10-12T10-00-00-\(parkCwd.codexId).jsonl"),
+                        atomically: true, encoding: .utf8)
+                } catch {
+                    probeFail("park-unpark leg: codex fixture: \(error)")
+                }
+                setenv("MEMTERM_CODEX_DIR", codexRoot.path, 1)
+
+                parkCwd.returnTo = activeWorkspaceId
+                guard let id = createWorkspace(named: "ParkCwd Probe") else {
+                    probeFail("park-unpark leg: could not create a workspace")
+                }
+                parkCwd.workspaceId = id
+                // Two plain tabs in the (inactive) workspace, the way the
+                // kit's openTab places them: a hidden holder host.
+                let holder = makeHost(frame: nil)
+                for dir in parkCwd.dirs {
+                    let tab = TerminalWindowController(app: self, workspaceId: id,
+                                                       initialCwd: dir)
+                    registerController(tab)
+                    holder.attach(tab, select: true)
+                }
+                materializedWorkspaceIds.insert(id)
+                memory?.scheduleTopologySave()
+                // Single-quoted: the probe's own paths never contain a quote.
+                let codexBin = bin.appendingPathComponent("codex").path
+                panes(ofWorkspace: id).last?.send(txt: "'\(codexBin)' 600\r")
+            },
+            condition: {
+                // Both shells really in their dirs, and the codex stand-in in
+                // the foreground of the beta tab — park's capture needs both.
+                let live = panes(ofWorkspace: parkCwd.workspaceId)
+                guard live.count == 2,
+                      Set(live.compactMap(kernelCwd)) == Set(parkCwd.dirs),
+                      let beta = live.first(where: { kernelCwd($0) == parkCwd.codexDir }),
+                      let process = beta.process,
+                      let fg = ProcessInspector.foregroundPgid(masterFd: process.childfd),
+                      let argv = ProcessInspector.argv(of: fg)
+                else { return false }
+                return argv.first?.hasSuffix("/codex") == true
+            },
+            assert: {},
+            onFailure: {
+                let live = panes(ofWorkspace: parkCwd.workspaceId)
+                print("UIPROBE-PARK-CWD setup panes=\(live.count) kernel_cwds=\(live.map { kernelCwd($0) ?? "nil" }) want=\(parkCwd.dirs)")
+                cleanUpParkCwd()
+            }))
+
+        probe.addStateful(ProbeStep(
+            name: "park-unpark-restores-cwds", timeout: 20,
+            action: { [self] in
+                guard let id = parkCwd.workspaceId else {
+                    probeFail("park-unpark leg: setup left no workspace")
+                }
+                parkWorkspace(id)
+                guard memory?.store.listWorkspaces().first(where: { $0.id == id })?.isParked == true,
+                      panes(ofWorkspace: id).isEmpty else {
+                    probeFail("park-unpark leg: the workspace did not park (panes still live: \(panes(ofWorkspace: id).count))")
+                }
+                switchToWorkspace(id)  // switching to a parked workspace reopens it
+            },
+            condition: {
+                let restored = panes(ofWorkspace: parkCwd.workspaceId)
+                return restored.count == 2 && restored.allSatisfy { kernelCwd($0) != nil }
+            },
+            assert: {
+                defer { cleanUpParkCwd() }
+                let restored = panes(ofWorkspace: parkCwd.workspaceId)
+                parkCwd.restoredCwds = restored.compactMap(kernelCwd)
+                parkCwd.codexOffer = restored
+                    .first { kernelCwd($0) == parkCwd.codexDir }?.pendingResumeCommand
+                parkCwd.otherOffers = restored
+                    .filter { kernelCwd($0) != parkCwd.codexDir }
+                    .compactMap(\.pendingResumeCommand)
+                print("UIPROBE-PARK-CWD restored_cwds=\(parkCwd.restoredCwds.sorted()) codex_offer=\(parkCwd.codexOffer ?? "nil") other_offers=\(parkCwd.otherOffers)")
+                guard Set(parkCwd.restoredCwds) == Set(parkCwd.dirs) else {
+                    throw ProbeFailure("unpark restored shells in \(parkCwd.restoredCwds.sorted()), not the parked dirs \(parkCwd.dirs.sorted())")
+                }
+                guard parkCwd.codexOffer == "codex resume \(parkCwd.codexId)" else {
+                    throw ProbeFailure("the codex tab offered \(parkCwd.codexOffer ?? "nothing"), not codex resume \(parkCwd.codexId)")
+                }
+                // Non-vacuous the other way: the plain-shell tab offers nothing.
+                guard parkCwd.otherOffers.isEmpty else {
+                    throw ProbeFailure("a plain-shell tab came back with an offer: \(parkCwd.otherOffers)")
+                }
+            },
+            onFailure: {
+                print("UIPROBE-PARK-CWD restored_cwds=\(panes(ofWorkspace: parkCwd.workspaceId).map { kernelCwd($0) ?? "nil" }) want=\(parkCwd.dirs) codex_offer=\(String(describing: parkCwd.codexOffer))")
+                cleanUpParkCwd()
+            }))
+
+        // ---------------------------------------------------------------
         // Random workspace colors (founder polish 2026-09-01): every NEW
         // workspace draws a preset no existing workspace is using — repeats
         // are legal only once all six presets are taken. Exercises the REAL

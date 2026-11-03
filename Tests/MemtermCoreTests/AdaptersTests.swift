@@ -102,6 +102,115 @@ final class AdaptersTests: XCTestCase {
                                               projectsDir: tempDir))
     }
 
+    // MARK: Codex
+
+    func testClassifyCodexBinaryAndNodeEntrypoint() {
+        for argv in [["codex"],
+                     ["/opt/homebrew/bin/codex", "--model", "o3"],
+                     ["node", "/Users/riley/.nvm/versions/node/v22/bin/codex"],
+                     ["node", "/usr/local/lib/node_modules/@openai/codex/bin/codex.js"]] {
+            let hit = Adapters.classify(argv: argv, cwd: nil, claudeProjectsDir: tempDir,
+                                        codexSessionsDir: tempDir)
+            XCTAssertEqual(hit?.adapter, "codex", "argv: \(argv)")
+            XCTAssertEqual(hit?.state, [:], "no cwd → no session id")
+        }
+        XCTAssertNil(Adapters.classify(argv: ["node", "codexify.js"], cwd: nil,
+                                       claudeProjectsDir: tempDir, codexSessionsDir: tempDir))
+    }
+
+    /// Writes a Codex rollout file the way Codex does: date-nested dirs, a
+    /// session_meta first line naming the session id and its cwd.
+    private func makeCodexRollout(id: String, cwd: String, age: TimeInterval,
+                                  day: String = "2026/10/12",
+                                  firstLine: String? = nil) throws {
+        let dir = tempDir.appendingPathComponent(day)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("rollout-2026-10-12T10-00-00-\(id).jsonl")
+        // Codex's real first line is ~20 KB (base_instructions) — keep the
+        // padding so a reader that only peeks at a small prefix fails here.
+        let padding = String(repeating: "x", count: 30_000)
+        let meta = firstLine ?? """
+            {"type":"session_meta","payload":{"base_instructions":"\(padding)","cwd":"\(cwd)","id":"\(id)"}}
+            """
+        try (meta + "\n{\"type\":\"turn\"}\n").write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -age)], ofItemAtPath: url.path)
+    }
+
+    func testCodexSessionIdPicksNewestRolloutForThisCwd() throws {
+        let cwd = "/Volumes/proj x"
+        try makeCodexRollout(id: "019caf03-0a24-7f23-bd21-f6a269cbf569", cwd: cwd, age: 7200,
+                             day: "2026/10/01")
+        try makeCodexRollout(id: "019caf04-bd2f-74b2-bf87-a687c733ebbb", cwd: cwd, age: 600)
+        // Newer, but another project's session: never chosen for this cwd.
+        try makeCodexRollout(id: "01a0cb0d-00be-7712-a933-df7fa4d592b0", cwd: "/elsewhere",
+                             age: 10)
+        // Newest of all, but malformed: skipped, never a crash or a guess.
+        try makeCodexRollout(id: "01a0cb0d-0000-7712-a933-df7fa4d592b0", cwd: cwd, age: 1,
+                             firstLine: "not json")
+
+        XCTAssertEqual(Adapters.codexSessionId(forCwd: cwd, sessionsDir: tempDir),
+                       "019caf04-bd2f-74b2-bf87-a687c733ebbb")
+
+        let hit = Adapters.classify(argv: ["codex"], cwd: cwd, claudeProjectsDir: tempDir,
+                                    codexSessionsDir: tempDir)
+        XCTAssertEqual(hit?.state["sessionId"], "019caf04-bd2f-74b2-bf87-a687c733ebbb")
+    }
+
+    func testCodexSessionIdNilWithoutAMatchingRollout() throws {
+        XCTAssertNil(Adapters.codexSessionId(forCwd: "/a", sessionsDir:
+                                                tempDir.appendingPathComponent("missing")))
+        try makeCodexRollout(id: "019caf03-0a24-7f23-bd21-f6a269cbf569", cwd: "/b", age: 5)
+        XCTAssertNil(Adapters.codexSessionId(forCwd: "/a", sessionsDir: tempDir))
+    }
+
+    func testCodexSessionsDirHonorsProbeSeamThenCodexHome() {
+        let saved = (ProcessInfo.processInfo.environment["MEMTERM_CODEX_DIR"],
+                     ProcessInfo.processInfo.environment["CODEX_HOME"])
+        defer {
+            if let v = saved.0 { setenv("MEMTERM_CODEX_DIR", v, 1) } else { unsetenv("MEMTERM_CODEX_DIR") }
+            if let v = saved.1 { setenv("CODEX_HOME", v, 1) } else { unsetenv("CODEX_HOME") }
+        }
+        setenv("CODEX_HOME", "/opt/codex-home", 1)
+        unsetenv("MEMTERM_CODEX_DIR")
+        XCTAssertEqual(Adapters.defaultCodexSessionsDir.path, "/opt/codex-home/sessions")
+        // The probe seam wins: fixture runs never read the real Codex tree.
+        setenv("MEMTERM_CODEX_DIR", "/tmp/fixture-codex", 1)
+        XCTAssertEqual(Adapters.defaultCodexSessionsDir.path, "/tmp/fixture-codex/sessions")
+    }
+
+    func testCodexResumeOffers() {
+        let id = "019caf04-bd2f-74b2-bf87-a687c733ebbb"
+        let resumable = SnapshotRow(exe: "codex", argv: ["codex"], adapter: "codex",
+                                    adapterState: ["sessionId": id])
+        XCTAssertEqual(Adapters.resumeOffer(for: resumable)?.command, "codex resume \(id)")
+
+        let unknown = SnapshotRow(exe: "codex", argv: ["codex"], adapter: "codex",
+                                  adapterState: [:])
+        XCTAssertEqual(Adapters.resumeOffer(for: unknown)?.command, "codex resume --last")
+        XCTAssertEqual(Adapters.resumeOffer(for: unknown)?.label,
+                       "codex (most recent session here)")
+
+        for bad in ["abc; sudo rm -rf ~", "a b", "id$(reboot)", "--last", ""] {
+            let snap = SnapshotRow(exe: "codex", argv: ["codex"], adapter: "codex",
+                                   adapterState: ["sessionId": bad])
+            XCTAssertEqual(Adapters.resumeOffer(for: snap)?.command, "codex resume --last",
+                           "malformed sessionId \(bad) must not be interpolated")
+        }
+    }
+
+    func testCodexOffersSuppressedWhenCwdFellBack() {
+        // Codex runs its agent in the CURRENT directory: resuming in a
+        // fallback cwd would point a coding agent at the wrong tree. Unlike
+        // claude --resume, neither offer survives FR-25's fallback.
+        let resumable = SnapshotRow(exe: "codex", argv: ["codex"], adapter: "codex",
+                                    adapterState: ["sessionId": "019caf04-bd2f-74b2-bf87-a687c733ebbb"])
+        XCTAssertNil(Adapters.resumeOffer(for: resumable, cwdUnavailable: true))
+        let continuable = SnapshotRow(exe: "codex", argv: ["codex"], adapter: "codex",
+                                      adapterState: [:])
+        XCTAssertNil(Adapters.resumeOffer(for: continuable, cwdUnavailable: true))
+    }
+
     // MARK: Resume offers
 
     func testClaudeResumeOfferUsesSessionId() {
