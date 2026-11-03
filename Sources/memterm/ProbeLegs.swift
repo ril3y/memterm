@@ -915,6 +915,101 @@ extension MemtermAppDelegate {
             }))
 
         // ---------------------------------------------------------------
+        // Founder bug 2026-10-24: "if you try to make the window slimmer but
+        // have lots of workspaces it won't allow it". The chip row held its
+        // full width and so set the window's minimum. Now it compacts
+        // (WorkspaceBarCompaction, L1-tested; this leg proves the real bar
+        // and window follow it). Narrow a real window with eight workspaces
+        // open: it must actually get that narrow, the visible row must fit
+        // in front of the gear, something must have compacted, and the
+        // active chip must still be on the bar. Widened again, every chip
+        // must be back to its full name.
+        // ---------------------------------------------------------------
+        final class CompactionProbe {
+            var created: [String] = []
+            var savedFrame: NSRect?
+            var report = ""
+        }
+        let compaction = CompactionProbe()
+        probe.add(ProbeStep(
+            name: "narrow-window-compacts-workspace-bar", timeout: 8,
+            action: { [self] in
+                guard config.workspaceBar else { return }
+                let before = activeWorkspaceId
+                for n in 1...7 {
+                    guard let id = createWorkspace(named: "Compact\(n)") else {
+                        probeFail("compaction leg: could not create a workspace")
+                    }
+                    compaction.created.append(id)
+                }
+                if activeWorkspaceId != before { switchToWorkspace(before) }
+            },
+            assert: { [self] in
+                defer {
+                    for id in compaction.created { forgetWorkspace(id) }
+                    if let frame = compaction.savedFrame { keyHost()?.window?.setFrame(frame, display: false) }
+                }
+                guard config.workspaceBar else {
+                    probe.skipLine(step: "narrow-window-compacts-workspace-bar", reason: "workspace_bar=false")
+                    return
+                }
+                guard let host = keyHost(), let window = host.window, let bar = host.workspaceBar else {
+                    throw ProbeFailure("no key window with a workspace bar")
+                }
+                compaction.savedFrame = window.frame
+
+                func settle(width: CGFloat) {
+                    var frame = window.frame
+                    frame.size.width = width
+                    window.setFrame(frame, display: true)
+                    window.layoutIfNeeded()
+                    window.contentView?.layoutSubtreeIfNeeded()
+                }
+
+                let narrow: CGFloat = 380
+                settle(width: narrow)
+                let barWidth = bar.bounds.width
+                let rowMaxX = bar.probeRowMaxX()
+                // The defect itself: the window refused to get narrower.
+                guard window.frame.width <= narrow + 1 else {
+                    throw ProbeFailure("the window stayed \(window.frame.width) wide when set to \(narrow): the workspace bar is holding it open")
+                }
+                guard let plan = bar.probeCompactionPlan() else {
+                    throw ProbeFailure("the bar made no compaction plan")
+                }
+                let compacted = plan.modes.values.filter { $0 != .full }.count
+                let activeChip = bar.probeChipView(activeWorkspaceId)
+                compaction.report = "narrow window_w=\(window.frame.width) bar_w=\(barWidth) row_max_x=\(rowMaxX) title=\(plan.showTitle) compacted=\(compacted) active_cap=\(plan.activeMaxWidth.map { String($0) } ?? "none") overflow=\(plan.overflow.count)"
+                print("UIPROBE-BAR-COMPACT \(compaction.report)")
+                guard rowMaxX <= barWidth - 44 + 1 else {
+                    throw ProbeFailure("the chip row runs to \(rowMaxX), under the gear (bar \(barWidth) wide)")
+                }
+                // Non-vacuous: eight workspaces cannot fit at full width here.
+                guard compacted > 0 || !plan.overflow.isEmpty else {
+                    throw ProbeFailure("nothing compacted at \(narrow) wide, so this leg proved nothing")
+                }
+                guard let activeChip, !activeChip.isHidden,
+                      !plan.overflow.contains(activeWorkspaceId) else {
+                    throw ProbeFailure("the active workspace's chip left the bar")
+                }
+
+                settle(width: 2400)
+                guard let wide = bar.probeCompactionPlan() else {
+                    throw ProbeFailure("no plan after widening")
+                }
+                print("UIPROBE-BAR-COMPACT wide window_w=\(window.frame.width) title=\(wide.showTitle) compacted=\(wide.modes.values.filter { $0 != .full }.count) overflow=\(wide.overflow.count)")
+                guard wide.showTitle, wide.overflow.isEmpty, wide.activeMaxWidth == nil,
+                      wide.modes.values.allSatisfy({ $0 == .full }) else {
+                    throw ProbeFailure("widening did not bring every chip back to full: \(wide)")
+                }
+            },
+            onFailure: { [self] in
+                for id in compaction.created { forgetWorkspace(id) }
+                if let frame = compaction.savedFrame { keyHost()?.window?.setFrame(frame, display: false) }
+                print("UIPROBE-BAR-COMPACT \(compaction.report)")
+            }))
+
+        // ---------------------------------------------------------------
         // Random workspace colors (founder polish 2026-09-01): every NEW
         // workspace draws a preset no existing workspace is using — repeats
         // are legal only once all six presets are taken. Exercises the REAL

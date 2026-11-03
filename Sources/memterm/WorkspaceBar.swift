@@ -47,6 +47,13 @@ final class WorkspaceBarView: NSVisualEffectView {
     }()
     private var chipsById: [String: WorkspaceChipView] = [:]
     private let leadingInset: CGFloat
+    /// Founder bug 2026-10-24: chips that don't fit move here (the
+    /// compaction plan's last step) instead of holding the window wide.
+    private let overflowButton = NSButton()
+    /// Trailing clearance for the gear (see the constraints in init).
+    private static let trailingClearance: CGFloat = 44
+    private var currentPlan: WorkspaceBarCompaction.Plan?
+    private var plannedWidth: CGFloat = -1
 
     /// `leadingInset`: where the chip row starts. Under the custom chrome the
     /// bar is the TOP chrome row of a plain window, so the host passes the
@@ -71,7 +78,23 @@ final class WorkspaceBarView: NSVisualEffectView {
         stack.alignment = .centerY
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
+        // The row must never set the window's minimum width: when it is
+        // short of room it compacts (relayoutChips), and past the last step
+        // it clips rather than pushing back on the window.
+        stack.setClippingResistancePriority(.defaultLow, for: .horizontal)
         addSubview(stack)
+
+        overflowButton.title = ""
+        overflowButton.image = NSImage(systemSymbolName: "chevron.right.2",
+                                       accessibilityDescription: "More Workspaces")
+        overflowButton.isBordered = false
+        overflowButton.setButtonType(.momentaryChange)
+        overflowButton.contentTintColor = .secondaryLabelColor
+        overflowButton.toolTip = "More workspaces"
+        overflowButton.target = self
+        overflowButton.action = #selector(showOverflowMenu(_:))
+        overflowButton.translatesAutoresizingMaskIntoConstraints = false
+        overflowButton.isHidden = true
 
         addButton.title = ""
         addButton.image = NSImage(systemSymbolName: "plus",
@@ -96,7 +119,8 @@ final class WorkspaceBarView: NSVisualEffectView {
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leadingInset),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -0.5),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -44),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor,
+                                            constant: -Self.trailingClearance),
         ])
     }
 
@@ -151,6 +175,7 @@ final class WorkspaceBarView: NSVisualEffectView {
                                isParked: workspace.isParked,
                                activity: activity[workspace.id] ?? .idle)
             }
+            relayoutChips(force: true)  // a rename or switch changes widths
             return
         }
         // The set or order changed: a rebuild is needed — but never under an
@@ -179,7 +204,85 @@ final class WorkspaceBarView: NSVisualEffectView {
             stack.addArrangedSubview(chip)
         }
         chipsById = kept
+        stack.addArrangedSubview(overflowButton)
         stack.addArrangedSubview(addButton)
+        relayoutChips(force: true)
+    }
+
+    // MARK: - Compaction (founder bug 2026-10-24)
+
+    override func layout() {
+        super.layout()
+        relayoutChips(force: false)
+    }
+
+    /// Fits the chips into the bar's current width with
+    /// WorkspaceBarCompaction's plan (title, then initials, then dots, then
+    /// the active name, then overflow). Runs on every width change and every
+    /// update; a no-op when neither the width nor the plan changed.
+    private func relayoutChips(force: Bool) {
+        let width = bounds.width
+        guard force || width != plannedWidth else { return }
+        plannedWidth = width
+        let chips = stack.arrangedSubviews.compactMap { $0 as? WorkspaceChipView }
+        guard !chips.isEmpty else { return }
+        let available = Double(width - leadingInset - Self.trailingClearance)
+        let plan = WorkspaceBarCompaction.plan(
+            available: available,
+            titleWidth: Double(titleLabel.intrinsicContentSize.width),
+            addWidth: Double(addButton.intrinsicContentSize.width),
+            overflowWidth: Double(overflowButton.intrinsicContentSize.width),
+            spacing: Double(stack.spacing),
+            minActiveWidth: Double(WorkspaceChipView.minimumActiveWidth(metrics)),
+            chips: chips.map { chip in
+                WorkspaceBarCompaction.Chip(
+                    id: chip.workspaceId,
+                    fullWidth: Double(chip.naturalWidth(for: .full)),
+                    initialsWidth: Double(chip.naturalWidth(for: .initials)),
+                    dotWidth: Double(chip.naturalWidth(for: .dot)),
+                    isActive: chip.isActive)
+            })
+        guard force || plan != currentPlan else { return }
+        currentPlan = plan
+        titleLabel.isHidden = !plan.showTitle
+        for chip in chips {
+            // Never compact or hide a chip mid-rename: its editor is up.
+            if chip.probeIsEditing { continue }
+            chip.isHidden = plan.overflow.contains(chip.workspaceId)
+            chip.setDisplay(mode: plan.modes[chip.workspaceId] ?? .full,
+                            maxWidth: chip.isActive ? plan.activeMaxWidth.map { CGFloat($0) } : nil)
+        }
+        overflowButton.isHidden = plan.overflow.isEmpty
+    }
+
+    @objc private func showOverflowMenu(_ sender: NSButton) {
+        guard let plan = currentPlan else { return }
+        let menu = NSMenu(title: "More Workspaces")
+        for id in plan.overflow {
+            guard let chip = chipsById[id] else { continue }
+            let item = NSMenuItem(title: chip.workspaceName,
+                                  action: #selector(switchFromOverflow(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = id
+            item.image = chip.menuDotImage
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    @objc private func switchFromOverflow(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        DispatchQueue.main.async { [weak app] in app?.switchToWorkspace(id) }
+    }
+
+    /// MEMTERM_UI_PROBE support: the plan the bar is drawing right now.
+    func probeCompactionPlan() -> WorkspaceBarCompaction.Plan? { currentPlan }
+
+    /// MEMTERM_UI_PROBE support: the visible row's right edge, bar coords.
+    func probeRowMaxX() -> CGFloat {
+        stack.arrangedSubviews.filter { !$0.isHidden }
+            .map { $0.convert($0.bounds, to: self).maxX }.max() ?? 0
     }
 
     func beginRename(workspaceId: String) {
@@ -281,6 +384,12 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     private var closeSize: NSLayoutConstraint!
     private var labelBaseline: NSLayoutConstraint!
     private var chipHeight: NSLayoutConstraint!
+    private var labelMaxWidth: NSLayoutConstraint!
+    /// Founder bug 2026-10-24: how much of the name the bar has room for.
+    private(set) var displayMode: WorkspaceChipMode = .full
+    private var maxWidth: CGFloat?
+    /// The label's widest full name (the pre-compaction cap).
+    private static let fullLabelMax: CGFloat = 220
 
     private static let pulseKey = "memterm.chip.pulse"
 
@@ -337,7 +446,6 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
             // glyph band (council #10 dropped the chips one size below the
             // tab pills; 4.25 was the size-11 tuning, scaled 10/11); the
             // probe's chip-vertical-centering step gates the rendered result.
-            label.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeSize,
@@ -347,6 +455,8 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         labelBaseline = label.firstBaselineAnchor.constraint(equalTo: centerYAnchor,
                                                              constant: 3.85)
         labelBaseline.isActive = true
+        labelMaxWidth = label.widthAnchor.constraint(lessThanOrEqualToConstant: Self.fullLabelMax)
+        labelMaxWidth.isActive = true
         setContentHuggingPriority(.required, for: .horizontal)
         apply(metrics: metrics, force: true)
     }
@@ -361,7 +471,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         chipHeight.constant = CGFloat(metrics.chipHeight)
         dotSize.constant = (8 * s).rounded()
         ringSize.constant = (14 * s).rounded()
-        closeSize.constant = (13 * s).rounded()
+        closeSize.constant = displayMode == .full ? (13 * s).rounded() : 0
         labelBaseline.constant = CGFloat(metrics.chipBaselineOffset)
         layer?.cornerRadius = (5 * s).rounded()
         dot.layer?.cornerRadius = dotSize.constant / 2
@@ -419,6 +529,72 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
+    var workspaceName: String { name }
+
+    /// The chip's color dot, for the overflow menu's items.
+    var menuDotImage: NSImage {
+        let size = NSSize(width: 10, height: 10)
+        let color = dotColor
+        return NSImage(size: size, flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
+            return true
+        }
+    }
+
+    // MARK: - Compaction (founder bug 2026-10-24)
+
+    /// Fixed chip parts around the label: leading 7, the dot, 5 to the
+    /// label, 2 to the ✕, the ✕, trailing 4 (the constraints in init).
+    private func chrome(closeWidth: CGFloat) -> CGFloat {
+        7 + dotSize.constant + 5 + 2 + closeWidth + 4
+    }
+
+    private static let measuringLabel = NSTextField(labelWithString: "")
+
+    private func labelWidth(_ text: NSAttributedString) -> CGFloat {
+        Self.measuringLabel.attributedStringValue = text
+        return ceil(Self.measuringLabel.intrinsicContentSize.width)
+    }
+
+    /// The chip's width when drawn in `mode`, uncapped.
+    func naturalWidth(for mode: WorkspaceChipMode) -> CGFloat {
+        switch mode {
+        case .full:
+            return chrome(closeWidth: (13 * CGFloat(metrics.scale)).rounded())
+                + min(labelWidth(title(for: .full)), Self.fullLabelMax)
+        case .initials:
+            return chrome(closeWidth: 0) + labelWidth(title(for: .initials))
+        case .dot:
+            return chrome(closeWidth: 0)
+        }
+    }
+
+    /// The narrowest the active chip may get: its dot plus about three
+    /// characters of name and an ellipsis.
+    static func minimumActiveWidth(_ metrics: ChromeMetrics) -> CGFloat {
+        let s = CGFloat(metrics.scale)
+        return (7 + 8 * s).rounded() + 5 + 2 + (13 * s).rounded() + 4 + (30 * s).rounded()
+    }
+
+    /// Applies a compaction step. `maxWidth` caps the whole chip (only the
+    /// active chip gets one); the label truncates with an ellipsis inside it.
+    func setDisplay(mode: WorkspaceChipMode, maxWidth: CGFloat?) {
+        guard mode != displayMode || maxWidth != self.maxWidth else { return }
+        displayMode = mode
+        self.maxWidth = maxWidth
+        let closeWidth = mode == .full ? (13 * CGFloat(metrics.scale)).rounded() : 0
+        closeSize.constant = closeWidth
+        closeButton.isHidden = mode != .full
+        label.isHidden = mode == .dot && editor == nil
+        if let maxWidth {
+            labelMaxWidth.constant = max(0, min(Self.fullLabelMax, maxWidth - chrome(closeWidth: closeWidth)))
+        } else {
+            labelMaxWidth.constant = Self.fullLabelMax
+        }
+        refreshTitle()
+    }
+
     var probeTitle: String {
         "\(name)\(isActive ? "*" : "")\(isParked ? "(parked)" : "")"
     }
@@ -458,7 +634,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         // it) — belt and braces on top of the center's own guard.
         applyActivity(isActive ? .idle : activity)
         toolTip = isParked ? "\(name) — parked. Right-click ▸ Reopen."
-            : isActive ? "Double-click to rename" : "Switch to \(name)"
+            : isActive ? "\(name) — double-click to rename" : "Switch to \(name)"
         closeButton.toolTip = isParked ? "Forget \(name)…" : "Park \(name) (keeps its memory)"
     }
 
@@ -467,21 +643,32 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     /// ChromeMetrics scales both), medium at heaviest — so the two rows read
     /// as workspace context over tab content, not two tab bars.
     private func refreshTitle() {
+        label.attributedStringValue = title(for: displayMode)
+    }
+
+    /// The label text for a display mode; a dot chip has none.
+    private func title(for mode: WorkspaceChipMode) -> NSAttributedString {
         let dimmed = isParked && !isActive
+        let text: String
+        switch mode {
+        case .full: text = name
+        case .initials: text = WorkspaceBarCompaction.initials(for: name)
+        case .dot: return NSAttributedString()
+        }
         let title = NSMutableAttributedString(
-            string: name,
+            string: text,
             attributes: [.foregroundColor: isActive ? NSColor.labelColor
                             : dimmed ? NSColor.tertiaryLabelColor
                             : NSColor.secondaryLabelColor,
                          .font: NSFont.systemFont(ofSize: CGFloat(metrics.chipFontSize),
                                                   weight: isActive ? .medium : .regular)])
-        if isParked {
+        if isParked, mode == .full {
             title.append(NSAttributedString(
                 string: "  (parked)",
                 attributes: [.foregroundColor: NSColor.tertiaryLabelColor,
                              .font: NSFont.systemFont(ofSize: CGFloat(metrics.chipSuffixFontSize))]))
         }
-        label.attributedStringValue = title
+        return title
     }
 
     /// Founder 2026-09-02: the ring means "output you haven't seen" — which
@@ -658,7 +845,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         let newName = field.stringValue.trimmingCharacters(in: .whitespaces)
         field.removeFromSuperview()
         editor = nil
-        label.isHidden = false
+        label.isHidden = displayMode == .dot
         if !renameCancelled, !newName.isEmpty, newName != name {
             app.memory?.store.renameWorkspace(workspaceId, name: newName)
             app.rebuildWorkspaceMenu()
