@@ -2419,6 +2419,9 @@ extension MemtermAppDelegate {
                         v = view.superview
                     }
                     print("UIPROBE-SCROLLUX pane_chain=\(chain.joined(separator: " < "))")
+                    let tail = pane.scrollbackText(maxLines: 12)
+                        .split(separator: "\n", omittingEmptySubsequences: false).suffix(12)
+                    print("UIPROBE-SCROLLUX pane_tail=\(tail.map { String($0) })")
                 }
             }))
 
