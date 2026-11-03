@@ -189,7 +189,60 @@ class PaneView: LocalProcessTerminalView {
               let controller = host.tab(containing: self) else {
             return super.menu(for: event)
         }
-        return controller.contextMenu(for: self)
+        return controller.contextMenu(for: self,
+                                      link: detectedLink(atWindowPoint: event.locationInWindow))
+    }
+
+    // MARK: - Path / URL under a right-click (founder ask 2026-10-29)
+
+    /// The file path or URL under a window point, or nil. The cell math,
+    /// wrapped-row joining and token rules are TerminalLinkDetect's
+    /// (L1-tested); this only reads SwiftTerm's grid into it.
+    func detectedLink(atWindowPoint windowPoint: NSPoint) -> DetectedLink? {
+        let point = convert(windowPoint, from: nil)
+        let terminal = getTerminal()
+        let size = cellSize()
+        let hit = TerminalLinkDetect.cell(atX: Double(point.x), y: Double(point.y),
+                                          viewHeight: Double(frame.height),
+                                          cellWidth: Double(size.width),
+                                          cellHeight: Double(size.height),
+                                          cols: terminal.cols, rows: terminal.rows)
+        var rows: [[TerminalCellText]] = []
+        var wrapped: [Bool] = []
+        for row in 0..<terminal.rows {
+            guard let line = terminal.getLine(row: row) else {
+                rows.append([])
+                wrapped.append(false)
+                continue
+            }
+            rows.append((0..<min(terminal.cols, line.count)).map { col in
+                let cell = line[col]
+                return TerminalCellText(character: terminal.getCharacter(for: cell),
+                                        width: Int(cell.width))
+            })
+            wrapped.append(line.isWrapped)
+        }
+        let logical = TerminalLinkDetect.logicalLine(rows: rows, wrapped: wrapped,
+                                                     clickRow: hit.row, clickCol: hit.col)
+        return TerminalLinkDetect.link(in: logical.text, at: logical.index)
+    }
+
+    /// SwiftTerm's cell size (its cellDimension is internal), computed the
+    /// way AppleTerminalView.computeFontDimensions does: the "W" advance and
+    /// ascent+descent+leading times lineSpacing, snapped to the pixel grid.
+    func cellSize() -> CGSize {
+        let f = font
+        let height = ceil((CTFontGetAscent(f) + CTFontGetDescent(f) + CTFontGetLeading(f)) * lineSpacing)
+        let width = f.advancement(forGlyph: f.glyph(withName: "W")).width
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        return CGSize(width: max(1, (width * scale).rounded() / scale),
+                      height: max(1, ceil(height * scale) / scale))
+    }
+
+    /// The directory a relative path on screen is relative to: OSC 7 when
+    /// the shell reports it, else the poller's kernel cwd.
+    var directoryForRelativePaths: String? {
+        currentLocalDirectory ?? lastKnownCwd
     }
 
     /// Founder UX: live tab-activity marks. LocalProcess delivers pty data on

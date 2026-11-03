@@ -231,7 +231,7 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
     /// forwarded to the pty even under mouse reporting (only encodeMouseEvent
     /// can encode .rightMouseUp, and nothing routes right-button events into
     /// it). There is no existing right-click behavior to preserve.
-    func contextMenu(for pane: PaneView) -> NSMenu {
+    func contextMenu(for pane: PaneView, link: DetectedLink? = nil) -> NSMenu {
         window?.makeFirstResponder(pane)
         let menu = NSMenu(title: "Pane")
 
@@ -241,6 +241,34 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             item.target = target
             item.representedObject = represented
             menu.addItem(item)
+        }
+        // Founder ask 2026-10-29: right-click a path or URL to copy it. The
+        // items lead the menu, under a disabled line naming what was found.
+        if let link {
+            let header = NSMenuItem(title: Self.middleTruncated(link.text, max: 60),
+                                    action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            switch link.kind {
+            case .url:
+                add("Open URL", #selector(ctxOpenURL(_:)), target: self, represented: link.text)
+                add("Copy URL", #selector(ctxCopyText(_:)), target: self, represented: link.text)
+            case .path:
+                add("Copy Path", #selector(ctxCopyText(_:)), target: self, represented: link.text)
+                if let suffix = link.lineSuffix {
+                    add("Copy Path\(suffix)", #selector(ctxCopyText(_:)), target: self,
+                        represented: link.text + suffix)
+                }
+                if let full = Self.resolvedPath(link.text, relativeTo: pane.directoryForRelativePaths) {
+                    if full != link.text {
+                        add("Copy Full Path", #selector(ctxCopyText(_:)), target: self,
+                            represented: full)
+                    }
+                    add("Reveal in Finder", #selector(ctxRevealInFinder(_:)), target: self,
+                        represented: full)
+                }
+            }
+            menu.addItem(.separator())
         }
         // nil target: copy:/paste: resolve through the responder chain to the
         // (now focused) terminal view.
@@ -270,6 +298,50 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         menu.addItem(.separator())
         add("Close Pane", #selector(ctxClosePane(_:)), target: self, represented: pane)
         return menu
+    }
+
+    // MARK: - Path / URL actions (founder ask 2026-10-29)
+
+    /// Where the link items copy to. The probe swaps in a private pasteboard
+    /// so a probe run never overwrites the user's clipboard.
+    static var linkPasteboard: NSPasteboard = .general
+
+    @objc func ctxCopyText(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        let pb = Self.linkPasteboard
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+    }
+
+    @objc func ctxOpenURL(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        // A bare "www." host has no scheme for NSWorkspace to route.
+        let full = text.lowercased().hasPrefix("www.") ? "https://" + text : text
+        guard let url = URL(string: full) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc func ctxRevealInFinder(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// The absolute path a path on screen names, if that file exists: "~"
+    /// expanded, a relative path resolved against the pane's directory.
+    static func resolvedPath(_ path: String, relativeTo directory: String?) -> String? {
+        var full = (path as NSString).expandingTildeInPath
+        if !full.hasPrefix("/") {
+            guard let directory else { return nil }
+            full = (directory as NSString).appendingPathComponent(full)
+        }
+        full = (full as NSString).standardizingPath
+        return FileManager.default.fileExists(atPath: full) ? full : nil
+    }
+
+    static func middleTruncated(_ text: String, max: Int) -> String {
+        guard text.count > max else { return text }
+        let half = (max - 1) / 2
+        return String(text.prefix(half)) + "…" + String(text.suffix(max - 1 - half))
     }
 
     /// feature/serial: the pane's Serial submenu. Built fresh per click so the

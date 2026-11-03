@@ -1373,6 +1373,108 @@ extension MemtermAppDelegate {
                     throw ProbeFailure("capture lost skipped cells: gap_ok=\(hasGap) nul=\(hasNul)")
                 }
             }))
+
+        // Founder ask 2026-10-29: right-click a path or URL to copy it, on a
+        // line shaped like the founder's "File: /private/tmp/…/x.zone". The
+        // detector is L1-tested (TerminalLinkDetectTests); this leg proves the
+        // real grid read, the point-to-cell math against SwiftTerm's real
+        // layout, and the real menu. The path is made longer than the pane is
+        // wide so the click lands on its WRAPPED second row. Copies go to a
+        // private pasteboard, never the user's clipboard.
+        probe.add(ProbeStep(
+            name: "right-click-copies-path-and-url",
+            assert: { [self] in
+                guard let host = keyHost(), let window = host.window,
+                      let pane = host.selectedTab?.currentPane() else {
+                    throw ProbeFailure("no pane (link leg)")
+                }
+                let terminal = pane.getTerminal()
+                // A real file, so Reveal in Finder is offered.
+                var dir = MemoryEngine.baseDir.appendingPathComponent("linkprobe").path
+                while dir.count < terminal.cols + 10 {
+                    dir += "/" + String(repeating: "d", count: 60)
+                }
+                try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                let path = dir + "/synthetos.com.zone"
+                FileManager.default.createFile(atPath: path, contents: Data())
+                let url = "https://example.com/probe?x=1"
+
+                let pasteboard = NSPasteboard(name: NSPasteboard.Name("memterm.probe.links.\(getpid())"))
+                let savedPasteboard = TerminalWindowController.linkPasteboard
+                TerminalWindowController.linkPasteboard = pasteboard
+                defer {
+                    TerminalWindowController.linkPasteboard = savedPasteboard
+                    pasteboard.releaseGlobally()
+                }
+
+                pane.feed(text: "\r\nFile: \(path)\r\nsee \(url) ok\r\n")
+
+                // Find where the lines landed on screen.
+                func rowText(_ row: Int) -> String {
+                    terminal.getLine(row: row)?.translateToString(trimRight: true) ?? ""
+                }
+                guard let fileRow = (0..<terminal.rows).last(where: { rowText($0).hasPrefix("File: /") }),
+                      let urlRow = (0..<terminal.rows).last(where: { rowText($0).hasPrefix("see https://") })
+                else {
+                    throw ProbeFailure("fed lines not found on screen")
+                }
+                guard terminal.getLine(row: fileRow + 1)?.isWrapped == true else {
+                    throw ProbeFailure("the path did not wrap (cols=\(terminal.cols) len=\(path.count)), so the wrapped-row case went untested")
+                }
+
+                // Right-click at a cell's center through the real menu path.
+                // The click points below come from cellSize() too, so first
+                // pin cellSize() to SwiftTerm's own grid: its rows/cols are
+                // frame / cell size, floored (the width minus a scroller).
+                let cell = pane.cellSize()
+                let fitRows = Int(pane.frame.height / cell.height)
+                let colsFit = CGFloat(terminal.cols) * cell.width <= pane.frame.width
+                    && CGFloat(terminal.cols + 3) * cell.width > pane.frame.width
+                guard fitRows == terminal.rows, colsFit else {
+                    throw ProbeFailure("cellSize() \(cell) disagrees with SwiftTerm's grid: frame=\(pane.frame.size) gives rows=\(fitRows) vs \(terminal.rows), cols=\(terminal.cols)")
+                }
+                func menuAt(col: Int, row: Int) -> NSMenu? {
+                    let local = NSPoint(x: (CGFloat(col) + 0.5) * cell.width,
+                                        y: pane.frame.height - (CGFloat(row) + 0.5) * cell.height)
+                    let windowPoint = pane.convert(local, to: nil)
+                    guard let event = NSEvent.mouseEvent(
+                        with: .rightMouseDown, location: windowPoint, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: window.windowNumber, context: nil,
+                        eventNumber: 0, clickCount: 1, pressure: 1) else { return nil }
+                    return pane.menu(for: event)
+                }
+                func perform(_ title: String, in menu: NSMenu?) -> String? {
+                    guard let menu, let index = menu.items.firstIndex(where: { $0.title == title })
+                    else { return nil }
+                    pasteboard.clearContents()
+                    menu.performActionForItem(at: index)
+                    return pasteboard.string(forType: .string)
+                }
+
+                let onWrapped = menuAt(col: 3, row: fileRow + 1)
+                let titles = onWrapped?.items.map(\.title) ?? []
+                let copiedPath = perform("Copy Path", in: onWrapped)
+                let reveal = titles.contains("Reveal in Finder")
+                let onLabel = menuAt(col: 1, row: fileRow)?.items.map(\.title) ?? []
+                let urlMenu = menuAt(col: 10, row: urlRow)
+                let copiedURL = perform("Copy URL", in: urlMenu)
+                let openOffered = urlMenu?.items.contains { $0.title == "Open URL" } == true
+                let generalUntouched = NSPasteboard.general.string(forType: .string) != path
+
+                print("UIPROBE-LINKS path_copied=\(copiedPath == path) reveal=\(reveal) label_has_copy=\(onLabel.contains("Copy Path")) url_copied=\(copiedURL == url) open_offered=\(openOffered) clipboard_untouched=\(generalUntouched)")
+                guard copiedPath == path else {
+                    throw ProbeFailure("Copy Path on the wrapped row copied \(copiedPath ?? "nothing"); menu=\(titles)")
+                }
+                guard reveal else { throw ProbeFailure("no Reveal in Finder for an existing file; menu=\(titles)") }
+                guard !onLabel.contains("Copy Path") else {
+                    throw ProbeFailure("right-clicking the \"File:\" label offered Copy Path")
+                }
+                guard copiedURL == url, openOffered else {
+                    throw ProbeFailure("URL items wrong: copied=\(copiedURL ?? "nothing") open=\(openOffered)")
+                }
+                guard generalUntouched else { throw ProbeFailure("the probe wrote to the user's clipboard") }
+            }))
     }
 
     // -----------------------------------------------------------------
