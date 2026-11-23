@@ -180,3 +180,86 @@ hosts with one visible all change with it.
 
 Taking (3) before (2) would mean building drop support twice. Taking (4)
 first would collide with the bar work in the same views.
+
+## 7. Build decisions (founder go-ahead 2026-11-23: "finish these")
+
+The founder asked for §3 and §5 to be finished. Dragging (§1-2) stays a
+separate step; the sidebar is built so the drag work can reuse it later.
+
+### §3 Workspace sidebar
+
+- **Config.** `workspace_bar_position = "top" | "left" | "right"`, default
+  `"top"`. The founder asked for "left or right", so both sides ship and the
+  choice is a popup in Settings ▸ General beside "Show the workspace bar".
+  `workspace_bar = false` still hides the bar in every position.
+- **Layout.** The tab strip stays a full-width row along the top, so the
+  traffic lights keep their place. In a side mode the workspace column runs
+  from under the tab strip to the bottom of the window, on the chosen side,
+  at a fixed width (ChromeMetrics-scaled, 160 pt at the reference size). The
+  terminal content fills the rest. The bar row above the tab strip is hidden
+  and the Settings gear moves into the tab strip (the existing fallback used
+  when the bar is hidden).
+- **One bar view, two axes.** `WorkspaceBarView` takes an axis. Vertically,
+  chips stack top-down at full column width, names truncate with an
+  ellipsis, and the content-side edge carries the hairline. Chips that do
+  not fit the column's height go to the existing overflow menu; the active
+  chip never overflows. The fit rule is pure
+  (`WorkspaceBarCompaction.verticalPlan`) and unit-tested.
+- Chip behavior (click, double-click rename, right-click menu, hover ✕,
+  activity pulse and ring) is unchanged in both axes.
+
+### §5 Quake as a mode of the one window
+
+- **Decision taken on §6:** with quake style OFF, Move Tab to New Window
+  stays (the spec's assumption). With quake style ON, "only one window" is
+  taken literally: Move Tab to New Window is disabled, ⌘N opens a tab in
+  the panel, and any other memterm window that comes on screen (a
+  multi-window workspace restored, a swap's extra groups) is hidden. Hidden
+  windows keep their tabs live and journaled; nothing is merged or closed.
+  Turning the mode off shows them again. Quake is a presentation mode of
+  the active workspace's window, not a second window.
+- **Entering.** `[dropdown] enabled = true` turns the active workspace's
+  window into the panel: its resting frame, level, style and collection
+  behavior are saved, then it takes the panel's geometry, floats, stops
+  being movable, and hides its traffic lights. It shows the moment the mode
+  is switched on (and at launch, with the mode on), then the hotkey hides
+  and shows it. No new host, no new tab, no new shell.
+- **Leaving.** `enabled = false` restores the saved frame, level, style and
+  collection behavior, and shows the window as a normal window.
+- **Workspaces.** A switch that swaps tab sets in place keeps the panel as
+  is. A switch that builds fresh hosts (a parked or never-opened workspace)
+  moves the panel role to the incoming workspace's window; the outgoing one
+  becomes a normal hidden holder with its resting frame back. Exactly one
+  memterm window is visible while the mode is on.
+- **Frames.** The journal always records a host's resting frame, never the
+  panel geometry, so turning the mode off, or relaunching with it off, puts
+  the window back where it was. Workspace switches that adopt a frame adopt
+  the resting frame for the same reason.
+- **Journal migration (one-way).** The panel is no longer journaled with
+  role `"dropdown"`. Rows written by earlier builds still carry it; on
+  restore their tabs merge into the workspace's normal window (or the panel
+  row becomes the normal window when it is the only one). The next capture
+  rewrites them without the role. The merge rule is pure
+  (`WindowRestore.mergingLegacyPanels`) and unit-tested.
+- **Switch fade.** The window-level crossfade of a switch that builds
+  fresh windows overlaps two windows on screen, so it is off while the mode
+  is on. In-window crossfades (same window) are unaffected.
+- **Races (from Codex's review).** A slide-away only orders the window out
+  if no show, hide or mode change happened since it started. Entering from
+  native full screen waits for the exit animation and then re-runs show(),
+  which re-checks that the mode is still on; turning the mode off cancels a
+  pending entry on every window. Leaving the mode settles any running slide
+  before restoring the frame.
+- **Order, not just end state.** With the mode on, a switch that builds
+  fresh windows hides the outgoing window before anything incoming exists;
+  restored windows and a swap's extra groups are never ordered on screen;
+  clicking the already-active workspace goes through the panel; `keyHost`
+  prefers the panel over a hidden last-focused sibling. At no point are two
+  memterm windows on screen, not only after the switch settles.
+- **Sidebar names.** A sidebar chip spans the column, so its name takes the
+  column's remaining width; the top bar's 220 pt name cap does not apply
+  there (it would contradict the column width at large chrome sizes).
+- **Dock / reopen.** With the mode on, a Dock click or `open -a memterm`
+  with nothing visible shows the panel.
+- **Menu.** Shell ▸ Toggle Drop-down Terminal does nothing while the mode is
+  off (it used to conjure a separate panel).

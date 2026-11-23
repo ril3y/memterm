@@ -204,3 +204,66 @@ final class WindowRoleJournalTests: XCTestCase {
         XCTAssertFalse(restored[0].isDropdown)
     }
 }
+
+/// Spec 2026-10-02 §7: the drop-down is a presentation mode of the one
+/// window now, never its own journaled window. Rows from earlier builds
+/// still carry role "dropdown"; restore folds them into the workspace's
+/// normal window instead of resurrecting a second one.
+final class LegacyPanelMergeTests: XCTestCase {
+    private func tab(_ title: String) -> TabRestore {
+        TabRestore(title: title, tree: .pane("\(title)-p"), panes: [:])
+    }
+
+    private func window(_ titles: [String], frame: String? = "10,10,900,600",
+                        focused: String? = nil, role: String? = nil) -> WindowRestore {
+        WindowRestore(frame: frame, focusedTab: focused, tabs: titles.map(tab), role: role)
+    }
+
+    private let panel = WindowRestore.dropdownRole
+
+    func testNoPanelRowsLeavesWindowsUntouched() {
+        let merged = WindowRestore.mergingLegacyPanels([window(["a"]), window(["b"], frame: "5,5,700,500")])
+        XCTAssertEqual(merged.map { $0.tabs.map(\.title) }, [["a"], ["b"]])
+        XCTAssertEqual(merged.map(\.frame), ["10,10,900,600", "5,5,700,500"])
+    }
+
+    func testPanelTabsJoinTheFirstNormalWindowAfterItsOwn() {
+        let merged = WindowRestore.mergingLegacyPanels([
+            window(["a", "b"], focused: "a-id"),
+            window(["q"], frame: "0,0,1600,500", focused: "q-id", role: panel),
+        ])
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].tabs.map(\.title), ["a", "b", "q"])
+        // The normal window keeps its own frame and focus: the panel's
+        // geometry was the panel's, not a window's.
+        XCTAssertEqual(merged[0].frame, "10,10,900,600")
+        XCTAssertEqual(merged[0].focusedTab, "a-id")
+        XCTAssertNil(merged[0].role)
+    }
+
+    func testPanelBeforeTheNormalWindowStillMergesIntoIt() {
+        let merged = WindowRestore.mergingLegacyPanels([
+            window(["q"], role: panel), window(["a"]), window(["b"]),
+        ])
+        XCTAssertEqual(merged.map { $0.tabs.map(\.title) }, [["a", "q"], ["b"]])
+        XCTAssertTrue(merged.allSatisfy { !$0.isDropdown })
+    }
+
+    func testALonePanelBecomesTheNormalWindowWithoutPanelGeometry() {
+        let merged = WindowRestore.mergingLegacyPanels([
+            window(["q"], frame: "0,0,1600,500", focused: "q-id", role: panel),
+        ])
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].tabs.map(\.title), ["q"])
+        XCTAssertNil(merged[0].role)
+        XCTAssertNil(merged[0].frame, "a panel frame is not a resting window frame")
+        XCTAssertEqual(merged[0].focusedTab, "q-id")
+    }
+
+    func testSeveralPanelsAllMergeAndEmptyOnesVanish() {
+        let merged = WindowRestore.mergingLegacyPanels([
+            window([], role: panel), window(["q1"], role: panel), window(["a"]), window(["q2"], role: panel),
+        ])
+        XCTAssertEqual(merged.map { $0.tabs.map(\.title) }, [["a", "q1", "q2"]])
+    }
+}

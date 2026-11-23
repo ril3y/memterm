@@ -198,6 +198,25 @@ public struct WindowRestore {
 
     public static let dropdownRole = "dropdown"
     public var isDropdown: Bool { role == Self.dropdownRole }
+
+    /// Spec 2026-10-02 §7 (one-way journal migration): the drop-down is a
+    /// presentation mode of the one window now, so restore never builds a
+    /// separate panel. Rows from earlier builds that carry role "dropdown"
+    /// fold their tabs into the first normal window, after its own tabs;
+    /// that window keeps its frame and focus. With no normal window, the
+    /// first panel row becomes the normal window, without its panel frame
+    /// (panel geometry is not a resting window frame). Empty rows vanish.
+    public static func mergingLegacyPanels(_ windows: [WindowRestore]) -> [WindowRestore] {
+        let panelTabs = windows.filter(\.isDropdown).flatMap(\.tabs)
+        var result = windows.filter { !$0.isDropdown && !$0.tabs.isEmpty }
+        guard !panelTabs.isEmpty else { return result }
+        if result.isEmpty {
+            let focus = windows.first { $0.isDropdown && !$0.tabs.isEmpty }?.focusedTab
+            return [WindowRestore(frame: nil, focusedTab: focus, tabs: panelTabs)]
+        }
+        result[0].tabs += panelTabs
+        return result
+    }
 }
 
 // MARK: - Archive (schema v6, founder-amended FR-56 2026-09-02)

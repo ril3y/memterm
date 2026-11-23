@@ -1,5 +1,14 @@
 import Foundation
 
+/// Where the workspace bar sits (spec 2026-10-02 §3/§7). `top` is the row
+/// above the tab strip; `left`/`right` are a sidebar under the tab strip.
+public enum WorkspaceBarPosition: String, CaseIterable, Sendable {
+    case top, left, right
+
+    /// Which coordinate runs along the bar.
+    public var axis: WorkspaceBarDrop.Axis { self == .top ? .horizontal : .vertical }
+}
+
 /// How a workspace chip is drawn when the bar is short of room.
 public enum WorkspaceChipMode: Equatable, Sendable {
     /// Color dot + full name (+ the hover ✕).
@@ -152,5 +161,45 @@ public enum WorkspaceBarCompaction {
         }
         if !current.isEmpty { parts.append(current) }
         return parts
+    }
+
+    // MARK: - Sidebar (vertical axis)
+
+    public struct VerticalPlan: Equatable, Sendable {
+        public var showTitle: Bool
+        /// Ids moved into the overflow menu, in bar order.
+        public var overflow: [String]
+    }
+
+    /// Fits a top-down chip column into `available` height. Every chip has
+    /// the column's full width, so only the count matters: drop the title
+    /// first, then move chips from the end into overflow (the overflow
+    /// button then takes a row of its own). The active chip never overflows.
+    public static func verticalPlan(available: Double, titleHeight: Double, addHeight: Double,
+                                    overflowHeight: Double, chipHeight: Double, spacing: Double,
+                                    chips: [(id: String, isActive: Bool)]) -> VerticalPlan {
+        func height(title: Bool, visibleChips: Int, overflow: Bool) -> Double {
+            var heights: [Double] = title ? [titleHeight] : []
+            heights += Array(repeating: chipHeight, count: visibleChips)
+            if overflow { heights.append(overflowHeight) }
+            heights.append(addHeight)
+            return heights.reduce(0, +) + spacing * Double(max(heights.count - 1, 0))
+        }
+        if height(title: true, visibleChips: chips.count, overflow: false) <= available {
+            return VerticalPlan(showTitle: true, overflow: [])
+        }
+        if height(title: false, visibleChips: chips.count, overflow: false) <= available {
+            return VerticalPlan(showTitle: false, overflow: [])
+        }
+        // Overflow candidates, last first; the active chip is never one.
+        let candidates = chips.reversed().filter { !$0.isActive }.map(\.id)
+        var overflowed: Set<String> = []
+        for id in candidates {
+            overflowed.insert(id)
+            if height(title: false, visibleChips: chips.count - overflowed.count,
+                      overflow: true) <= available { break }
+        }
+        return VerticalPlan(showTitle: false,
+                            overflow: chips.map(\.id).filter { overflowed.contains($0) })
     }
 }

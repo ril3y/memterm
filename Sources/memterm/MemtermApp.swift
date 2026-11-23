@@ -117,7 +117,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             groups.append(CaptureGroup(members: host.tabs,
                                        focusedTabId: host.selectedTab?.tabId
                                            ?? host.tabs[0].tabId,
-                                       role: host.isDropdown ? WindowRestore.dropdownRole : nil))
+                                       restingFrame: host.restingFrame))
         }
         // Safety net: a tab mid-re-homing (no host) still journals alone.
         for controller in controllers where !claimed.contains(ObjectIdentifier(controller)) {
@@ -378,7 +378,12 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// any, else a fresh one in Default (created/un-parked as needed).
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard !flag else { return true }
-        if let hidden = hosts.first(where: { !$0.isDropdown && $0.workspaceId == activeWorkspaceId && !$0.tabs.isEmpty }) {
+        // Quake style on: the one window is the panel — bring it down.
+        if config.dropdownEnabled {
+            dropdown.show()
+            return false
+        }
+        if let hidden = hosts.first(where: { $0.workspaceId == activeWorkspaceId && !$0.tabs.isEmpty }) {
             hidden.focusWindow()
             return false
         }
@@ -572,19 +577,16 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     func restoreWindows(_ windows: [WindowRestore], workspaceId: String,
                         adoptingFrame: NSRect? = nil) {
         var focusHost: WindowHostController?
-        // The first NORMAL window adopts the switch-in frame; a drop-down
-        // panel restores HIDDEN (its frame is the config's, shown on hotkey).
+        // The first window adopts the switch-in frame. Spec 2026-10-02 §7:
+        // the drop-down is a presentation of the one window now, so panel
+        // rows journaled by earlier builds fold into the normal window
+        // (one-way; the next capture rewrites them without the role).
         var adoptFrame = adoptingFrame
-        for win in windows {
+        for win in WindowRestore.mergingLegacyPanels(windows) {
             guard !win.tabs.isEmpty else { continue }
-            let frame: NSRect?
-            if win.isDropdown {
-                frame = nil
-            } else {
-                frame = adoptFrame ?? parseFrame(win.frame)
-                adoptFrame = nil
-            }
-            let host = makeHost(frame: frame, role: win.isDropdown ? .dropdown : .normal)
+            let frame = adoptFrame ?? parseFrame(win.frame)
+            adoptFrame = nil
+            let host = makeHost(frame: frame)
             var focusedInHost = false
             for tab in win.tabs {
                 let controller = TerminalWindowController(app: self, workspaceId: workspaceId,
@@ -594,12 +596,19 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
                 host.attach(controller, select: focus)
                 if focus { focusedInHost = true }
             }
-            guard !win.isDropdown else { continue }
+            if focusedInHost || focusHost == nil { focusHost = host }
+            // Quake style on (spec §7): restored windows stay hidden;
+            // dropdown.show() presents the workspace's one window as the
+            // panel and keeps any other group a hidden holder.
+            guard !isDropdownMode else { continue }
             if fadeInPending { host.window?.alphaValue = 0 }
             host.showWindow(nil)
-            if focusedInHost || focusHost == nil { focusHost = host }
         }
-        focusHost?.focusWindow()
+        if isDropdownMode {
+            if let focusHost { noteHostFocused(focusHost) }
+        } else {
+            focusHost?.focusWindow()
+        }
         refreshWorkspaceChips()
     }
 
@@ -622,8 +631,8 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// Creates and registers a new (empty) window host. The caller attaches
     /// at least one tab before showing it.
     @discardableResult
-    func makeHost(frame: NSRect?, role: WindowHostController.Role = .normal) -> WindowHostController {
-        let host = WindowHostController(app: self, frame: frame, role: role)
+    func makeHost(frame: NSRect?) -> WindowHostController {
+        let host = WindowHostController(app: self, frame: frame)
         hosts.append(host)
         return host
     }
@@ -667,12 +676,24 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         }
         // No key-window info (app not active, or a non-host window is key):
         // the model's own focus notion wins over guessing by workspace.
+        // Quake style on: the panel is the window, even slid away — ahead
+        // of a last-focused sibling that the mode keeps hidden.
+        if let panel = hosts.first(where: { $0.isPanel && $0.workspaceId == activeWorkspaceId }) {
+            return panel
+        }
         if let last = lastFocusedHost, hosts.contains(where: { $0 === last }) {
             return last
         }
-        // A hidden drop-down panel is never the guessed key host.
-        return hosts.first { $0.workspaceId == activeWorkspaceId && !$0.isDropdown }
-            ?? hosts.first { !$0.isDropdown } ?? hosts.first
+        return hosts.first { $0.workspaceId == activeWorkspaceId } ?? hosts.first
+    }
+
+    /// The window a workspace presents in: the key host when it belongs to
+    /// the workspace, else its first visible host with tabs, else its first
+    /// host with tabs. The drop-down presents THIS window (spec §7).
+    func primaryHost(ofWorkspace id: String) -> WindowHostController? {
+        let candidates = hosts.filter { $0.workspaceId == id && !$0.tabs.isEmpty }
+        if let key = keyHost(), candidates.contains(where: { $0 === key }) { return key }
+        return candidates.first { $0.window?.isVisible == true } ?? candidates.first
     }
 
     func keyController() -> TerminalWindowController? {
@@ -692,6 +713,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func newWindow(_ sender: Any?) {
+        // Quake style on (spec §7): one window only — ⌘N opens a tab in it.
+        if config.dropdownEnabled {
+            newWindowForTab(sender)
+            return
+        }
         let controller = TerminalWindowController(app: self, workspaceId: activeWorkspaceId,
                                                   initialCwd: inheritedCwd())
         controllers.append(controller)
@@ -739,9 +765,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// OUR Move Tab to New Window: re-homes the selected TabController to a
     /// fresh host (same panes, same processes — nothing respawns).
     @objc func moveTabToNewWindowAction(_ sender: Any?) {
+        // Quake style on: one window only (spec §7; the menu item is off).
+        guard !config.dropdownEnabled else { return }
         guard let host = keyHost(), host.tabs.count > 1,
               let tab = host.selectedTab else { return }
-        let frame = host.window?.frame.offsetBy(dx: 28, dy: -28)
+        let frame = host.restingFrame?.offsetBy(dx: 28, dy: -28)
         host.detach(tab)
         let fresh = makeHost(frame: frame)
         fresh.attach(tab, select: true)
@@ -834,6 +862,9 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleDropdown(_ sender: Any?) {
         dropdown.toggle()
     }
+
+    /// Quake style on: the panel is the one window.
+    var isDropdownMode: Bool { config.dropdownEnabled }
 
     @objc func increaseFontSize(_ sender: Any?) { changeFontSize(by: 1) }
     @objc func decreaseFontSize(_ sender: Any?) { changeFontSize(by: -1) }
@@ -1050,6 +1081,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
 struct CaptureGroup {
     let members: [TerminalWindowController]
     let focusedTabId: String?
-    /// WindowSnap.role: "dropdown" for the Quake panel, nil for a window.
-    var role: String? = nil
+    /// The host's frame as a normal window (WindowHostController
+    /// .restingFrame): the journal never records drop-down panel geometry.
+    var restingFrame: NSRect? = nil
 }

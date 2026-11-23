@@ -308,7 +308,7 @@ final class ExtensionHostRuntime: NSObject {
                                                   initialCwd: cwd?.path)
         app.registerController(controller)
         let isActive = wsId == app.activeWorkspaceId
-        if let host = app.hosts.first(where: { $0.workspaceId == wsId && !$0.isDropdown }) {
+        if let host = app.hosts.first(where: { $0.workspaceId == wsId }) {
             host.attach(controller, select: isActive)
         } else {
             let fresh = app.makeHost(frame: nil)
@@ -571,7 +571,7 @@ extension ExtensionHostRuntime: NSMenuItemValidation {
     }
 }
 
-/// Quiet-run twin of ProbeQuietWindow for extension panels: AppKit's frame
+/// Quiet-run twin of HostWindow.allowsOffscreenFrames for extension panels: AppKit's frame
 /// constraining would drag the offscreen panel back onto a screen.
 final class QuietExtensionPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {

@@ -40,6 +40,18 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     // -- Chrome --
     private let chromeStack = NSStackView()
     private let barRow = NSView()
+    /// Spec 2026-10-02 §3/§7: the workspace sidebar — the same bar view,
+    /// moved into this column under the tab strip on the configured side.
+    private let sideBar = NSView()
+    private var sideBarWidth: NSLayoutConstraint!
+    /// The bar's own constraints inside whichever container holds it.
+    private var barPlacement: [NSLayoutConstraint] = []
+    /// Content/sidebar edges for each placement; exactly one set is active.
+    private var topLayout: [NSLayoutConstraint] = []
+    private var leftLayout: [NSLayoutConstraint] = []
+    private var rightLayout: [NSLayoutConstraint] = []
+    /// Where the bar is drawn right now (nil while hidden).
+    private(set) var barPlacementShown: WorkspaceBarPosition?
     /// Chrome row heights follow ChromeMetrics (Appearance › Size); kept so
     /// applyConfig can re-size the rows live.
     private var barRowHeight: NSLayoutConstraint!
@@ -60,40 +72,49 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     // here first if multi-pane focus targeting regresses after an OS update.
     private var firstResponderObservation: NSKeyValueObservation?
 
-    /// Quake-style drop-down (2026-09-09): a .dropdown host is the active
-    /// workspace's slide-in panel — journaled with role "dropdown", restored
-    /// hidden, placed by DropdownController, never a swap slot.
-    enum Role { case normal, dropdown }
-    let role: Role
-    var isDropdown: Bool { role == .dropdown }
+    /// Quake-style drop-down, one-window edition (spec 2026-10-02 §5/§7):
+    /// the panel is a PRESENTATION of this host's own window, not a second
+    /// host. While presented as the panel, `resting` holds what the window
+    /// looked like as a normal window, so leaving the mode puts it back and
+    /// the journal keeps recording the resting frame, never panel geometry.
+    private struct RestingState {
+        let frame: NSRect
+        let styleMask: NSWindow.StyleMask
+        let level: NSWindow.Level
+        let collectionBehavior: NSWindow.CollectionBehavior
+        let hidesOnDeactivate: Bool
+        let excludedFromWindowsMenu: Bool
+        let movable: Bool
+        let movableByBackground: Bool
+    }
+    private var resting: RestingState?
+    /// Entering the panel from native full screen waits for the exit
+    /// animation (full screen is an asynchronous lifecycle, and styleMask
+    /// edits mid-transition are refused). Holds what to run once it is out —
+    /// the drop-down's show(), which re-checks that the mode is still on and
+    /// this is still the window to present before restyling anything.
+    private var pendingPanelEntry: (() -> Void)?
 
-    init(app: MemtermAppDelegate, frame: NSRect?, role: Role = .normal) {
+    /// True while this host's window is presented as the drop-down panel.
+    var isPanel: Bool { resting != nil }
+
+    /// The frame this window has as a normal window: its live frame, or the
+    /// saved one while it is presented as the panel. Journaling and
+    /// frame-adopting workspace switches read this, never panel geometry.
+    var restingFrame: NSRect? { resting?.frame ?? window?.frame }
+
+    init(app: MemtermAppDelegate, frame: NSRect?) {
         self.app = app
-        self.role = role
         let rect = NSRect(x: 0, y: 0, width: 980, height: 640)
-        // The panel has no traffic lights and is not user-movable: its place
-        // is the configured edge, and Esc-style dismissal is the hotkey.
-        let styleMask: NSWindow.StyleMask = role == .dropdown
-            ? [.titled, .fullSizeContentView]
-            : [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+        let styleMask: NSWindow.StyleMask =
+            [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         // Quiet probe/smoke runs (TESTING.md §2.5) position windows offscreen
-        // — ProbeQuietWindow disables AppKit's frame constraining so they
-        // stay there.
-        let window: NSWindow
-        if role == .dropdown {
-            // The panel parks fully OFF its screen edge between shows; a
-            // plain NSWindow's constrainFrameRect would clamp that back on
-            // screen (visible-probe finding, 2026-09-09) and the slide would
-            // stop short.
-            window = DropdownWindow(contentRect: rect, styleMask: styleMask,
-                                    backing: .buffered, defer: false)
-        } else if ProbeSupport.quiet {
-            window = ProbeQuietWindow(contentRect: rect, styleMask: styleMask,
-                                      backing: .buffered, defer: false)
-        } else {
-            window = NSWindow(contentRect: rect, styleMask: styleMask,
-                              backing: .buffered, defer: false)
-        }
+        // — HostWindow stops AppKit's frame constraining so they stay there;
+        // the panel presentation turns the same switch on (it parks fully
+        // off its screen edge between shows).
+        let window = HostWindow(contentRect: rect, styleMask: styleMask,
+                                backing: .buffered, defer: false)
+        window.allowsOffscreenFrames = ProbeSupport.quiet
         window.title = "memterm"
         // Custom chrome: the strip draws titles; native tabbing is OFF.
         window.titleVisibility = .hidden
@@ -107,17 +128,6 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         // the traffic lights.
         window.titlebarAppearsTransparent = true
         window.tabbingMode = .disallowed
-        if role == .dropdown {
-            window.isMovable = false
-            window.isMovableByWindowBackground = false
-            window.level = .floating
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-            window.hidesOnDeactivate = false
-            window.isExcludedFromWindowsMenu = true
-            window.standardWindowButton(.closeButton)?.isHidden = true
-            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-            window.standardWindowButton(.zoomButton)?.isHidden = true
-        }
         if let frame {
             window.setFrame(frame, display: false)
         } else {
@@ -141,10 +151,11 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         content.addSubview(blurView)
 
         // Row 1: workspace strip + trailing gear (the old .right accessory).
+        // In a sidebar position the bar view moves into `sideBar` instead
+        // (applyBarPlacement) and the gear moves into the tab strip.
         let bar = WorkspaceBarView(app: app, leadingInset: Self.trafficLightInset)
         workspaceBar = bar
         bar.translatesAutoresizingMaskIntoConstraints = false
-        barRow.addSubview(bar)
         gearButton.configureAsSettingsGear(app: app)
         gearButton.translatesAutoresizingMaskIntoConstraints = false
         barRow.addSubview(gearButton)
@@ -155,10 +166,6 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
             equalToConstant: CGFloat(metrics.workspaceBarHeight))
         NSLayoutConstraint.activate([
             barRowHeight,
-            bar.leadingAnchor.constraint(equalTo: barRow.leadingAnchor),
-            bar.trailingAnchor.constraint(equalTo: barRow.trailingAnchor),
-            bar.topAnchor.constraint(equalTo: barRow.topAnchor),
-            bar.bottomAnchor.constraint(equalTo: barRow.bottomAnchor),
             gearButton.trailingAnchor.constraint(equalTo: barRow.trailingAnchor, constant: -8),
             gearButton.centerYAnchor.constraint(equalTo: barRow.centerYAnchor),
             gearButton.widthAnchor.constraint(equalToConstant: 24),
@@ -183,7 +190,26 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
 
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(contentContainer)
+        sideBar.translatesAutoresizingMaskIntoConstraints = false
+        sideBar.isHidden = true
+        content.addSubview(sideBar)
         blurView.translatesAutoresizingMaskIntoConstraints = false
+        sideBarWidth = sideBar.widthAnchor.constraint(
+            equalToConstant: CGFloat(Self.sidebarWidth(metrics)))
+        topLayout = [
+            contentContainer.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            contentContainer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+        ]
+        leftLayout = [
+            sideBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            contentContainer.leadingAnchor.constraint(equalTo: sideBar.trailingAnchor),
+            contentContainer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+        ]
+        rightLayout = [
+            sideBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            contentContainer.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            contentContainer.trailingAnchor.constraint(equalTo: sideBar.leadingAnchor),
+        ]
         NSLayoutConstraint.activate([
             chromeStack.topAnchor.constraint(equalTo: content.topAnchor),
             chromeStack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -191,9 +217,10 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
             barRow.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
             tabStrip.widthAnchor.constraint(equalTo: chromeStack.widthAnchor),
             contentContainer.topAnchor.constraint(equalTo: chromeStack.bottomAnchor),
-            contentContainer.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            contentContainer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             contentContainer.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sideBar.topAnchor.constraint(equalTo: chromeStack.bottomAnchor),
+            sideBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sideBarWidth,
             blurView.topAnchor.constraint(equalTo: content.topAnchor),
             blurView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             blurView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -216,6 +243,12 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     /// Leading inset that keeps the topmost chrome row's content clear of the
     /// traffic lights (AppKit used to inset titlebar accessories ~78 pt).
     static let trafficLightInset: CGFloat = 78
+
+    /// The workspace sidebar's fixed width: 160 pt at the reference chrome
+    /// size, scaled with Appearance › Size like every other chrome metric.
+    static func sidebarWidth(_ metrics: ChromeMetrics) -> Double {
+        (160 * metrics.scale).rounded()
+    }
 
     /// Deliberate programmatic focus: orders the window key/front AND records
     /// this host as the app's focused host — NSApp.keyWindow can lag or stay
@@ -507,17 +540,51 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     /// `always_show_tab_bar` key is parsed as a documented no-op now. Only
     /// the workspace row remains toggleable (workspace_bar).
     func updateChromeVisibility() {
-        let barVisible = app.config.workspaceBar
-        barRow.isHidden = !barVisible
+        let placement: WorkspaceBarPosition? =
+            app.config.workspaceBar ? app.config.workspaceBarPosition : nil
+        applyBarPlacement(placement)
+        let barOnTop = placement == .top
+        barRow.isHidden = !barOnTop
+        sideBar.isHidden = placement == nil || barOnTop
         tabStrip.isHidden = false
         // The TOP visible chrome row keeps its content clear of the traffic
-        // lights; a strip below the workspace bar needs no extra inset.
-        tabStrip.leadingInset = barVisible ? 8 : Self.trafficLightInset
+        // lights; a strip below the workspace bar needs no extra inset. With
+        // the bar in a sidebar (or hidden) the strip IS the top row.
+        tabStrip.leadingInset = barOnTop ? 8 : Self.trafficLightInset
         // The Settings gear was its own .right titlebar accessory before the
         // custom chrome — visible regardless of workspace_bar. With the bar
-        // row (its current home) hidden, the strip shows its own gear so the
-        // affordance never disappears.
-        tabStrip.showsGear = !barVisible
+        // row (its current home) hidden or the bar in a sidebar, the strip
+        // shows its own gear so the affordance never disappears.
+        tabStrip.showsGear = !barOnTop
+    }
+
+    /// Spec 2026-10-02 §3/§7: puts the one workspace bar view where the
+    /// config says — the row above the tab strip, or a column under it on
+    /// the left or right — and lays the terminal content beside it. A no-op
+    /// when nothing changed, so config refreshes cost nothing.
+    private func applyBarPlacement(_ placement: WorkspaceBarPosition?) {
+        guard placement != barPlacementShown || barPlacement.isEmpty,
+              let bar = workspaceBar else { return }
+        barPlacementShown = placement
+        NSLayoutConstraint.deactivate(barPlacement + topLayout + leftLayout + rightLayout)
+        let container = placement == nil || placement == .top ? barRow : sideBar
+        if bar.superview !== container {
+            bar.removeFromSuperview()
+            // Below the gear in the bar row: the gear keeps its clicks.
+            container.addSubview(bar, positioned: .below, relativeTo: nil)
+        }
+        barPlacement = [
+            bar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            bar.topAnchor.constraint(equalTo: container.topAnchor),
+            bar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ]
+        bar.setPosition(placement ?? .top)
+        switch placement {
+        case .left?: NSLayoutConstraint.activate(barPlacement + leftLayout)
+        case .right?: NSLayoutConstraint.activate(barPlacement + rightLayout)
+        default: NSLayoutConstraint.activate(barPlacement + topLayout)
+        }
     }
 
     /// Live config application (Settings changes): chrome rows + window-level
@@ -530,6 +597,7 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         let metrics = ChromeMetrics.derived(fromTerminalFontSize: config.fontSize)
         barRowHeight.constant = CGFloat(metrics.workspaceBarHeight)
         tabStripHeight.constant = CGFloat(metrics.tabStripHeight)
+        sideBarWidth.constant = CGFloat(Self.sidebarWidth(metrics))
         workspaceBar?.applyMetrics(metrics)
         tabStrip.reload()
     }
@@ -560,6 +628,8 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         // bar over a translucent page.
         chromeStack.wantsLayer = true
         chromeStack.layer?.backgroundColor = bg.withAlphaComponent(1).cgColor
+        sideBar.wantsLayer = true
+        sideBar.layer?.backgroundColor = bg.withAlphaComponent(1).cgColor
     }
 
     /// Called by tabs when their title, color, or activity mark changed.
@@ -596,8 +666,13 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     var isTabStripVisible: Bool { !tabStrip.isHidden }
 
     func workspaceBarFrameInWindow() -> NSRect? {
-        guard let bar = workspaceBar, !barRow.isHidden, bar.window === window else { return nil }
+        guard let bar = workspaceBar, barPlacementShown != nil, bar.window === window else { return nil }
         return bar.convert(bar.bounds, to: nil)
+    }
+
+    /// MEMTERM_UI_PROBE: the terminal content area, window coordinates.
+    func contentFrameInWindow() -> NSRect {
+        contentContainer.convert(contentContainer.bounds, to: nil)
     }
 
     func tabStripFrameInWindow() -> NSRect? {
@@ -622,7 +697,109 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        if role == .dropdown { app.dropdown.panelResignedKey(self) }
+        if isPanel { app.dropdown.panelResignedKey(self) }
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        let entry = pendingPanelEntry
+        pendingPanelEntry = nil
+        entry?()
+    }
+
+    func windowDidFailToExitFullScreen(_ window: NSWindow) {
+        pendingPanelEntry = nil
+    }
+
+    /// Drops a panel entry still waiting on a full-screen exit (mode turned
+    /// off, workspace switched, panel moved elsewhere).
+    func cancelPendingPanelEntry() {
+        pendingPanelEntry = nil
+    }
+
+    // MARK: - Drop-down panel presentation (spec 2026-10-02 §5/§7)
+
+    /// Restyles this window as the drop-down panel: floats, can't be moved,
+    /// no traffic lights, joins every Space, may park off its screen edge.
+    /// The normal-window state is saved for exitPanelPresentation. From
+    /// native full screen it leaves full screen first and then enters.
+    func enterPanelPresentation(then completion: (() -> Void)? = nil) {
+        guard let window = window as? HostWindow, resting == nil else {
+            completion?()
+            return
+        }
+        if window.styleMask.contains(.fullScreen) {
+            // Already leaving full screen for an earlier request: just
+            // replace what runs when it is done (never toggle twice). The
+            // window is NOT restyled here; `completion` (show) re-enters.
+            let waiting = pendingPanelEntry != nil
+            pendingPanelEntry = completion ?? {}
+            if !waiting { window.toggleFullScreen(nil) }
+            return
+        }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        // Saved BEFORE any style or frame change: a capture that runs
+        // mid-restyle must still journal the resting frame.
+        resting = RestingState(frame: window.frame, styleMask: window.styleMask,
+                               level: window.level,
+                               collectionBehavior: window.collectionBehavior,
+                               hidesOnDeactivate: window.hidesOnDeactivate,
+                               excludedFromWindowsMenu: window.isExcludedFromWindowsMenu,
+                               movable: window.isMovable,
+                               movableByBackground: window.isMovableByWindowBackground)
+        window.styleMask = [.titled, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        window.hidesOnDeactivate = false
+        window.isExcludedFromWindowsMenu = true
+        window.allowsOffscreenFrames = true
+        setTrafficLightsHidden(true)
+        refocusSelectedPane()
+        completion?()
+    }
+
+    /// Puts the window back the way it was before it became the panel:
+    /// frame, style, level, Spaces behavior. Does not order it on screen;
+    /// the caller decides (a hidden holder stays hidden).
+    func exitPanelPresentation() {
+        pendingPanelEntry = nil
+        guard let window = window as? HostWindow, let saved = resting else { return }
+        window.styleMask = saved.styleMask
+        window.titlebarAppearsTransparent = true
+        window.isMovable = saved.movable
+        window.isMovableByWindowBackground = saved.movableByBackground
+        window.level = saved.level
+        window.collectionBehavior = saved.collectionBehavior
+        window.hidesOnDeactivate = saved.hidesOnDeactivate
+        window.isExcludedFromWindowsMenu = saved.excludedFromWindowsMenu
+        window.allowsOffscreenFrames = ProbeSupport.quiet
+        setTrafficLightsHidden(false)
+        // A zero-length animation group settles any slide still running, so
+        // it cannot land on top of the restored frame afterwards.
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0
+            window.animator().setFrame(saved.frame, display: window.isVisible)
+        })
+        window.setFrame(saved.frame, display: window.isVisible)
+        // Cleared only now: until the frame is back, captures keep reading
+        // the saved resting frame.
+        resting = nil
+        refocusSelectedPane()
+        app.memory?.scheduleFrameSave()
+    }
+
+    /// A styleMask change can cost the focused pane its first-responder
+    /// status; hand it back.
+    private func refocusSelectedPane() {
+        if let pane = selectedTab?.currentPane() { window?.makeFirstResponder(pane) }
+    }
+
+    private func setTrafficLightsHidden(_ hidden: Bool) {
+        for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+            window?.standardWindowButton(kind)?.isHidden = hidden
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -666,13 +843,19 @@ private final class TabContentContainerView: NSView {
     }
 }
 
-/// The drop-down panel's window: frames are never constrained to the screen
-/// (it slides off its edge), and it can take keyboard focus without a
-/// title bar's chrome.
-final class DropdownWindow: NSWindow {
+/// Every host's window. `allowsOffscreenFrames` turns off AppKit's frame
+/// constraining: quiet probe/smoke runs (TESTING.md §2.5) live offscreen,
+/// and the drop-down presentation parks fully off its screen edge between
+/// shows — a plain NSWindow's constrainFrameRect would clamp that back on
+/// screen (visible-probe finding, 2026-09-09) and the slide would stop short.
+final class HostWindow: NSWindow {
+    var allowsOffscreenFrames = false
+
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
-        frameRect
+        allowsOffscreenFrames ? frameRect : super.constrainFrameRect(frameRect, to: screen)
     }
+    // The panel presentation drops the close/resize bits; it must still
+    // take keyboard focus.
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }

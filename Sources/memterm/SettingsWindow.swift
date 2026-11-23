@@ -22,6 +22,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     private let confirmQuitCheck = NSButton(checkboxWithTitle: "Confirm quitting while jobs are running", target: nil, action: nil)
     private let confirmCloseTabCheck = NSButton(checkboxWithTitle: "Confirm before closing a tab", target: nil, action: nil)
     private let workspaceBarCheck = NSButton(checkboxWithTitle: "Show the workspace bar", target: nil, action: nil)
+    /// Spec 2026-10-02 §7: top row, or a left / right sidebar.
+    private let workspaceBarPositionPopUp = NSPopUpButton()
     private let shellField = NSTextField()
 
     // Appearance
@@ -201,6 +203,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         controlChanged(sender)
     }
 
+    /// MEMTERM_UI_PROBE: picks a workspace bar position through the real
+    /// General-tab popup and its change handler; returns what the config
+    /// holds afterwards.
+    func probeChooseWorkspaceBarPosition(_ position: WorkspaceBarPosition) -> WorkspaceBarPosition {
+        probeSelectSection("General")
+        workspaceBarPositionPopUp.selectItem(
+            at: WorkspaceBarPosition.allCases.firstIndex(of: position) ?? 0)
+        controlChanged(workspaceBarPositionPopUp)
+        return app.config.workspaceBarPosition
+    }
+
     /// MEMTERM_UI_PROBE: the slide-speed readout after setting the slider.
     func probeSetDropdownSpeed(_ ms: Int) -> (readout: String, configMs: Int) {
         dropdownSpeedSlider.doubleValue = Double(ms)
@@ -244,6 +257,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
                       shellIntegrationCheck, dropdownEnableCheck, dropdownHideCheck] {
             wire(check)
         }
+        workspaceBarPositionPopUp.addItems(withTitles: ["Top", "Left sidebar", "Right sidebar"])
+        wire(workspaceBarPositionPopUp)
         // Drop-down terminal controls.
         for popup in [dropdownEdgePopUp, dropdownAlignPopUp, dropdownScreenPopUp] { wire(popup) }
         dropdownTriggerPopUp.addItems(withTitles: ["Key combination"]
@@ -363,6 +378,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
             [NSGridCell.emptyContentView, confirmCloseTabCheck],
             [NSGridCell.emptyContentView, caption("The tab's ✕ and Close Tab ask first. The sheet's “Don't ask me again” turns this off.")],
             [NSGridCell.emptyContentView, workspaceBarCheck],
+            [label("Workspaces:"), workspaceBarPositionPopUp],
+            [NSGridCell.emptyContentView, caption("On top above the tabs, or as a sidebar on the left or right.")],
             [label("Shell:"), shellField],
             [NSGridCell.emptyContentView, caption("Applies to new panes. Blank uses $SHELL.")],
             [NSGridCell.emptyContentView, editFile],
@@ -582,6 +599,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         confirmQuitCheck.state = config.confirmQuit ? .on : .off
         confirmCloseTabCheck.state = config.confirmCloseTab ? .on : .off
         workspaceBarCheck.state = config.workspaceBar ? .on : .off
+        workspaceBarPositionPopUp.selectItem(
+            at: WorkspaceBarPosition.allCases.firstIndex(of: config.workspaceBarPosition) ?? 0)
+        workspaceBarPositionPopUp.isEnabled = config.workspaceBar
         shellField.stringValue = config.shell ?? ""
 
         // Appearance
@@ -721,6 +741,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         config.confirmQuit = confirmQuitCheck.state == .on
         config.confirmCloseTab = confirmCloseTabCheck.state == .on
         config.workspaceBar = workspaceBarCheck.state == .on
+        let positionIndex = workspaceBarPositionPopUp.indexOfSelectedItem
+        if WorkspaceBarPosition.allCases.indices.contains(positionIndex) {
+            config.workspaceBarPosition = WorkspaceBarPosition.allCases[positionIndex]
+        }
+        workspaceBarPositionPopUp.isEnabled = config.workspaceBar
         let shell = shellField.stringValue.trimmingCharacters(in: .whitespaces)
         config.shell = shell.isEmpty ? nil : shell
 

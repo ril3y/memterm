@@ -91,10 +91,16 @@ extension MemtermAppDelegate {
                 // EVERY restored pane (the shells need a beat to draw their
                 // prompts) — the assert then re-checks and reports.
                 guard let bmp = probeBitmap(tab.paneRoot) else { return false }
+                // 64x64 sampling (2026-11-23): a restored pane whose only
+                // content is a one-line prompt (~14 pt band in a ~570 pt
+                // pane) can fall between the default 16x16 grid's rows —
+                // a session saved at drop-down geometry put it exactly
+                // there. Denser sampling reduces misses for sparse content;
+                // a uniform pane still fails, and geometry is checked apart.
                 return tab.allPanes().allSatisfy { pane in
                     let region = pane.convert(pane.bounds, to: tab.paneRoot)
                     return (try? assertRendered(bmp, region: region,
-                                                what: "pane paint")) != nil
+                                                what: "pane paint", grid: 64)) != nil
                 }
             },
             assert: { [self] in
@@ -143,7 +149,8 @@ extension MemtermAppDelegate {
                         for pane in tab.allPanes() {
                             let region = pane.convert(pane.bounds, to: tab.paneRoot)
                             try assertRendered(bmp, region: region,
-                                               what: "restored pane \(pane.paneId.prefix(8))")
+                                               what: "restored pane \(pane.paneId.prefix(8))",
+                                               grid: 64)
                         }
                     }
                     print("UIPROBE-RESTORED tabs=\(controllers.count) panes=\(controllers.flatMap { $0.allPanes() }.count) geometry_ok=true rendered_ok=true")
@@ -177,23 +184,16 @@ extension MemtermAppDelegate {
                         }
                         print("UIPROBE-OBSERVE chips=\(chips)")
                     }
-                    // Presented = the journal's NORMAL windows; a drop-down
-                    // panel row (2026-09-09) restores as a hidden panel host
-                    // and is reconciled separately below.
+                    // Presented = every journaled tab. Spec 2026-10-02 §7: a
+                    // legacy drop-down panel row folds into the normal window
+                    // at restore, so its tabs count here too.
                     let rows = memory?.store.loadState(workspaceId: activeWorkspaceId) ?? []
-                    let journalTabs = rows.filter { !$0.isDropdown }.reduce(0) { $0 + $1.tabs.count }
-                    let liveTabs = controllers.filter {
-                        $0.workspaceId == activeWorkspaceId && $0.host?.isDropdown != true
-                    }.count
-                    let journalPanelTabs = rows.filter(\.isDropdown).reduce(0) { $0 + $1.tabs.count }
-                    let livePanelTabs = hosts.filter { $0.isDropdown && $0.workspaceId == activeWorkspaceId }
-                        .reduce(0) { $0 + $1.tabs.count }
-                    print("UIPROBE-OBSERVE journal_tabs=\(journalTabs) live_tabs=\(liveTabs) strip_tabs=\(host.tabStrip.probeTabIds().count) panel_tabs=\(journalPanelTabs)/\(livePanelTabs)")
+                    let journalTabs = rows.reduce(0) { $0 + $1.tabs.count }
+                    let legacyPanelTabs = rows.filter(\.isDropdown).reduce(0) { $0 + $1.tabs.count }
+                    let liveTabs = controllers.filter { $0.workspaceId == activeWorkspaceId }.count
+                    print("UIPROBE-OBSERVE journal_tabs=\(journalTabs) live_tabs=\(liveTabs) strip_tabs=\(host.tabStrip.probeTabIds().count) legacy_panel_tabs=\(legacyPanelTabs)")
                     guard journalTabs == liveTabs, liveTabs == host.tabStrip.probeTabIds().count else {
                         throw ProbeFailure("presented tabs disagree with the journal on an untouched launch")
-                    }
-                    guard journalPanelTabs == livePanelTabs else {
-                        throw ProbeFailure("drop-down panel rows (\(journalPanelTabs)) disagree with the restored panel (\(livePanelTabs))")
                     }
                 }))
             // Stage 3: READ-ONLY check of the claude scanner against the
@@ -1336,6 +1336,8 @@ extension MemtermAppDelegate {
         // world's shared manifest has no business repeating that, and a
         // footprint measurement wants the quietest world available.
         if mode == "fresh" { addHiddenWindowMemorySteps(probe) }
+        // Workspace sidebar (spec 2026-10-02 §3/§7).
+        addWorkspaceSidebarSteps(probe)
         // Quake-style drop-down legs: before the archive legs (which wipe
         // the probe state dir last by design).
         addDropdownSteps(probe)
@@ -4944,7 +4946,7 @@ extension MemtermAppDelegate {
                 func measure() {
                     // Every host that is not presenting the active workspace.
                     state.hosts = hosts.filter {
-                        !$0.isDropdown && $0.window != nil
+                        $0.window != nil
                             && $0.workspaceId != self.activeWorkspaceId
                     }
                     guard state.hosts.count >= 3 else {
@@ -5192,35 +5194,63 @@ extension MemtermAppDelegate {
             c.dropdownAnimationMs = 0
             return c
         }
+        func frameString(_ f: NSRect) -> String {
+            "\(Int(f.origin.x)),\(Int(f.origin.y)),\(Int(f.width)),\(Int(f.height))"
+        }
+        func visibleHosts() -> [WindowHostController] {
+            hosts.filter { $0.window?.isVisible == true }
+        }
         var panelTab: TerminalWindowController?
+        var windowHost: WindowHostController?
+        var windowFrame = NSRect.zero
+        var controllersBefore = 0
         let originalConfig = config
 
-        // Toggle ON: a .dropdown host for the active workspace appears at the
-        // configured frame, key, with a live tab; no hotkey registered here.
+        // Spec 2026-10-02 §5/§7 (founder: "if you select quake style it
+        // should be that window with all the current tabs and workspaces"):
+        // switching the mode ON turns the window already on screen into the
+        // panel — the SAME host, the same tabs, no new tab or shell — at the
+        // configured frame, floating, unmovable, traffic lights hidden, and
+        // it is the only memterm window on screen. No hotkey registers here.
         probe.add(ProbeStep(
             name: "dropdown-show", timeout: 10,
             action: { [self] in
+                windowHost = keyHost()
+                windowFrame = windowHost?.window?.frame ?? .zero
+                controllersBefore = controllers.count
                 applyConfigLive(dropdownConfig())
-                dropdown.toggle()
             },
             condition: { [self] in
                 dropdown.panelHost?.window?.isVisible == true
-                    && dropdown.panelHost?.selectedTab?.allPanes().first?.process?.running == true
             },
             assert: { [self] in
                 guard let host = dropdown.panelHost, let window = host.window else {
-                    throw ProbeFailure("no drop-down panel after toggle")
+                    throw ProbeFailure("no drop-down panel after enabling the mode")
                 }
                 panelTab = host.selectedTab
                 let expected = dropdown.targetFrame(config)
                 let off = max(abs(window.frame.minX - expected.minX), abs(window.frame.minY - expected.minY),
                               abs(window.frame.width - expected.width), abs(window.frame.height - expected.height))
-                print("UIPROBE-DROPDOWN show=true role=dropdown ws_is_active=\(host.workspaceId == activeWorkspaceId) frame=\(Int(window.frame.minX)),\(Int(window.frame.minY)),\(Int(window.frame.width))x\(Int(window.frame.height)) expected_off=\(String(format: "%.1f", off)) level_floating=\(window.level == .floating) movable=\(window.isMovable) hotkey_registered=\(dropdown.probeRegisteredHotkey ?? "none")")
-                guard host.isDropdown, host.workspaceId == activeWorkspaceId, off <= 1 else {
-                    throw ProbeFailure("panel geometry/role wrong: off=\(off) role=\(host.isDropdown) ws=\(host.workspaceId ?? "nil")")
+                let lightsHidden = window.standardWindowButton(.closeButton)?.isHidden != false
+                let visible = visibleHosts()
+                print("UIPROBE-DROPDOWN show=true same_window=\(host === windowHost) tabs_before=\(controllersBefore) tabs_after=\(controllers.count) visible_windows=\(visible.count) frame=\(frameString(window.frame)) expected_off=\(String(format: "%.1f", off)) level_floating=\(window.level == .floating) movable=\(window.isMovable) lights_hidden=\(lightsHidden) resting=\(host.restingFrame.map(frameString) ?? "nil") hotkey_registered=\(dropdown.probeRegisteredHotkey ?? "none")")
+                guard host === windowHost else {
+                    throw ProbeFailure("quake style built a second window instead of presenting the one on screen")
                 }
-                guard window.level == .floating, !window.isMovable else {
-                    throw ProbeFailure("panel must float above windows and not be movable")
+                guard controllers.count == controllersBefore else {
+                    throw ProbeFailure("enabling quake style opened a tab (\(controllersBefore) → \(controllers.count))")
+                }
+                guard visible.count == 1, visible[0] === host else {
+                    throw ProbeFailure("\(visible.count) memterm windows visible with quake style on")
+                }
+                guard host.workspaceId == activeWorkspaceId, off <= 1 else {
+                    throw ProbeFailure("panel geometry wrong: off=\(off) ws=\(host.workspaceId ?? "nil")")
+                }
+                guard window.level == .floating, !window.isMovable, lightsHidden else {
+                    throw ProbeFailure("panel must float, not move, and hide its traffic lights")
+                }
+                guard host.restingFrame.map(frameString) == frameString(windowFrame) else {
+                    throw ProbeFailure("the window's resting frame was not kept (\(host.restingFrame.map(frameString) ?? "nil") vs \(frameString(windowFrame)))")
                 }
                 guard dropdown.probeRegisteredHotkey == nil else {
                     throw ProbeFailure("a global hotkey was registered inside an automated run")
@@ -5228,7 +5258,7 @@ extension MemtermAppDelegate {
             }))
 
         // Toggle OFF: slides off its edge and orders out; the host and its
-        // live tab stay (the panel is hidden, not closed).
+        // live tabs stay (the panel is hidden, not closed).
         probe.add(ProbeStep(
             name: "dropdown-hide", timeout: 8,
             action: { [self] in dropdown.toggle() },
@@ -5243,8 +5273,8 @@ extension MemtermAppDelegate {
                 let parked = abs(window.frame.minY - hidden.minY) <= 1 && abs(window.frame.minX - hidden.minX) <= 1
                 let alive = controllers.contains { $0 === tab } && host.tabs.contains { $0 === tab }
                     && tab.allPanes().first?.process?.running == true
-                print("UIPROBE-DROPDOWN hide=true parked_off_edge=\(parked) tab_alive=\(alive)")
-                guard parked, alive else { throw ProbeFailure("hide must park off-edge and keep the tab live") }
+                print("UIPROBE-DROPDOWN hide=true parked_off_edge=\(parked) tab_alive=\(alive) still_panel=\(host.isPanel)")
+                guard parked, alive, host.isPanel else { throw ProbeFailure("hide must park off-edge and keep the tab live") }
             }))
 
         // Every edge and placement lands where DropdownLayout says.
@@ -5261,7 +5291,7 @@ extension MemtermAppDelegate {
                     let expected = dropdown.targetFrame(config)
                     let off = max(abs(window.frame.minX - expected.minX), abs(window.frame.minY - expected.minY),
                                   abs(window.frame.width - expected.width), abs(window.frame.height - expected.height))
-                    print("UIPROBE-DROPDOWN edge=\(edge) align=\(align) size=\(width)x\(height) frame=\(Int(window.frame.minX)),\(Int(window.frame.minY)),\(Int(window.frame.width))x\(Int(window.frame.height)) off=\(String(format: "%.1f", off))")
+                    print("UIPROBE-DROPDOWN edge=\(edge) align=\(align) size=\(width)x\(height) frame=\(frameString(window.frame)) off=\(String(format: "%.1f", off))")
                     guard off <= 1 else { throw ProbeFailure("edge \(edge) align \(align): frame off by \(off)") }
                     dropdown.hide()
                     guard window.isVisible == false else { throw ProbeFailure("edge \(edge): hide left it visible") }
@@ -5270,14 +5300,18 @@ extension MemtermAppDelegate {
             }))
 
         // hide_on_focus_loss: another window taking key slides the panel away;
-        // with the option off it stays.
-        // Quiet runs are never the ACTIVE app, so a real key-window
-        // transition may not happen (flaked on a busy desktop); they drive
-        // the window-delegate entry point the transition calls. Visible
-        // runs take the real path.
+        // with the option off it stays. There is no second memterm window to
+        // take key any more (one window), so visible runs use a scratch
+        // window; quiet runs are never the ACTIVE app, so a real key-window
+        // transition may not happen — they drive the delegate entry point.
+        var scratch: NSWindow?
         func loseFocus() {
             if ProbeSupport.visible {
-                hosts.first { !$0.isDropdown && $0.workspaceId == activeWorkspaceId }?.focusWindow()
+                let window = NSWindow(contentRect: NSRect(x: 40, y: 40, width: 200, height: 120),
+                                      styleMask: [.titled], backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                window.makeKeyAndOrderFront(nil)
+                scratch = window
             } else if let panel = dropdown.panelHost {
                 dropdown.panelResignedKey(panel)
             }
@@ -5290,11 +5324,15 @@ extension MemtermAppDelegate {
             },
             condition: { [self] in dropdown.panelHost?.window?.isVisible == false },
             assert: { [self] in
+                scratch?.close()
+                scratch = nil
                 print("UIPROBE-DROPDOWN focus_loss_hides=true real_key_path=\(ProbeSupport.visible)")
                 applyConfigLive(dropdownConfig(hideOnFocusLoss: false))
                 dropdown.show()
                 loseFocus()
                 let stayed = dropdown.panelHost?.window?.isVisible == true
+                scratch?.close()
+                scratch = nil
                 print("UIPROBE-DROPDOWN focus_loss_off_stays=\(stayed)")
                 guard stayed else { throw ProbeFailure("hide_on_focus_loss=false must keep the panel") }
                 dropdown.hide()
@@ -5373,63 +5411,458 @@ extension MemtermAppDelegate {
                 applyConfigLive(dropdownConfig())
             }))
 
-        // Journal: the panel captures as a window with role "dropdown".
+        // Journal (spec §7): the panel is the normal window's presentation,
+        // so it journals as a plain window — no "dropdown" role — with the
+        // window's RESTING frame, never the panel geometry.
         probe.add(ProbeStep(
-            name: "dropdown-journal-role",
+            name: "dropdown-journal-resting-frame",
             assert: { [self] in
-                guard let engine = memory, let tab = panelTab else { throw ProbeFailure("no engine/tab") }
+                guard let engine = memory, let host = dropdown.panelHost,
+                      let resting = host.restingFrame, let panel = host.window?.frame else {
+                    throw ProbeFailure("no engine/panel")
+                }
+                dropdown.show()
                 engine.flushSync()
                 let rows = engine.store.loadState(workspaceId: activeWorkspaceId)
-                let panelRow = rows.first { $0.isDropdown }
-                let normal = rows.filter { !$0.isDropdown }.count
-                print("UIPROBE-DROPDOWN journaled_role=\(panelRow != nil) normal_windows=\(normal) panel_tabs=\(panelRow?.tabs.count ?? -1)")
-                guard let panelRow, panelRow.tabs.count == 1, normal >= 1 else {
-                    throw ProbeFailure("panel not journaled with role dropdown (rows: \(rows.map { $0.role ?? "nil" }))")
+                let roles = rows.compactMap(\.role)
+                let frames = rows.compactMap(\.frame)
+                print("UIPROBE-DROPDOWN journal_roles=\(roles) frames=\(frames) resting=\(frameString(resting)) panel=\(frameString(panel))")
+                guard roles.isEmpty else { throw ProbeFailure("the panel was journaled with a role (\(roles))") }
+                guard frames.contains(frameString(resting)), !frames.contains(frameString(host.window?.frame ?? panel)) else {
+                    throw ProbeFailure("the journal holds the panel geometry instead of the resting frame")
                 }
-                _ = tab
+                dropdown.hide()
             }))
 
-        // FR-59: the panel belongs to its workspace — a switch hides it, never
-        // swaps it into a normal window; the other workspace gets its own
-        // panel; switching back finds the first panel again, same tab.
+        // One window (spec §7): with the mode on, ⌘N opens a TAB in the
+        // panel and Move Tab to New Window is off — neither makes a second
+        // window.
+        probe.add(ProbeStep(
+            name: "dropdown-one-window-commands", timeout: 10,
+            action: { [self] in
+                dropdown.show()
+            },
+            condition: { [self] in dropdown.isShowing },
+            assert: { [self] in
+                guard let host = dropdown.panelHost else { throw ProbeFailure("no panel") }
+                let hostsBefore = hosts.count
+                let tabsBefore = host.tabs.count
+                newWindow(nil)
+                let added = host.tabs.count - tabsBefore
+                let hostsAfterNew = hosts.count
+                let moveItem = NSMenuItem(title: "Move Tab to New Window",
+                                          action: #selector(moveTabToNewWindowAction(_:)), keyEquivalent: "")
+                let moveEnabled = validateMenuItem(moveItem)
+                moveTabToNewWindowAction(nil)
+                let hostsAfterMove = hosts.count
+                print("UIPROBE-DROPDOWN cmd_n_added_tabs=\(added) hosts=\(hostsBefore)/\(hostsAfterNew)/\(hostsAfterMove) move_tab_enabled=\(moveEnabled) visible_windows=\(visibleHosts().count)")
+                if added == 1, let extra = host.tabs.last { host.close(tab: extra, userInitiated: false) }
+                guard added == 1, hostsAfterNew == hostsBefore else {
+                    throw ProbeFailure("⌘N with quake style on must add a tab to the panel, not a window")
+                }
+                guard !moveEnabled, hostsAfterMove == hostsBefore else {
+                    throw ProbeFailure("Move Tab to New Window must be off with quake style on")
+                }
+                guard visibleHosts().count == 1 else {
+                    throw ProbeFailure("\(visibleHosts().count) windows visible with quake style on")
+                }
+            }))
+
+        // FR-59 + spec §7: a workspace switch never shows a second window.
+        // Into a workspace with no live window (fresh windows are built),
+        // the panel moves to the incoming window and the old one goes back
+        // to a normal, hidden window with its resting frame. Back again (an
+        // in-place swap), the panel shows the first workspace's tabs.
         var otherWorkspace: String?
+        var firstWindow: WindowHostController?
+        var firstResting: NSRect?
         probe.addStateful(ProbeStep(
             name: "dropdown-workspace-switch", timeout: 12,
             action: { [self] in
                 dropdown.show()
+                firstWindow = dropdown.panelHost
+                firstResting = firstWindow?.restingFrame
                 otherWorkspace = createWorkspace(named: "Dropdown Probe")
                 if let id = otherWorkspace { switchToWorkspace(id) }
             },
             condition: { [self] in
                 guard let id = otherWorkspace else { return false }
-                return activeWorkspaceId == id
-                    && hosts.contains { $0.workspaceId == id && !$0.isDropdown && $0.window?.isVisible == true }
-                    && hosts.filter { $0.isDropdown }.allSatisfy { $0.window?.isVisible != true }
+                return activeWorkspaceId == id && dropdown.panelHost?.workspaceId == id
+                    && dropdown.isShowing
             },
             assert: { [self] in
-                guard let id = otherWorkspace, let tab = panelTab else { throw ProbeFailure("switch setup lost") }
-                let firstPanel = hosts.first { $0.isDropdown && $0.tabs.contains { $0 === tab } }
-                guard let firstPanel, firstPanel.workspaceId == StateStore.defaultWorkspaceId else {
-                    throw ProbeFailure("the default workspace's panel was swapped or re-homed")
+                guard let id = otherWorkspace, let tab = panelTab, let first = firstWindow,
+                      let panel = dropdown.panelHost else { throw ProbeFailure("switch setup lost") }
+                let visible = visibleHosts()
+                let firstBack = !first.isPanel && first.window?.isVisible != true
+                    && first.window.map { frameString($0.frame) } == firstResting.map(frameString)
+                print("UIPROBE-DROPDOWN switch_visible_windows=\(visible.count) panel_ws_is_new=\(panel.workspaceId == id) old_window_normal_hidden=\(firstBack) old_frame=\(first.window.map { frameString($0.frame) } ?? "nil") old_resting=\(firstResting.map(frameString) ?? "nil")")
+                guard visible.count == 1, visible[0] === panel else {
+                    throw ProbeFailure("\(visible.count) windows visible after a switch with quake style on")
                 }
-                dropdown.toggle()  // the OTHER workspace's own panel
-                guard let second = dropdown.panelHost, second !== firstPanel, second.workspaceId == id,
-                      second.window?.isVisible == true else {
-                    throw ProbeFailure("the other workspace did not get its own panel")
+                guard firstBack else {
+                    throw ProbeFailure("the old panel did not go back to a hidden normal window at its resting frame")
                 }
-                dropdown.hide()
                 switchToWorkspace(StateStore.defaultWorkspaceId)
-                guard activeWorkspaceId == StateStore.defaultWorkspaceId,
-                      dropdown.panelHost === firstPanel, firstPanel.window?.isVisible != true else {
-                    throw ProbeFailure("switching back did not find the first panel hidden")
+                guard let back = dropdown.panelHost else { throw ProbeFailure("no panel after switching back") }
+                let backVisible = visibleHosts()
+                let showsTab = back.tabs.contains { $0 === tab }
+                print("UIPROBE-DROPDOWN switch_back visible_windows=\(backVisible.count) panel_has_first_tab=\(showsTab) panel_showing=\(dropdown.isShowing)")
+                guard activeWorkspaceId == StateStore.defaultWorkspaceId, showsTab, dropdown.isShowing,
+                      backVisible.count == 1, backVisible[0] === back else {
+                    throw ProbeFailure("switching back did not present the first workspace's tabs in the one panel")
                 }
-                dropdown.toggle()
-                let same = dropdown.panelHost === firstPanel && firstPanel.selectedTab === tab
-                    && firstPanel.window?.isVisible == true
-                print("UIPROBE-DROPDOWN switch_hides=true per_workspace_panels=true back_same_tab=\(same)")
-                guard same else { throw ProbeFailure("panel after switch-back is not the same tab") }
                 dropdown.hide()
+            }))
+
+        // Spec §7 journal migration: rows written by earlier builds with
+        // role "dropdown" fold into the workspace's normal window on
+        // restore — one window, all tabs — and the next capture drops the
+        // role.
+        var legacyWorkspace: String?
+        probe.addStateful(ProbeStep(
+            name: "dropdown-legacy-panel-row-merges", timeout: 15,
+            action: { [self] in
+                guard let engine = memory, let id = createWorkspace(named: "Legacy Panel Probe") else { return }
+                legacyWorkspace = id
+                func window(_ tag: String, role: String?) -> WindowSnap {
+                    let wid = "legacy-\(tag)-\(UUID().uuidString.prefix(8))"
+                    return WindowSnap(id: wid, frame: "100,100,900,600", focusedTab: "\(wid)-t",
+                                      tabs: [TabSnap(id: "\(wid)-t", title: "legacy \(tag)",
+                                                     tree: .pane("\(wid)-p"),
+                                                     panes: [PaneSnap(id: "\(wid)-p", shell: nil,
+                                                                      cwd: NSTemporaryDirectory(), cwdSource: nil)])],
+                                      workspaceId: id, role: role)
+                }
+                engine.store.saveTopology([window("normal", role: nil),
+                                           window("panel", role: WindowRestore.dropdownRole)],
+                                          forWorkspaces: [id])
+                engine.store.barrier()
+                switchToWorkspace(id)
+            },
+            condition: { [self] in
+                guard let id = legacyWorkspace else { return false }
+                return activeWorkspaceId == id && hosts.contains { $0.workspaceId == id }
+            },
+            assert: { [self] in
+                guard let id = legacyWorkspace, let engine = memory else { throw ProbeFailure("legacy setup lost") }
+                let wsHosts = hosts.filter { $0.workspaceId == id }
+                let titles = wsHosts.flatMap(\.tabs).map(\.displayTitle)
+                engine.flushSync()
+                let roles = engine.store.loadState(workspaceId: id).compactMap(\.role)
+                print("UIPROBE-DROPDOWN legacy_hosts=\(wsHosts.count) legacy_tabs=\(titles.count) panel=\(wsHosts.first?.isPanel == true) roles_after_capture=\(roles)")
+                guard wsHosts.count == 1, wsHosts[0].tabs.count == 2 else {
+                    throw ProbeFailure("legacy panel row did not merge into one window (\(wsHosts.count) hosts, tabs \(titles))")
+                }
+                guard wsHosts[0].isPanel, roles.isEmpty else {
+                    throw ProbeFailure("merged window is not the panel, or the role survived a capture (\(roles))")
+                }
+                switchToWorkspace(StateStore.defaultWorkspaceId)
+                forgetWorkspace(id)
+                if let other = otherWorkspace { forgetWorkspace(other) }
+            }))
+
+        // A workspace with TWO windows (Codex review): quake style presents
+        // the focused one, keeps the other a hidden holder; clicking the
+        // already-active workspace never brings the holder forward; leaving
+        // the mode shows both again (FR-59).
+        var twoGroup: (first: WindowHostController, second: WindowHostController)?
+        var twoGroupExtraTab: TerminalWindowController?
+        probe.add(ProbeStep(
+            name: "dropdown-two-window-workspace", timeout: 12,
+            action: { [self] in
+                var off = originalConfig
+                off.dropdownEnabled = false
+                applyConfigLive(off)
+                guard let first = keyHost() else { return }
+                newWindowForTab(nil)
+                moveTabToNewWindowAction(nil)
+                guard let second = keyHost(), second !== first else { return }
+                twoGroup = (first, second)
+                twoGroupExtraTab = second.tabs.first
+                second.focusWindow()
+                applyConfigLive(dropdownConfig(hideOnFocusLoss: false))
+            },
+            condition: { [self] in dropdown.isShowing },
+            assert: { [self] in
+                guard let pair = twoGroup else { throw ProbeFailure("could not build a two-window workspace") }
+                let presented = dropdown.panelHost
+                let afterEnable = visibleHosts()
+                switchToWorkspace(activeWorkspaceId)  // the active chip's click path
+                let afterClick = visibleHosts()
+                let keyIsPanel = keyHost() === dropdown.panelHost
+                print("UIPROBE-DROPDOWN two_windows panel_is_focused=\(presented === pair.second) visible_after_enable=\(afterEnable.count) visible_after_active_click=\(afterClick.count) key_is_panel=\(keyIsPanel)")
+                guard presented === pair.second, afterEnable.count == 1, afterEnable[0] === pair.second else {
+                    throw ProbeFailure("quake style did not present the focused window alone")
+                }
+                guard afterClick.count == 1, afterClick[0] === pair.second, keyIsPanel else {
+                    throw ProbeFailure("clicking the active workspace brought a second window forward")
+                }
+                var off = originalConfig
+                off.dropdownEnabled = false
+                applyConfigLive(off)
+                let bothBack = pair.first.window?.isVisible == true && pair.second.window?.isVisible == true
+                print("UIPROBE-DROPDOWN two_windows_after_off both_visible=\(bothBack)")
+                guard bothBack else { throw ProbeFailure("leaving quake style did not show both windows (FR-59)") }
+                pair.first.focusWindow()
+                mergeAllWindowsAction(nil)
+                if let extra = twoGroupExtraTab, let host = extra.host, host.tabs.count > 1 {
+                    host.close(tab: extra, userInitiated: false)
+                }
+                applyConfigLive(dropdownConfig())
+            }))
+
+        // Real slides (automated runs otherwise slide instantly): a hide
+        // followed at once by a show must end DOWN at the panel frame — the
+        // old slide-away's completion may not order it out — and a hide
+        // followed at once by turning the mode off must end as a normal,
+        // visible window at its resting frame (the slide is settled first).
+        var raceDeadline = Date()
+        var raceResting = NSRect.zero
+        probe.add(ProbeStep(
+            name: "dropdown-race-hide-then-show", timeout: 6,
+            action: { [self] in
+                dropdown.probeSlideSeconds = nil
+                dropdown.show()
+                dropdown.probeSlideSeconds = 0.3
+                dropdown.hide()
+                dropdown.show()
+                raceDeadline = Date().addingTimeInterval(0.9)
+            },
+            condition: { Date() >= raceDeadline },
+            assert: { [self] in
+                let window = dropdown.panelHost?.window
+                let target = dropdown.targetFrame(config)
+                let atTarget = window.map { $0.frame.equalTo(target) } ?? false
+                print("UIPROBE-DROPDOWN race_hide_show visible=\(window?.isVisible == true) at_target=\(atTarget) frame=\(window.map { frameString($0.frame) } ?? "nil")")
+                guard window?.isVisible == true, atTarget else {
+                    throw ProbeFailure("a hide immediately followed by show did not end down at the panel frame")
+                }
+            }))
+        probe.add(ProbeStep(
+            name: "dropdown-race-hide-then-off", timeout: 6,
+            action: { [self] in
+                windowHost = dropdown.panelHost
+                raceResting = windowHost?.restingFrame ?? .zero
+                dropdown.hide()
+                var off = originalConfig
+                off.dropdownEnabled = false
+                applyConfigLive(off)
+                raceDeadline = Date().addingTimeInterval(0.9)
+            },
+            condition: { Date() >= raceDeadline },
+            assert: { [self] in
+                dropdown.probeSlideSeconds = nil
+                let window = windowHost?.window
+                let frameOK = window.map { frameString($0.frame) == frameString(raceResting) } ?? false
+                print("UIPROBE-DROPDOWN race_hide_off visible=\(window?.isVisible == true) panel=\(windowHost?.isPanel == true) frame=\(window.map { frameString($0.frame) } ?? "nil") resting=\(frameString(raceResting))")
+                guard window?.isVisible == true, windowHost?.isPanel == false, frameOK else {
+                    throw ProbeFailure("turning quake style off mid-slide did not leave a normal window at its resting frame")
+                }
+                applyConfigLive(dropdownConfig())
+            }))
+
+        // Mode OFF (spec §7, "if you unselect it it should be the
+        // opposite"): the panel goes back to a normal window — resizable,
+        // closable, normal level, movable, traffic lights — at the frame it
+        // had before, on screen.
+        probe.add(ProbeStep(
+            name: "dropdown-off-restores-window", timeout: 8,
+            action: { [self] in
+                dropdown.show()
+                windowHost = dropdown.panelHost
+                windowFrame = windowHost?.restingFrame ?? .zero
+                var off = originalConfig
+                off.dropdownEnabled = false
+                applyConfigLive(off)
+            },
+            condition: { [self] in dropdown.panelHost == nil && windowHost?.window?.isVisible == true },
+            assert: { [self] in
+                guard let host = windowHost, let window = host.window else { throw ProbeFailure("window lost") }
+                let mask = window.styleMask
+                let lights = window.standardWindowButton(.closeButton)?.isHidden == false
+                print("UIPROBE-DROPDOWN off_restores frame=\(frameString(window.frame)) resting=\(frameString(windowFrame)) resizable=\(mask.contains(.resizable)) closable=\(mask.contains(.closable)) level_normal=\(window.level == .normal) movable=\(window.isMovable) lights=\(lights) toggle_noop=\(!dropdown.isShowing)")
+                guard frameString(window.frame) == frameString(windowFrame) else {
+                    throw ProbeFailure("leaving quake style did not restore the window frame")
+                }
+                guard mask.contains(.resizable), mask.contains(.closable), window.level == .normal,
+                      window.isMovable, lights else {
+                    throw ProbeFailure("leaving quake style did not restore the normal window chrome")
+                }
+                dropdown.toggle()  // mode off: no panel appears
+                guard dropdown.panelHost == nil else {
+                    throw ProbeFailure("toggle conjured a panel with quake style off")
+                }
                 applyConfigLive(originalConfig)
+            }))
+    }
+
+    /// Spec 2026-10-02 §3/§7: the workspace bar as a sidebar. Left, then
+    /// right: the tab strip stays a full-width top row, the bar becomes a
+    /// column under it on that side, the terminal fills the rest, chips
+    /// stack top-down and render, the gear moves into the strip; a short
+    /// window overflows chips into the menu but never the active one; back
+    /// on top, everything is where it was.
+    private func addWorkspaceSidebarSteps(_ probe: ProbeRunner) {
+        let originalConfig = config
+        func check(_ side: WorkspaceBarPosition) throws {
+            keyHost()?.window?.contentView?.layoutSubtreeIfNeeded()
+            guard let host = keyHost(), let window = host.window, let bar = host.workspaceBar,
+                  let barFrame = host.workspaceBarFrameInWindow(),
+                  let strip = host.tabStripFrameInWindow() else {
+                throw ProbeFailure("\(side): no bar/strip")
+            }
+            let content = host.contentFrameInWindow()
+            let width = window.contentView?.bounds.width ?? 0
+            let expectedWidth = CGFloat(WindowHostController.sidebarWidth(chromeMetrics))
+            let chips = bar.probeChipFrames().sorted { $0.frame.maxY > $1.frame.maxY }
+            let xs = Set(chips.map { Int($0.frame.minX) })
+            let stacked = zip(chips, chips.dropFirst()).allSatisfy { $0.frame.minY >= $1.frame.maxY - 0.5 }
+            let edgeOK = side == .left
+                ? abs(barFrame.minX) <= 0.5 && abs(content.minX - barFrame.maxX) <= 0.5
+                : abs(barFrame.maxX - width) <= 0.5 && abs(content.maxX - barFrame.minX) <= 0.5
+            print("UIPROBE-SIDEBAR side=\(side.rawValue) bar=\(Int(barFrame.minX)),\(Int(barFrame.minY)),\(Int(barFrame.width))x\(Int(barFrame.height)) strip=\(Int(strip.minX))..\(Int(strip.maxX)) content=\(Int(content.minX))..\(Int(content.maxX)) chips=\(chips.count) columns=\(xs.count) stacked=\(stacked) gear_in_strip=\(host.gearFrameInWindow() == nil)")
+            guard bar.position == side, edgeOK, abs(barFrame.width - expectedWidth) <= 0.5 else {
+                throw ProbeFailure("\(side): sidebar not on its edge at \(expectedWidth) pt (bar \(barFrame), content \(content))")
+            }
+            guard abs(barFrame.maxY - strip.minY) <= 0.5, abs(strip.minX) <= 0.5, abs(strip.maxX - width) <= 0.5 else {
+                throw ProbeFailure("\(side): the tab strip must stay a full-width row above the sidebar")
+            }
+            guard chips.count >= 3, xs.count == 1, stacked else {
+                throw ProbeFailure("\(side): chips are not one top-down column")
+            }
+            // Each chip spans the column, and its name stays inside it (an
+            // unsatisfiable width rule would break one of the two).
+            let column = barFrame.width - 16
+            let labels = Dictionary(bar.probeChipLabelFrames().map { ($0.id, $0.frame) },
+                                    uniquingKeysWith: { a, _ in a })
+            for (id, frame) in chips {
+                let label = labels[id] ?? .zero
+                guard abs(frame.width - column) <= 0.5,
+                      label.minX >= frame.minX - 0.5, label.maxX <= frame.maxX + 0.5 else {
+                    throw ProbeFailure("\(side): chip \(id.prefix(8)) is \(frame.width) wide (column \(column)), label \(label)")
+                }
+            }
+            guard host.gearFrameInWindow() == nil, host.tabStrip.showsGear else {
+                throw ProbeFailure("\(side): the Settings gear did not move into the tab strip")
+            }
+            // Rendered pixels, not frames: every chip and its name draw.
+            bar.layoutSubtreeIfNeeded()
+            guard let bmp = probeBitmap(bar) else { throw ProbeFailure("\(side): bar produced no bitmap") }
+            for (id, frame) in bar.probeChipFrames() {
+                try assertChipVisible(chipFrame: frame, in: bmp, what: "\(side) sidebar chip \(id.prefix(8))")
+            }
+            for (id, frame) in bar.probeChipLabelFrames() {
+                try assertChipVisible(chipFrame: frame, in: bmp, what: "\(side) sidebar chip \(id.prefix(8)) label")
+            }
+        }
+        // Two extra workspaces so the column has chips to stack (forgotten
+        // again in workspace-sidebar-back-to-top).
+        var stackFixtures: [String] = []
+        for side in [WorkspaceBarPosition.left, .right] {
+            probe.add(ProbeStep(
+                name: "workspace-sidebar-\(side.rawValue)",
+                assert: { [self] in
+                    guard originalConfig.workspaceBar else {
+                        probe.skipLine(step: "workspace-sidebar-\(side.rawValue)", reason: "workspace_bar=false")
+                        return
+                    }
+                    if stackFixtures.isEmpty {
+                        for name in ["Sidebar A", "Sidebar B"] {
+                            if let id = createWorkspace(named: name) { stackFixtures.append(id) }
+                        }
+                        refreshWorkspaceChips()
+                    }
+                    // Through the real Settings popup (General ▸ Workspaces).
+                    let settings = SettingsWindowController(app: self)
+                    let chosen = settings.probeChooseWorkspaceBarPosition(side)
+                    settings.window?.orderOut(nil)
+                    guard chosen == side else {
+                        throw ProbeFailure("Settings popup set \(chosen.rawValue), wanted \(side.rawValue)")
+                    }
+                    try check(side)
+                }))
+        }
+        // Large chrome (Appearance › Size follows the terminal font): at
+        // font 26 the column is 320 pt and chip chrome doubles — the chip
+        // must still span the column with its name inside (Codex review:
+        // the top bar's 220 pt name cap made this unsatisfiable).
+        probe.add(ProbeStep(
+            name: "workspace-sidebar-large-font",
+            assert: { [self] in
+                guard originalConfig.workspaceBar else {
+                    probe.skipLine(step: "workspace-sidebar-large-font", reason: "workspace_bar=false")
+                    return
+                }
+                var c = originalConfig
+                c.fontSize = 26
+                c.workspaceBarPosition = .left
+                applyConfigLive(c)
+                defer {
+                    var back = originalConfig
+                    back.workspaceBarPosition = .right
+                    applyConfigLive(back)
+                }
+                print("UIPROBE-SIDEBAR large_font=26 width=\(WindowHostController.sidebarWidth(chromeMetrics))")
+                try check(.left)
+            }))
+        var extra: [String] = []
+        probe.add(ProbeStep(
+            name: "workspace-sidebar-overflow",
+            assert: { [self] in
+                guard originalConfig.workspaceBar else {
+                    probe.skipLine(step: "workspace-sidebar-overflow", reason: "workspace_bar=false")
+                    return
+                }
+                guard let host = keyHost(), let window = host.window, let bar = host.workspaceBar else {
+                    throw ProbeFailure("no bar")
+                }
+                for n in 1...4 { if let id = createWorkspace(named: "Sidebar \(n)") { extra.append(id) } }
+                refreshWorkspaceChips()
+                let saved = window.frame
+                var short = saved
+                short.size.height = 150
+                window.setFrame(short, display: true)
+                window.contentView?.layoutSubtreeIfNeeded()
+                bar.layoutSubtreeIfNeeded()
+                let plan = bar.probeSidebarPlan()
+                // Read while still short: cleanup below relayouts the chips.
+                let activeVisible = bar.probeChipView(activeWorkspaceId)?.isHidden == false
+                let hiddenChips = extra.filter { bar.probeChipView($0)?.isHidden == true }.count
+                print("UIPROBE-SIDEBAR overflow=\(plan?.overflow.count ?? -1) hidden_chips=\(hiddenChips) title=\(plan?.showTitle ?? true) active_visible=\(activeVisible)")
+                window.setFrame(saved, display: true)
+                for id in extra { forgetWorkspace(id) }
+                extra = []
+                guard let plan, !plan.overflow.isEmpty, !plan.showTitle, hiddenChips > 0 else {
+                    throw ProbeFailure("a short sidebar did not overflow chips into the menu")
+                }
+                guard activeVisible, !plan.overflow.contains(activeWorkspaceId) else {
+                    throw ProbeFailure("the active workspace's chip overflowed")
+                }
+            }))
+        probe.add(ProbeStep(
+            name: "workspace-sidebar-back-to-top",
+            assert: { [self] in
+                applyConfigLive(originalConfig)
+                for id in stackFixtures { forgetWorkspace(id) }
+                stackFixtures = []
+                guard originalConfig.workspaceBar, originalConfig.workspaceBarPosition == .top else {
+                    probe.skipLine(step: "workspace-sidebar-back-to-top", reason: "bar not on top in this config")
+                    return
+                }
+                keyHost()?.window?.contentView?.layoutSubtreeIfNeeded()
+                guard let host = keyHost(), let bar = host.workspaceBar,
+                      let barFrame = host.workspaceBarFrameInWindow(),
+                      let strip = host.tabStripFrameInWindow() else { throw ProbeFailure("no bar/strip") }
+                host.window?.contentView?.layoutSubtreeIfNeeded()
+                let content = host.contentFrameInWindow()
+                let width = host.window?.contentView?.bounds.width ?? 0
+                print("UIPROBE-SIDEBAR back_to_top bar_y=\(Int(barFrame.minY)) strip_top=\(Int(strip.maxY)) bar_width=\(Int(barFrame.width)) content=\(Int(content.minX))..\(Int(content.maxX)) gear=\(host.gearFrameInWindow() != nil)")
+                guard bar.position == .top, abs(barFrame.minY - strip.maxY) <= 0.5,
+                      abs(barFrame.width - width) <= 0.5, abs(content.minX) <= 0.5,
+                      abs(content.maxX - width) <= 0.5, host.gearFrameInWindow() != nil else {
+                    throw ProbeFailure("back on top, the bar/content/gear are not where they were")
+                }
             }))
     }
 
@@ -5466,6 +5899,10 @@ extension MemtermAppDelegate {
                 guard inDefault else {
                     throw ProbeFailure("panel after close-all is not in an active Default workspace (ws=\(host.workspaceId ?? "nil") active=\(activeWorkspaceId) list=\(list.map(\.name)))")
                 }
+                // Leave the mode off: the config file is the next run's.
+                var off = config
+                off.dropdownEnabled = false
+                applyConfigLive(off)
             }))
     }
 

@@ -60,30 +60,33 @@ extension MemtermAppDelegate {
             engine.store.setWorkspaceParked(id, parked: false)  // reopen
         }
         let outgoingId = activeWorkspaceId
-        let fade = switchFadeEnabled
+        // Quake style on: no window-level crossfade (spec §7) — it overlaps
+        // the outgoing and incoming windows on screen. In-window fades of a
+        // swap are unaffected (same window).
+        let fade = switchFadeEnabled && !isDropdownMode
         isSwitchingWorkspaces = true
         // Slot order: the KEY host first — the in-place presentation swaps
         // the incoming primary group into the window the user is looking at.
-        // The drop-down panel is never a swap slot: the outgoing one hides
-        // with its workspace, the incoming one stays hidden until its hotkey.
-        for panel in hosts where panel.isDropdown && panel.workspaceId == outgoingId {
-            panel.orderOutReleasingSurfaces()
-        }
-        var outgoing = hosts.filter { $0.workspaceId == outgoingId && !$0.isDropdown }
+        // With quake style on that window IS the panel (spec §7), so a swap
+        // keeps the panel and simply shows the other workspace's tabs in it.
+        var outgoing = hosts.filter { $0.workspaceId == outgoingId }
         if let keyWindow = NSApp.keyWindow ?? NSApp.mainWindow
             ?? lastFocusedHost?.window,
            let keyIndex = outgoing.firstIndex(where: { $0.window === keyWindow }),
            keyIndex != 0 {
             outgoing.swapAt(0, keyIndex)
         }
-        let incoming = hosts.filter { $0.workspaceId == id && !$0.isDropdown }
+        let incoming = hosts.filter { $0.workspaceId == id }
         if !incoming.isEmpty {
             swapTabSets(incoming: incoming, outgoing: outgoing, fade: fade)
         } else if controllers.contains(where: { $0.workspaceId == id }) {
-            // Only a hidden drop-down panel is live for the incoming
-            // workspace: open a fresh window for it (its panel stays a panel),
-            // and hide the outgoing windows like the resurrect path does.
-            let adoptFrame = outgoing.first?.window?.frame
+            // Live tabs with no host (mid re-homing): open a fresh window
+            // for the workspace and hide the outgoing windows like the
+            // resurrect path does.
+            let adoptFrame = outgoing.first?.restingFrame
+            // Quake style on: the outgoing window leaves the screen BEFORE
+            // anything incoming appears — never two at once (spec §7).
+            if isDropdownMode { for host in outgoing { host.orderOutReleasingSurfaces() } }
             let fresh = openNewWindow(in: id)
             if let adoptFrame { fresh.window?.setFrame(adoptFrame, display: true) }
             for host in outgoing { host.orderOutReleasingSurfaces() }
@@ -93,7 +96,11 @@ extension MemtermAppDelegate {
             // adopts the outgoing key frame so the switch still presents in
             // place. The outgoing hosts hide whole (plain windows — nothing
             // dissolves; their tabs, order, and selection stay first-class).
-            let adoptFrame = outgoing.first?.window?.frame
+            // The RESTING frame: a panel's geometry is not a window's (§7).
+            let adoptFrame = outgoing.first?.restingFrame
+            // Quake style on: hide the outgoing window first; restoreWindows
+            // then leaves the incoming windows hidden for dropdown.show().
+            if isDropdownMode { for host in outgoing { host.orderOutReleasingSurfaces() } }
             fadeInPending = fade
             let restored = engine.store.loadState(workspaceId: id)
             if restored.isEmpty {
@@ -120,6 +127,8 @@ extension MemtermAppDelegate {
         engine.store.setMeta("active_workspace_id", id)
         rebuildWorkspaceMenu()
         engine.scheduleTopologySave()
+        // Quake style on: the incoming workspace's window is the panel, down.
+        dropdown.activeWorkspaceChanged()
     }
 
     /// The FR-59 swap: slot-matched over the two workspaces' ordered host
@@ -148,8 +157,10 @@ extension MemtermAppDelegate {
             // releasing is the no-op its content view's state says it is).
             holder.orderOutReleasingSurfaces()
         }
-        // Incoming groups beyond the overlap: show their hosts as-is.
-        if incoming.count > outgoing.count {
+        // Incoming groups beyond the overlap: show their hosts as-is —
+        // except with quake style on, where the panel is the one window and
+        // extras stay hidden holders (spec §7).
+        if incoming.count > outgoing.count, !isDropdownMode {
             for host in incoming[outgoing.count...] {
                 guard let window = host.window else { continue }
                 host.restoreGPUSurfaces()
@@ -196,7 +207,7 @@ extension MemtermAppDelegate {
             for host in outgoing { host.orderOutReleasingSurfaces() }
             return
         }
-        let incomingWindows = hosts.filter { $0.workspaceId == incomingId && !$0.isDropdown }
+        let incomingWindows = hosts.filter { $0.workspaceId == incomingId }
             .compactMap(\.window)
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.16
@@ -315,7 +326,13 @@ extension MemtermAppDelegate {
     }
 
     func focusWindows(ofWorkspace id: String) {
-        hosts.first { $0.workspaceId == id && !$0.isDropdown }?.focusWindow()
+        // Quake style on: the panel is the workspace's one window; never
+        // bring a hidden secondary window forward (spec §7).
+        if isDropdownMode, id == activeWorkspaceId {
+            dropdown.show()
+            return
+        }
+        hosts.first { $0.workspaceId == id }?.focusWindow()
     }
 
     /// FR-58: reassigns a live tab to another workspace, then FOLLOWS the tab
@@ -348,7 +365,7 @@ extension MemtermAppDelegate {
         // the target workspace's host, or a fresh one.
         controller.host?.detach(controller)
         controller.setWorkspace(id)
-        if let target = hosts.first(where: { $0.workspaceId == id && !$0.isDropdown }) {
+        if let target = hosts.first(where: { $0.workspaceId == id }) {
             target.attach(controller, select: true)
         } else {
             let fresh = makeHost(frame: nil)
@@ -898,6 +915,11 @@ extension MemtermAppDelegate: NSMenuItemValidation {
             return store.listWorkspaces().count > 1
         case #selector(nextWorkspace(_:)), #selector(previousWorkspace(_:)):
             return store.listWorkspaces().filter { !$0.isParked }.count > 1
+        case #selector(moveTabToNewWindowAction(_:)):
+            // Quake style on: one window only (spec 2026-10-02 §7).
+            return !isDropdownMode
+        case #selector(toggleDropdown(_:)):
+            return isDropdownMode
         default:
             return true
         }

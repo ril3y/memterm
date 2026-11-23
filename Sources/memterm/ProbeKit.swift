@@ -416,14 +416,16 @@ private func sampleColors(_ bmp: NSBitmapImageRep, region: CGRect,
 }
 
 /// Bug-1 class, pixel half: the region actually RENDERED something — it is
-/// non-empty and non-uniform (>= 2 distinct quantized colors on a 16x16
-/// sample grid). A blank/collapsed pane fails here even when its frame lies.
+/// non-empty and non-uniform (>= 2 distinct quantized colors on a `grid` x
+/// `grid` sample grid, 16 by default). A uniform region fails; a collapsed
+/// frame is caught by the geometry checks, not here. This proves sampled
+/// pixels differ, not that terminal text painted.
 func assertRendered(_ bmp: NSBitmapImageRep, region: CGRect,
-                    what: String) throws {
+                    what: String, grid: Int = 16) throws {
     guard region.width >= 1, region.height >= 1 else {
         throw ProbeFailure("\(what): empty region \(region)")
     }
-    let colors = sampleColors(bmp, region: region)
+    let colors = sampleColors(bmp, region: region, grid: grid)
     guard !colors.isEmpty else {
         throw ProbeFailure("\(what): no samples inside the bitmap")
     }
@@ -624,13 +626,6 @@ func assertChipVisible(chipFrame: CGRect, in bmp: NSBitmapImageRep,
     }
 }
 
-// MARK: - Quiet-mode window (TESTING.md §2.5)
-
-/// Probe windows in quiet mode live offscreen; AppKit's default
-/// constrainFrameRect would drag them back onto a screen, so the probe
-/// window class disables constraining entirely.
-final class ProbeQuietWindow: NSWindow {
-    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
-        frameRect
-    }
-}
+// Quiet-mode windows (TESTING.md §2.5): host windows are HostWindow
+// (WindowHost.swift) with allowsOffscreenFrames set, so AppKit never drags
+// them back onto a screen.

@@ -214,7 +214,7 @@ extension RemoteHost {
                                                   initialCwd: nil)
         app.registerController(controller)
         let isActive = workspaceId == app.activeWorkspaceId
-        if let host = app.hosts.first(where: { $0.workspaceId == workspaceId && !$0.isDropdown }) {
+        if let host = app.hosts.first(where: { $0.workspaceId == workspaceId }) {
             host.attach(controller, select: isActive)
         } else {
             let fresh = app.makeHost(frame: nil)

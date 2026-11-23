@@ -25,6 +25,7 @@ Requires macOS 14 or later.
 - A workspace with unseen output shows a ring, and a pulsing dot while output is flowing.
 - Closing a workspace's last tab parks it in the Parked menu with its name and color kept.
 - In a narrow window the bar shortens workspace names to initials, then dots.
+- The workspace bar can sit on top or as a sidebar on the left or right (**Settings ▸ General ▸ Workspaces**).
 - ⌃⌘1–9 switches workspaces; ⌘1–9 switches tabs.
 
 ## Terminal
@@ -34,7 +35,7 @@ Requires macOS 14 or later.
 - Right-click a file path or URL to copy it, open it, or reveal it in Finder. Paths that wrap across lines work too.
 - New tabs open in the current directory, read from the system, so no shell setup is needed.
 - Six built-in themes plus `.itermcolors` import, transparency and blur, Nerd Font detection, option-as-meta.
-- **Drop-down terminal:** a global hotkey (a key combo, or a double-tap of ⌃ ⌥ ⌘ ⇧ or Esc) slides a terminal in from the top, left, or right edge. Turn it on in **Settings ▸ Appearance**.
+- **Drop-down terminal:** turn it on in **Settings ▸ Appearance** and your window becomes the drop-down, with all its tabs and workspaces. A global hotkey (a key combo, or a double-tap of ⌃ ⌥ ⌘ ⇧ or Esc) slides it in from the top, left, or right edge and away again. Turn it off and it goes back to a normal window where it was.
 
 ## Remote attach
 

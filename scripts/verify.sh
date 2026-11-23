@@ -121,6 +121,10 @@ fi
 echo "== [5/8] headless + perf gates against the dist binary"
 CFGDIR="$WORK/configs"; mkdir -p "$CFGDIR"
 : > "$CFGDIR/default.toml"
+# Smoke and the smoke-save seeds get their OWN config file: the smoke run
+# leaves quake style ON (spec 2026-10-02 §7: run 2 proves the mode comes
+# back on the restored window), and probe worlds must not inherit that.
+: > "$CFGDIR/smoke.toml"
 printf 'window_opacity = 0.37\nwindow_blur = true\n' > "$CFGDIR/founder.toml"
 printf 'workspace_bar = false\n' > "$CFGDIR/nobar.toml"
 printf '[theme]\nbackground = "#ffffff"\nforeground = "#1d1f21"\ncursor = "#1d1f21"\n' > "$CFGDIR/light.toml"
@@ -135,10 +139,10 @@ check "config-dump" "$LOG/config-dump.log" "^config: "
 
 echo "== [6/8] smoke (reboot-restore promise, capture -> crash-sim -> restore)"
 SMOKEDIR="$(mktemp -d)"
-MEMTERM_STATE_DIR="$SMOKEDIR" MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" \
+MEMTERM_STATE_DIR="$SMOKEDIR" MEMTERM_CONFIG_PATH="$CFGDIR/smoke.toml" \
     "$BIN" --smoke=save > "$LOG/smoke-save.log" 2>&1
 check "smoke-save" "$LOG/smoke-save.log" "SMOKE-PASS run=save steps=([0-9]+)/\1"
-MEMTERM_STATE_DIR="$SMOKEDIR" MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" \
+MEMTERM_STATE_DIR="$SMOKEDIR" MEMTERM_CONFIG_PATH="$CFGDIR/smoke.toml" \
     MEMTERM_SMOKE_GOLDEN="$GOLDEN" \
     "$BIN" --smoke=verify > "$LOG/smoke-verify.log" 2>&1
 check "smoke-verify" "$LOG/smoke-verify.log" "SMOKE-PASS run=verify steps=([0-9]+)/\1"
@@ -146,8 +150,9 @@ check "smoke-geometry-golden" "$LOG/smoke-verify.log" "SMOKE-GEOMETRY golden=mat
 # Founder bug 2026-09-09 (duplicate window at launch): the seed carries a
 # hidden-unparked workspace; launch must show exactly the active one and
 # leave C journaled for a lazy resurrect on switch-in.
-# hosts=2: the default window plus its hidden drop-down panel (2026-09-09).
-check "smoke-launch-visible" "$LOG/smoke-verify.log" "SMOKE-LAUNCH-VISIBLE hosts=2 visible=1 stray=0 c_restored=false"
+# hosts=1: the drop-down is the default window's own presentation now
+# (spec 2026-10-02 §7), no separate panel host.
+check "smoke-launch-visible" "$LOG/smoke-verify.log" "SMOKE-LAUNCH-VISIBLE hosts=1 visible=1 stray=0 c_restored=false"
 check "smoke-lazy-resurrect" "$LOG/smoke-verify.log" "SMOKE-LAZY-RESURRECT c_tabs=1 visible=1 stray=0 "
 
 # ------------------------------------------------------- relay preflight
@@ -202,14 +207,14 @@ fi
 # restored world: seeded from a REAL --smoke=save capture, restored through
 # the REAL restoreWindows() pipeline. Bugs 1 and 3's permanent gate.
 SEED1="$(mktemp -d)"
-MEMTERM_STATE_DIR="$SEED1" MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" \
+MEMTERM_STATE_DIR="$SEED1" MEMTERM_CONFIG_PATH="$CFGDIR/smoke-seed1.toml" \
     "$BIN" --smoke=save > "$LOG/seed-restored.log" 2>&1
 check "seed-for-restored" "$LOG/seed-restored.log" "SMOKE-PASS run=save steps=([0-9]+)/\1"
 probe "restored-default" restored "$CFGDIR/default.toml" "$SEED1"
 
 # observe: the side-effect quarantine — a pristine seed, zero fixtures.
 SEED2="$(mktemp -d)"
-MEMTERM_STATE_DIR="$SEED2" MEMTERM_CONFIG_PATH="$CFGDIR/default.toml" \
+MEMTERM_STATE_DIR="$SEED2" MEMTERM_CONFIG_PATH="$CFGDIR/smoke-seed2.toml" \
     "$BIN" --smoke=save > "$LOG/seed-observe.log" 2>&1
 check "seed-for-observe" "$LOG/seed-observe.log" "SMOKE-PASS run=save steps=([0-9]+)/\1"
 probe "observe" observe "$CFGDIR/default.toml" "$SEED2"
@@ -239,12 +244,30 @@ check "fresh-default-hidden-surfaces" "$LOG/probe-fresh-default.log" "UIPROBE-HI
 # off-edge with its tab live, journaled with its role, per-workspace.
 # Founder 2026-09-19: an inline workspace rename must survive a chip-row refresh and a click into the field.
 check "fresh-default-rename-survives" "$LOG/probe-fresh-default.log" "UIPROBE-RENAME-SURVIVES started=true after_refresh=true after_click=true"
-check "fresh-default-dropdown-show" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN show=true role=dropdown ws_is_active=true .* expected_off=0.0 level_floating=true movable=false hotkey_registered=none"
-check "fresh-default-dropdown-switch" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN switch_hides=true per_workspace_panels=true back_same_tab=true"
+# Spec 2026-10-02 §7 (one window): the mode presents the SAME window with
+# the same tabs, alone on screen; journals the resting frame with no role;
+# ⌘N/Move Tab never make a second window; switches keep one window; legacy
+# panel rows merge; real-slide races end right; mode off restores the window.
+check "fresh-default-dropdown-show" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN show=true same_window=true tabs_before=([0-9]+) tabs_after=\1 visible_windows=1 .* expected_off=0.0 level_floating=true movable=false lights_hidden=true .*hotkey_registered=none"
+check "fresh-default-dropdown-journal" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN journal_roles=\[\] "
+check "fresh-default-dropdown-one-window" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN cmd_n_added_tabs=1 hosts=([0-9]+)/\1/\1 move_tab_enabled=false visible_windows=1"
+check "fresh-default-dropdown-switch" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN switch_visible_windows=1 panel_ws_is_new=true old_window_normal_hidden=true "
+check "fresh-default-dropdown-switch-back" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN switch_back visible_windows=1 panel_has_first_tab=true panel_showing=true"
+check "fresh-default-dropdown-legacy-merge" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN legacy_hosts=1 legacy_tabs=2 panel=true roles_after_capture=\[\]"
+check "fresh-default-dropdown-two-windows" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN two_windows panel_is_focused=true visible_after_enable=1 visible_after_active_click=1 key_is_panel=true"
+check "fresh-default-dropdown-race-show" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN race_hide_show visible=true at_target=true "
+check "fresh-default-dropdown-race-off" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN race_hide_off visible=true panel=false "
+check "fresh-default-dropdown-off" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN off_restores .* resizable=true closable=true level_normal=true movable=true lights=true toggle_noop=true"
+# Spec 2026-10-02 §3/§7: the workspace sidebar, both sides, large chrome,
+# overflow, and back on top.
+check "fresh-default-sidebar-left" "$LOG/probe-fresh-default.log" "UIPROBE-SIDEBAR side=left .* columns=1 stacked=true gear_in_strip=true"
+check "fresh-default-sidebar-right" "$LOG/probe-fresh-default.log" "UIPROBE-SIDEBAR side=right .* columns=1 stacked=true gear_in_strip=true"
+check "fresh-default-sidebar-overflow" "$LOG/probe-fresh-default.log" "UIPROBE-SIDEBAR overflow=[1-9][0-9]* hidden_chips=[1-9][0-9]* title=false active_visible=true"
+check "fresh-default-sidebar-top" "$LOG/probe-fresh-default.log" "UIPROBE-SIDEBAR back_to_top .* gear=true"
 check "fresh-default-dropdown-size-typing" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN settings_typed_field=40 width_after_typing=0.4 "
 check "fresh-default-dropdown-close-all" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN close_all_then_hotkey=true active_before=other panel_in_default=true tab_live=true "
 check "fresh-default-dropdown-double-tap" "$LOG/probe-fresh-default.log" "UIPROBE-DROPDOWN double_tap_toggles=true slow_ignored=true shortcut_ignored=true other_key_ignored=true global_tap=false"
-check "smoke-dropdown-restores" "$LOG/smoke-verify.log" "SMOKE-DROPDOWN restored_panels=1 hidden=true panel_tabs=1 "
+check "smoke-dropdown-restores" "$LOG/smoke-verify.log" "SMOKE-DROPDOWN restored_panels=1 visible_windows=1 panel_visible=true .* roles=\[\]"
 probe "matrix-nobar"   fresh "$CFGDIR/nobar.toml"
 check "matrix-nobar-skips" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-contrast-rendered reason=workspace_bar=false"
 check "matrix-nobar-skips-centering" "$LOG/probe-matrix-nobar.log" "UIPROBE-SKIP step=chip-vertical-centering reason=workspace_bar=false"

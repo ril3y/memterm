@@ -401,3 +401,35 @@ final class RemoteConfigTests: XCTestCase {
         XCTAssertEqual(back.themeBackground, c.themeBackground)
     }
 }
+
+/// Spec 2026-10-02 §7: the workspace bar can sit on top (default), or as a
+/// sidebar on the left or right.
+final class WorkspaceBarPositionConfigTests: XCTestCase {
+    func testDefaultsToTop() {
+        XCTAssertEqual(Config().workspaceBarPosition, .top)
+        XCTAssertEqual(Config.parse("").workspaceBarPosition, .top)
+    }
+
+    func testParsesLeftAndRight() {
+        XCTAssertEqual(Config.parse("workspace_bar_position = \"left\"").workspaceBarPosition, .left)
+        XCTAssertEqual(Config.parse("workspace_bar_position = \"right\"").workspaceBarPosition, .right)
+    }
+
+    func testUnknownValueKeepsTop() {
+        XCTAssertEqual(Config.parse("workspace_bar_position = \"bottom\"").workspaceBarPosition, .top)
+        XCTAssertEqual(Config.parse("workspace_bar_position = 3").workspaceBarPosition, .top)
+    }
+
+    func testRoundTripsThroughSerialize() {
+        var c = Config()
+        c.workspaceBarPosition = .right
+        XCTAssertEqual(Config.parse(c.serialize()).workspaceBarPosition, .right)
+        XCTAssertTrue(c.serialize().contains("workspace_bar_position = \"right\""))
+    }
+
+    func testAxisFollowsPosition() {
+        XCTAssertEqual(WorkspaceBarPosition.top.axis, .horizontal)
+        XCTAssertEqual(WorkspaceBarPosition.left.axis, .vertical)
+        XCTAssertEqual(WorkspaceBarPosition.right.axis, .vertical)
+    }
+}

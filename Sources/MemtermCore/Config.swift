@@ -38,6 +38,9 @@ public struct Config {
     /// by default (the founder wants to SEE workspaces); `workspace_bar =
     /// false` hides it.
     public var workspaceBar = true
+    /// Spec 2026-10-02 §7: where the workspace bar sits — `top` (the row
+    /// above the tab strip, default) or a `left` / `right` sidebar.
+    public var workspaceBarPosition = WorkspaceBarPosition.top
     /// DEPRECATED NO-OP (custom-tab-chrome stage 2): memterm's own tab strip
     /// is the window's titlebar surface and is always visible — collapsing it
     /// would orphan titles, rename, drag, and activity. The key stays parsed
@@ -224,6 +227,8 @@ public struct Config {
         if let n = number(values["font_size"]), n > 4 { c.fontSize = n }
         if let b = boolean(values["copy_on_select"]) { c.copyOnSelect = b }
         if let b = boolean(values["workspace_bar"]) { c.workspaceBar = b }
+        if let s = string(values["workspace_bar_position"]),
+           let position = WorkspaceBarPosition(rawValue: s) { c.workspaceBarPosition = position }
         if let b = boolean(values["always_show_tab_bar"]) { c.alwaysShowTabBar = b }
         if case .int(let n)? = values["scrollback_lines"], n >= 0 { c.scrollbackLines = n }
         if case .int(let n)? = values["archive_retention_days"], n >= 0 { c.archiveRetentionDays = n }
@@ -367,6 +372,7 @@ public struct Config {
         lines.append("font_size = \(fontSize == fontSize.rounded() ? String(Int(fontSize)) : String(fontSize))")
         lines.append("copy_on_select = \(copyOnSelect)")
         lines.append("workspace_bar = \(workspaceBar)")
+        lines.append("workspace_bar_position = \"\(workspaceBarPosition.rawValue)\"  # top | left | right (a sidebar under the tabs)")
         lines.append("always_show_tab_bar = \(alwaysShowTabBar)  # no-op: memterm's tab strip is always visible")
         lines.append("scrollback_lines = \(scrollbackLines)")
         lines.append("archive_retention_days = \(archiveRetentionDays)  # closed-tab archive kept this long; 0 = forever")
@@ -454,6 +460,8 @@ public struct Config {
 
         # The workspace bar (chips under the tab bar). false hides it.
         # workspace_bar = true
+        # Where it sits: top (a row above the tabs) or a left / right sidebar.
+        # workspace_bar_position = "top"
 
         # No-op (kept for old config files): memterm draws its own tab strip
         # and it is always visible.

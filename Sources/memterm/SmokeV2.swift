@@ -232,9 +232,11 @@ extension MemtermAppDelegate {
                 }
             }))
 
-        // Quake-style drop-down (2026-09-09): a panel with a live shell is
-        // left open in the default workspace so run 2 proves it restores AS
-        // a panel — role kept, hidden, its tab live — not as a plain window.
+        // Quake-style drop-down, one window (spec 2026-10-02 §7): the mode
+        // is left ON with the default workspace's window presented as the
+        // panel. The journal must hold that window as a plain window at its
+        // RESTING frame (no role, no panel geometry); run 2 proves the mode
+        // comes back on the restored window, still one window.
         smoke.add(ProbeStep(
             name: "save-dropdown-panel", timeout: 10,
             action: { [self] in
@@ -242,18 +244,23 @@ extension MemtermAppDelegate {
                 c.dropdownEnabled = true
                 c.dropdownAnimationMs = 0
                 applyConfigLive(c)
-                dropdown.show()
             },
             condition: { [self] in
-                dropdown.panelHost?.selectedTab?.allPanes().first?.process?.running == true
+                dropdown.panelHost?.window?.isVisible == true
             },
             assert: { [self] in
-                guard let engine = memory else { throw ProbeFailure("no engine") }
+                guard let engine = memory, let host = dropdown.panelHost,
+                      let resting = host.restingFrame else { throw ProbeFailure("no engine/panel") }
                 engine.flushSync()
                 let rows = engine.store.loadState(workspaceId: StateStore.defaultWorkspaceId)
-                let panel = rows.contains { $0.isDropdown }
-                print("SMOKE-DROPDOWN journaled_role=\(panel) windows=\(rows.count)")
-                guard panel else { throw ProbeFailure("drop-down panel not journaled with its role") }
+                let roles = rows.compactMap(\.role)
+                let frame = "\(Int(resting.origin.x)),\(Int(resting.origin.y)),\(Int(resting.width)),\(Int(resting.height))"
+                let visible = hosts.filter { $0.window?.isVisible == true }.count
+                print("SMOKE-DROPDOWN roles=\(roles) windows=\(rows.count) resting=\(frame) journaled_frames=\(rows.compactMap(\.frame)) visible_windows=\(visible)")
+                guard roles.isEmpty, rows.contains(where: { $0.frame == frame }) else {
+                    throw ProbeFailure("the panel must journal as a plain window at its resting frame")
+                }
+                guard visible == 1 else { throw ProbeFailure("\(visible) windows visible with quake style on") }
             }))
 
         // FR-56 leg — SEMANTICS UPDATED with the founder-amended FR-56
@@ -269,7 +276,6 @@ extension MemtermAppDelegate {
             assert: { [self] in
                 guard let engine = memory, let doomed = controllers.first(where: {
                     $0.workspaceId == activeWorkspaceId && $0.allPanes().count == 1
-                        && $0.host?.isDropdown != true
                 }) else {
                     throw ProbeFailure("no single-pane tab to close")
                 }
@@ -332,19 +338,35 @@ extension MemtermAppDelegate {
                         .allSatisfy { $0.frame.width >= 1 && $0.frame.height >= 1 }
             },
             assert: { [self] in
-                // The drop-down panel restores AS a panel: hidden, role kept,
-                // its tab live; it is not one of the normal windows counted
-                // below.
-                let panelHosts = hosts.filter { $0.isDropdown }
-                let panelHidden = panelHosts.allSatisfy { $0.window?.isVisible != true }
-                let panelTabs = panelHosts.flatMap(\.tabs)
-                print("SMOKE-DROPDOWN restored_panels=\(panelHosts.count) hidden=\(panelHidden) panel_tabs=\(panelTabs.count) panel_ws=\(panelHosts.first?.workspaceId ?? "nil")")
-                guard panelHosts.count == 1, panelHidden, panelTabs.count == 1,
-                      panelHosts[0].workspaceId == StateStore.defaultWorkspaceId else {
-                    throw ProbeFailure("drop-down panel did not restore as a hidden panel")
+                // Quake style was left on (spec 2026-10-02 §7): the restored
+                // window itself is the panel — the only window on screen, its
+                // resting frame the journaled one, no role in the journal.
+                let panelHosts = hosts.filter(\.isPanel)
+                let visibleNow = hosts.filter { $0.window?.isVisible == true }
+                let rowsNow = memory?.store.loadState(workspaceId: StateStore.defaultWorkspaceId) ?? []
+                let resting = panelHosts.first?.restingFrame.map {
+                    "\(Int($0.origin.x)),\(Int($0.origin.y)),\(Int($0.width)),\(Int($0.height))"
                 }
-                let windows = hosts.filter { !$0.tabs.isEmpty && !$0.isDropdown }.count
-                let panes = controllers.filter { $0.host?.isDropdown != true }.flatMap { $0.allPanes() }
+                print("SMOKE-DROPDOWN restored_panels=\(panelHosts.count) visible_windows=\(visibleNow.count) panel_visible=\(panelHosts.first?.window?.isVisible == true) resting=\(resting ?? "nil") journaled_frames=\(rowsNow.compactMap(\.frame)) roles=\(rowsNow.compactMap(\.role))")
+                guard config.dropdownEnabled, panelHosts.count == 1, visibleNow.count == 1,
+                      visibleNow[0] === panelHosts[0],
+                      panelHosts[0].workspaceId == StateStore.defaultWorkspaceId else {
+                    throw ProbeFailure("quake style did not come back as the one restored window")
+                }
+                guard let resting, rowsNow.contains(where: { $0.frame == resting }),
+                      rowsNow.allSatisfy({ $0.role == nil }) else {
+                    throw ProbeFailure("the restored panel's resting frame is not the journaled frame")
+                }
+                // The remaining verify steps (geometry golden included) read a
+                // normal window: quake style off restores it.
+                var off = config
+                off.dropdownEnabled = false
+                applyConfigLive(off)
+                guard hosts.allSatisfy({ !$0.isPanel }) else {
+                    throw ProbeFailure("turning quake style off left a panel")
+                }
+                let windows = hosts.filter { !$0.tabs.isEmpty }.count
+                let panes = controllers.flatMap { $0.allPanes() }
                 let cwds = panes.compactMap { $0.lastKnownCwd }
                 print("SMOKE-RESTORED windows=\(windows) tabs=\(controllers.count) panes=\(panes.count) cwds=\(cwds)")
                 // Workspace assertions: parked B is listed but NOT restored.
@@ -381,7 +403,7 @@ extension MemtermAppDelegate {
                 // forever: its sessions row and frozen files must have
                 // survived the crash-sim relaunch (including the launch-time
                 // orphan sweep and retention pass).
-                let normalTabs = controllers.filter { $0.host?.isDropdown != true }.count
+                let normalTabs = controllers.count
                 guard normalTabs == 1, panes.count == 2 else {
                     throw ProbeFailure("close-forget: expected 1 tab / 2 panes restored, got \(normalTabs) tab(s) / \(panes.count) pane(s)")
                 }
@@ -411,7 +433,7 @@ extension MemtermAppDelegate {
         smoke.add(ProbeStep(
             name: "verify-restore-geometry-golden", timeout: 10,
             assert: { [self] in
-                guard let host = hosts.first(where: { !$0.tabs.isEmpty && !$0.isDropdown }),
+                guard let host = hosts.first(where: { !$0.tabs.isEmpty }),
                       let window = host.window, let tab = host.selectedTab else {
                     throw ProbeFailure("no restored window for the geometry golden")
                 }

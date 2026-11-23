@@ -5,13 +5,19 @@ import MemtermCore
 
 // Quake-style drop-down terminal (founder ask 2026-09-09): a global hotkey
 // slides a terminal panel in from a screen edge and away again — "the old
-// school terminal in quake2". The panel is a normal WindowHostController
-// with role .dropdown: its tabs are first-class (journaled with role
-// "dropdown", restored hidden, archived on close like any tab), it belongs
-// to the ACTIVE workspace (hidden with it on a switch, FR-59), and it is
-// never slot-matched into the workspace swap. Geometry is
-// MemtermCore.DropdownLayout; the hotkey is MemtermCore.HotkeySpec via
-// Carbon's RegisterEventHotKey (no Accessibility grant needed).
+// school terminal in quake2".
+//
+// One window (founder 2026-10-02, built 2026-11-23; spec 2026-10-02 §5/§7):
+// "There should ONLY be one memterm window ever visible, so if you select
+// quake style it should be that window with all the current tabs and
+// workspaces; if you unselect it it should be the opposite." The panel is
+// therefore a PRESENTATION of the active workspace's own window
+// (WindowHostController.enterPanelPresentation), not a second host: same
+// tabs, same workspace bar, same journal rows (resting frame, no role).
+// Turning the mode off restores the window's frame, level and style.
+// Geometry is MemtermCore.DropdownLayout; the hotkey is
+// MemtermCore.HotkeySpec via Carbon's RegisterEventHotKey (no Accessibility
+// grant needed).
 final class DropdownController {
     private unowned let app: MemtermAppDelegate
     private var hotKeyRef: EventHotKeyRef?
@@ -35,6 +41,13 @@ final class DropdownController {
     private var grantPoll: Timer?
     /// The panel currently sliding away (ignored by focus-loss hiding).
     private var hiding: WindowHostController?
+    /// Bumped by every show/hide/mode change: a slide-away completion only
+    /// orders the window out if nothing happened since it started (a quick
+    /// hide → show must not vanish when the old slide finishes).
+    private var generation = 0
+    /// Whether the mode was on at the last applyConfig: its edges (on → the
+    /// window becomes the panel and shows; off → it goes back) run once.
+    private var modeEnabled = false
 
     static let hotKeySignature: OSType = 0x4D54_4D44  // 'MTMD'
 
@@ -74,10 +87,43 @@ final class DropdownController {
             detector = DoubleTapDetector()
             if wantedTap != nil, !automated { startDoubleTap() }
         }
+        // Mode edges (spec §7): switching quake style on turns the active
+        // workspace's window into the panel and shows it there; switching it
+        // off puts every panel back as a normal window.
+        if config.dropdownEnabled != modeEnabled {
+            modeEnabled = config.dropdownEnabled
+            if modeEnabled {
+                show()
+            } else {
+                leavePanelMode()
+            }
+            return
+        }
         // A live change of placement re-lays the panel if it is showing.
         if let host = panelHost, host.window?.isVisible == true, hiding !== host {
             host.window?.setFrame(targetFrame(config), display: true)
         }
+    }
+
+    /// Quake style switched off: the panel goes back to being a normal
+    /// window — saved frame, level, style — and stays on screen if it
+    /// belongs to the active workspace.
+    private func leavePanelMode() {
+        hiding = nil
+        generation += 1
+        // Every host, not just panels: one may still be waiting on a
+        // full-screen exit before it becomes the panel.
+        for host in app.hosts { host.cancelPendingPanelEntry() }
+        let panels = app.hosts.filter(\.isPanel)
+        for host in panels { host.exitPanelPresentation() }
+        // FR-59 again: every window of the active workspace is on screen,
+        // including any the mode kept hidden; the former panel takes focus.
+        let active = app.activeWorkspaceId
+        for host in app.hosts where host.workspaceId == active && !host.tabs.isEmpty {
+            host.window?.alphaValue = 1
+            host.showWindow(nil)
+        }
+        panels.first { $0.workspaceId == active }?.focusWindow()
     }
 
     // MARK: - Double-tap trigger
@@ -311,33 +357,56 @@ final class DropdownController {
 
     // MARK: - The panel
 
-    /// The active workspace's panel host, if one exists (visible or hidden).
+    /// The host presented as the panel right now (visible or slid away).
     var panelHost: WindowHostController? {
-        app.hosts.first { $0.role == .dropdown && $0.workspaceId == app.activeWorkspaceId }
+        app.hosts.first { $0.isPanel }
     }
 
     var isShowing: Bool {
-        guard let host = panelHost, hiding !== host else { return false }
+        guard let host = panelHost, hiding !== host,
+              host.workspaceId == app.activeWorkspaceId else { return false }
         return host.window?.isVisible == true
     }
 
+    /// The hotkey, the menu item and the double-tap all land here. With
+    /// quake style off there is no panel to toggle (the window is a window).
     func toggle() {
+        guard app.config.dropdownEnabled else { return }
         if isShowing { hide() } else { show() }
     }
 
     func show() {
         let config = app.config
+        guard config.dropdownEnabled else { return }
         // Founder 2026-09-09: with every tab closed, the hotkey must still
         // produce a terminal — in the Default workspace when the active one
         // is gone (its last user close removed it).
         _ = app.workspaceForDropdown()
-        let host = panelHost ?? makePanel()
-        guard let window = host.window else { return }
-        hiding = nil
+        let host = adoptPanelHost()
+        // One window, before anything is presented (even while a full-screen
+        // exit is still pending).
+        hideOtherWindows(than: host)
+        // Entering from native full screen finishes after the exit
+        // animation; show() runs again then and re-checks everything.
+        guard host.isPanel, let window = host.window else {
+            host.enterPanelPresentation { [weak self] in self?.show() }
+            return
+        }
         let target = targetFrame(config)
+        // Already down and in place (e.g. a workspace switch that kept the
+        // window): just take focus, no second slide.
+        if isShowing, window.frame.equalTo(target) {
+            host.focusWindow()
+            return
+        }
+        hiding = nil
+        generation += 1
         let hidden = DropdownLayout.hiddenFrame(target: target, screen: screenFrame(config),
                                                 edge: edge(config))
-        window.setFrame(hidden, display: false)
+        // A slide-away may still be running (hide → show in quick
+        // succession): settle it first, or the two animations fight and the
+        // panel stops part-way (visible-probe finding, 2026-11-23).
+        Self.settleFrame(window, at: hidden)
         window.alphaValue = 1
         if Self.trace { NSLog("memterm dropdown: show (app active=%d)", NSApp.isActive ? 1 : 0) }
         if !ProbeSupport.quiet {
@@ -361,11 +430,16 @@ final class DropdownController {
         guard let window = host.window, hiding !== host else { return }
         let config = app.config
         hiding = host
+        generation += 1
+        let started = generation
         let target = targetFrame(config)
         let hidden = DropdownLayout.hiddenFrame(target: target, screen: screenFrame(config),
                                                 edge: edge(config))
+        // Same in reverse: a slide-in still running stops where it is.
+        Self.settleFrame(window, at: window.frame)
         animate(window, to: hidden, config: config) { [weak self, weak host] in
-            guard let self, let host else { return }
+            guard let self, let host, self.generation == started,
+                  self.hiding === host, host.isPanel else { return }
             // The panel has slid off its edge; releasing its drawables here
             // costs a redraw on the next hotkey and saves a window-sized
             // backing store per workspace in between.
@@ -382,14 +456,55 @@ final class DropdownController {
         hide(host)
     }
 
-    private func makePanel() -> WindowHostController {
-        let controller = TerminalWindowController(app: app, workspaceId: app.activeWorkspaceId)
+    /// The active workspace's window, to present as the panel. A panel left
+    /// on another workspace (a switch that built fresh windows) goes back to
+    /// being a normal hidden window first, so exactly one panel exists. With
+    /// no window at all (every tab closed), a fresh one is made — a normal
+    /// host with one new tab, presented as the panel.
+    @discardableResult
+    private func adoptPanelHost() -> WindowHostController {
+        let active = app.activeWorkspaceId
+        if let host = panelHost, host.workspaceId == active { return host }
+        for stale in app.hosts where stale.isPanel || stale.workspaceId != active {
+            stale.cancelPendingPanelEntry()
+            guard stale.isPanel else { continue }
+            if hiding === stale { hiding = nil }
+            if stale.window?.isVisible == true { stale.orderOutReleasingSurfaces() }
+            stale.exitPanelPresentation()
+        }
+        // show() presents it (enterPanelPresentation), which may wait for
+        // a native full-screen exit first.
+        return app.primaryHost(ofWorkspace: active) ?? makeWindow(in: active)
+    }
+
+    private func makeWindow(in workspaceId: String) -> WindowHostController {
+        let controller = TerminalWindowController(app: app, workspaceId: workspaceId)
         app.registerController(controller)
-        let host = app.makeHost(frame: nil, role: .dropdown)
+        let host = app.makeHost(frame: nil)
         host.attach(controller, select: true)
         app.memory?.scheduleTopologySave()
         app.refreshWorkspaceChips()
         return host
+    }
+
+    /// Spec §7, one window: while quake style is on, any other memterm
+    /// window that came on screen (a multi-window workspace restored, a
+    /// swap's extra groups) is hidden. Its tabs stay live and journaled as
+    /// a hidden holder — nothing merges or closes; turning the mode off or
+    /// Window ▸ Merge All Windows brings them back.
+    private func hideOtherWindows(than panel: WindowHostController) {
+        for host in app.hosts where host !== panel && host.window?.isVisible == true {
+            host.orderOutReleasingSurfaces()
+        }
+    }
+
+    /// After every workspace switch (spec §7): with quake style on, the
+    /// incoming workspace's window is the panel and is down. A swap kept
+    /// the same window (nothing to move); a switch that built fresh windows
+    /// moves the panel to them.
+    func activeWorkspaceChanged() {
+        guard app.config.dropdownEnabled else { return }
+        show()
     }
 
     // MARK: - Geometry
@@ -422,10 +537,25 @@ final class DropdownController {
                                    align: DropdownLayout.Align(rawValue: config.dropdownAlign) ?? .center)
     }
 
+    /// Ends any frame animation in flight and puts the window at `frame`. A
+    /// zero-length animation group replaces the running one; the plain
+    /// setFrame makes the model frame exact.
+    static func settleFrame(_ window: NSWindow, at frame: NSRect) {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0
+            window.animator().setFrame(frame, display: false)
+        })
+        window.setFrame(frame, display: false)
+    }
+
+    /// MEMTERM_UI_PROBE: a real slide duration for the race legs (automated
+    /// runs otherwise slide instantly).
+    var probeSlideSeconds: Double?
+
     private func animate(_ window: NSWindow, to frame: NSRect, config: Config,
                          completion: (() -> Void)?) {
-        let duration = ProbeSupport.quiet || ProbeSupport.isUIProbe
-            ? 0 : Double(config.dropdownAnimationMs) / 1000
+        let duration = probeSlideSeconds ?? (ProbeSupport.quiet || ProbeSupport.isUIProbe
+            ? 0 : Double(config.dropdownAnimationMs) / 1000)
         guard duration > 0 else {
             window.setFrame(frame, display: true)
             completion?()

@@ -54,6 +54,17 @@ final class WorkspaceBarView: NSVisualEffectView {
     private static let trailingClearance: CGFloat = 44
     private var currentPlan: WorkspaceBarCompaction.Plan?
     private var plannedWidth: CGFloat = -1
+    /// Spec 2026-10-02 §3/§7: the same bar lays out as a top row or as a
+    /// left/right sidebar column. The host moves the view; this lays it out.
+    private(set) var position: WorkspaceBarPosition = .top
+    private var horizontalLayout: [NSLayoutConstraint] = []
+    private var verticalLayout: [NSLayoutConstraint] = []
+    /// Sidebar: every chip spans the column's width.
+    private var chipWidthConstraints: [NSLayoutConstraint] = []
+    private var verticalPlan: WorkspaceBarCompaction.VerticalPlan?
+    private var plannedHeight: CGFloat = -1
+    /// Sidebar column padding.
+    private static let sidebarPadding: CGFloat = 8
 
     /// `leadingInset`: where the chip row starts. Under the custom chrome the
     /// bar is the TOP chrome row of a plain window, so the host passes the
@@ -116,12 +127,79 @@ final class WorkspaceBarView: NSVisualEffectView {
         // 1pt bottom hairline (the old +0.5 rode the pills 1pt low — founder
         // screenshot 2026-09-01; the probe's chip-vertical-centering step
         // gates this on rendered pixels now).
-        NSLayoutConstraint.activate([
+        horizontalLayout = [
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leadingInset),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -0.5),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor,
                                             constant: -Self.trailingClearance),
-        ])
+        ]
+        // Sidebar: a top-down column, padded, chips at full column width.
+        verticalLayout = [
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: Self.sidebarPadding),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.sidebarPadding),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.sidebarPadding),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor,
+                                          constant: -Self.sidebarPadding),
+        ]
+        stack.setClippingResistancePriority(.defaultLow, for: .vertical)
+        NSLayoutConstraint.activate(horizontalLayout)
+    }
+
+    /// Moves the bar between its top-row and sidebar layouts. The host has
+    /// already put the view in the right container; this re-lays the chips.
+    func setPosition(_ newPosition: WorkspaceBarPosition) {
+        guard newPosition != position else { return }
+        position = newPosition
+        let vertical = newPosition.axis == .vertical
+        NSLayoutConstraint.deactivate(vertical ? horizontalLayout : verticalLayout)
+        NSLayoutConstraint.activate(vertical ? verticalLayout : horizontalLayout)
+        stack.orientation = vertical ? .vertical : .horizontal
+        stack.alignment = vertical ? .leading : .centerY
+        stack.spacing = vertical ? 4 : 6
+        titleLabel.stringValue = vertical ? "Workspaces" : "Workspaces:"
+        // A sidebar chip's name gets the whole column (the top bar's 220 pt
+        // cap would contradict the column width at large chrome sizes).
+        for chip in chipsById.values { chip.spansColumn = vertical }
+        layoutSeparator()
+        applyChipWidthConstraints()
+        currentPlan = nil
+        verticalPlan = nil
+        plannedWidth = -1
+        plannedHeight = -1
+        if !vertical {
+            // Back on top: every chip starts from full again; the
+            // horizontal plan re-compacts as needed.
+            for chip in chipsById.values { chip.isHidden = false; chip.setDisplay(mode: .full, maxWidth: nil) }
+        }
+        needsLayout = true
+        relayoutChips(force: true)
+    }
+
+    /// The hairline sits on the edge that faces the terminal: under a top
+    /// bar, on the inner side of a sidebar.
+    private func layoutSeparator() {
+        switch position {
+        case .top:
+            separator.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 1)
+            separator.autoresizingMask = [.width, .maxYMargin]
+        case .left:
+            separator.frame = NSRect(x: bounds.width - 1, y: 0, width: 1, height: bounds.height)
+            separator.autoresizingMask = [.height, .minXMargin]
+        case .right:
+            separator.frame = NSRect(x: 0, y: 0, width: 1, height: bounds.height)
+            separator.autoresizingMask = [.height, .maxXMargin]
+        }
+    }
+
+    /// Sidebar chips span the stack's width; on top they size to content.
+    private func applyChipWidthConstraints() {
+        NSLayoutConstraint.deactivate(chipWidthConstraints)
+        chipWidthConstraints = []
+        guard position.axis == .vertical else { return }
+        for chip in stack.arrangedSubviews.compactMap({ $0 as? WorkspaceChipView }) {
+            chipWidthConstraints.append(chip.widthAnchor.constraint(equalTo: stack.widthAnchor))
+        }
+        NSLayoutConstraint.activate(chipWidthConstraints)
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -194,6 +272,7 @@ final class WorkspaceBarView: NSVisualEffectView {
         for workspace in workspaces {
             let chip = chipsById[workspace.id] ?? WorkspaceChipView(app: app,
                                                                     workspaceId: workspace.id)
+            chip.spansColumn = position.axis == .vertical
             chip.apply(metrics: metrics)
             chip.configure(name: workspace.name,
                            color: MemtermAppDelegate.nsColor(hex: workspace.color),
@@ -206,6 +285,7 @@ final class WorkspaceBarView: NSVisualEffectView {
         chipsById = kept
         stack.addArrangedSubview(overflowButton)
         stack.addArrangedSubview(addButton)
+        applyChipWidthConstraints()
         relayoutChips(force: true)
     }
 
@@ -221,6 +301,10 @@ final class WorkspaceBarView: NSVisualEffectView {
     /// the active name, then overflow). Runs on every width change and every
     /// update; a no-op when neither the width nor the plan changed.
     private func relayoutChips(force: Bool) {
+        if position.axis == .vertical {
+            relayoutSidebar(force: force)
+            return
+        }
         let width = bounds.width
         guard force || width != plannedWidth else { return }
         plannedWidth = width
@@ -255,10 +339,45 @@ final class WorkspaceBarView: NSVisualEffectView {
         overflowButton.isHidden = plan.overflow.isEmpty
     }
 
+    /// Sidebar fit: chips keep their full names (truncated to the column)
+    /// and the ones that don't fit the height move into overflow
+    /// (WorkspaceBarCompaction.verticalPlan; the active chip never does).
+    private func relayoutSidebar(force: Bool) {
+        let height = bounds.height
+        let width = bounds.width
+        guard force || height != plannedHeight || width != plannedWidth else { return }
+        let widthChanged = width != plannedWidth
+        plannedHeight = height
+        plannedWidth = width
+        let chips = stack.arrangedSubviews.compactMap { $0 as? WorkspaceChipView }
+        guard !chips.isEmpty else { return }
+        let plan = WorkspaceBarCompaction.verticalPlan(
+            available: Double(height - 2 * Self.sidebarPadding),
+            titleHeight: Double(titleLabel.intrinsicContentSize.height),
+            addHeight: Double(addButton.intrinsicContentSize.height),
+            overflowHeight: Double(overflowButton.intrinsicContentSize.height),
+            chipHeight: Double(metrics.chipHeight),
+            spacing: Double(stack.spacing),
+            chips: chips.map { ($0.workspaceId, $0.isActive) })
+        guard force || widthChanged || plan != verticalPlan else { return }
+        verticalPlan = plan
+        titleLabel.isHidden = !plan.showTitle
+        for chip in chips {
+            if chip.probeIsEditing { continue }
+            chip.isHidden = plan.overflow.contains(chip.workspaceId)
+            chip.setDisplay(mode: .full, maxWidth: nil)
+        }
+        overflowButton.isHidden = plan.overflow.isEmpty
+    }
+
+    /// The ids in the overflow menu, whichever axis is laid out.
+    private var overflowIds: [String] {
+        position.axis == .vertical ? (verticalPlan?.overflow ?? []) : (currentPlan?.overflow ?? [])
+    }
+
     @objc private func showOverflowMenu(_ sender: NSButton) {
-        guard let plan = currentPlan else { return }
         let menu = NSMenu(title: "More Workspaces")
-        for id in plan.overflow {
+        for id in overflowIds {
             guard let chip = chipsById[id] else { continue }
             let item = NSMenuItem(title: chip.workspaceName,
                                   action: #selector(switchFromOverflow(_:)), keyEquivalent: "")
@@ -278,6 +397,9 @@ final class WorkspaceBarView: NSVisualEffectView {
 
     /// MEMTERM_UI_PROBE support: the plan the bar is drawing right now.
     func probeCompactionPlan() -> WorkspaceBarCompaction.Plan? { currentPlan }
+
+    /// MEMTERM_UI_PROBE support: the sidebar plan (vertical axis only).
+    func probeSidebarPlan() -> WorkspaceBarCompaction.VerticalPlan? { verticalPlan }
 
     /// MEMTERM_UI_PROBE support: the visible row's right edge, bar coords.
     func probeRowMaxX() -> CGFloat {
@@ -387,6 +509,12 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     private var labelMaxWidth: NSLayoutConstraint!
     /// Founder bug 2026-10-24: how much of the name the bar has room for.
     private(set) var displayMode: WorkspaceChipMode = .full
+    /// Sidebar (spec 2026-10-02 §7): the chip spans the column, so its name
+    /// takes whatever width is left — no 220 pt cap, which could contradict
+    /// the column width at large chrome sizes.
+    var spansColumn = false {
+        didSet { labelMaxWidth.isActive = !spansColumn }
+    }
     private var maxWidth: CGFloat?
     /// The label's widest full name (the pre-compaction cap).
     private static let fullLabelMax: CGFloat = 220

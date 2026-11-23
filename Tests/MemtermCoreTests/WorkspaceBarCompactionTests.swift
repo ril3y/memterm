@@ -158,3 +158,66 @@ final class WorkspaceBarCompactionTests: XCTestCase {
         XCTAssertEqual(WorkspaceBarCompaction.initials(for: "   "), "•")
     }
 }
+
+/// Spec 2026-10-02 §3/§7: the workspace sidebar stacks chips top-down. Each
+/// chip has the column's full width, so the only question is how many fit
+/// the height: drop the title first, then move chips from the end into the
+/// overflow menu. The active chip never overflows.
+final class WorkspaceSidebarPlanTests: XCTestCase {
+    // title 16, add 20, overflow 20, chip 20, spacing 4.
+    private func plan(_ available: Double, ids: [String] = ["a", "b", "c", "d"],
+                      active: String = "a") -> WorkspaceBarCompaction.VerticalPlan {
+        WorkspaceBarCompaction.verticalPlan(available: available, titleHeight: 16, addHeight: 20,
+                                            overflowHeight: 20, chipHeight: 20, spacing: 4,
+                                            chips: ids.map { ($0, $0 == active) })
+    }
+
+    /// Independent recomputation of the height the plan's visible items need.
+    private func used(_ p: WorkspaceBarCompaction.VerticalPlan, total: Int = 4) -> Double {
+        var heights: [Double] = p.showTitle ? [16] : []
+        heights += Array(repeating: 20, count: total - p.overflow.count)
+        if !p.overflow.isEmpty { heights.append(20) }
+        heights.append(20)
+        return heights.reduce(0, +) + 4 * Double(heights.count - 1)
+    }
+
+    func testEverythingFitsWithTitle() {
+        // 16 + 4*20 + 20 + 5*4 = 136
+        let p = plan(136)
+        XCTAssertTrue(p.showTitle)
+        XCTAssertEqual(p.overflow, [])
+    }
+
+    func testTitleGoesBeforeAnyChip() {
+        let p = plan(135)
+        XCTAssertFalse(p.showTitle)
+        XCTAssertEqual(p.overflow, [])
+        XCTAssertLessThanOrEqual(used(p), 135)
+    }
+
+    func testChipsOverflowFromTheEndAndTheMenuButtonTakesItsRoom() {
+        // Without title: 4 chips + add = 5*20 + 4*4 = 116. At 100, the
+        // overflow button replaces chips from the end.
+        let p = plan(100)
+        XCTAssertFalse(p.showTitle)
+        XCTAssertEqual(p.overflow, ["c", "d"])
+        XCTAssertLessThanOrEqual(used(p), 100)
+    }
+
+    func testTheActiveChipNeverOverflows() {
+        let p = plan(92, active: "d")
+        XCTAssertFalse(p.overflow.contains("d"))
+        XCTAssertEqual(p.overflow, ["b", "c"])
+    }
+
+    func testNoRoomAtAllKeepsOnlyTheActiveChip() {
+        let p = plan(0, active: "c")
+        XCTAssertEqual(p.overflow, ["a", "b", "d"])
+        XCTAssertFalse(p.showTitle)
+    }
+
+    func testNoChipsIsAnEmptyPlan() {
+        let p = plan(0, ids: [])
+        XCTAssertEqual(p.overflow, [])
+    }
+}
