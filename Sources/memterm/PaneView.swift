@@ -30,6 +30,11 @@ class PaneView: LocalProcessTerminalView {
     /// MemoryEngine.pollPane (nil whenever the fg process is not claude).
     /// Read by ExtensionHostRuntime.claudeTabSessions().
     var lastClaudeSessionId: String?
+    /// FR-61: the coding agent this pane's foreground process classified as
+    /// (claude / codex / gemini), kept current by MemoryEngine.pollPane; nil
+    /// when the foreground is anything else. AgentStatusController evaluates
+    /// only panes where this is set.
+    var agentKind: AgentKind?
     /// FR-59 guard rail: how many "── restored ──" dividers were ever fed into
     /// this pane. The resurrect path increments it; a workspace switch must
     /// not (switching is hide/show, never restore) — the smoke gate asserts
@@ -409,6 +414,46 @@ class PaneView: LocalProcessTerminalView {
         screen += lines.joined(separator: "\r\n")
         screen += "\u{1b}[\(cursorRow + 1);\(cursorCol + 1)H"
         return (cols, rows, Data(screen.utf8))
+    }
+
+    /// FR-61: the LIVE screen (the bottom `rows` lines of the buffer) as
+    /// plain text, one row per line — what agent rules read. Unlike
+    /// visibleScreenBytes this ignores the viewport: a user scrolled up into
+    /// history must not make a waiting agent look idle. The buffer's own
+    /// line count is internal to SwiftTerm, so the live bottom is found by
+    /// probing getScrollInvariantLine (exponential, then binary search).
+    func liveScreenText() -> String {
+        let terminal = getTerminal()
+        let rows = terminal.rows
+        guard rows > 0 else { return "" }
+        let viewTop = terminal.buffer.totalLinesTrimmed + terminal.buffer.yDisp
+        var last = viewTop + rows - 1
+        if terminal.getScrollInvariantLine(row: last + 1) != nil {
+            var step = rows
+            var lo = last + 1
+            var hi = lo + step
+            while terminal.getScrollInvariantLine(row: hi) != nil {
+                lo = hi
+                step *= 2
+                hi = lo + step
+            }
+            while hi - lo > 1 {  // lo valid, hi invalid
+                let mid = (lo + hi) / 2
+                if terminal.getScrollInvariantLine(row: mid) != nil { lo = mid } else { hi = mid }
+            }
+            last = lo
+        }
+        var lines: [String] = []
+        lines.reserveCapacity(rows)
+        for row in (last - rows + 1)...last {
+            guard let line = terminal.getScrollInvariantLine(row: row) else {
+                lines.append("")
+                continue
+            }
+            lines.append(ScrollbackText.normalizeCells(
+                line.translateToString(trimRight: true, skipNullCellsFollowingWide: true)))
+        }
+        return lines.joined(separator: "\n")
     }
 
     func updateLocalDirectory(fromOSC7 directory: String?) {

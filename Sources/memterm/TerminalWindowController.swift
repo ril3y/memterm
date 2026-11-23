@@ -579,7 +579,16 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
             pane.selectedTextBackgroundColor = selection
         }
         if let ansi = config.terminalAnsiColors { pane.installColors(ansi) }
-        pane.onOutputActivity = { [weak self] in self?.paneProducedOutput() }
+        pane.onOutputActivity = { [weak self, weak pane] in
+            self?.paneProducedOutput()
+            if let pane { self?.app.agentStatus.paneOutput(pane) }
+        }
+        // FR-61: OSC 7501 (herdr's Program Status Protocol) self-reports.
+        // A registered handler runs before SwiftTerm's built-ins; 7501 has no
+        // built-in meaning, so nothing is displaced.
+        pane.getTerminal().registerOscHandler(code: 7501) { [weak self, weak pane] payload in
+            if let pane { self?.app.agentStatus.paneReported(pane, payload: payload) }
+        }
         pane.onBell = { [weak self] in self?.paneRangBell() }
     }
 
@@ -624,6 +633,7 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
     func noteSelected() {
         activity.recordSelected()
         refreshActivityIndicator()
+        app.agentStatus.tabLooked(self)
     }
 
     private func refreshActivityIndicator() {
@@ -1157,6 +1167,7 @@ final class TerminalWindowController: NSResponder, LocalProcessTerminalViewDeleg
         guard let pane = source as? PaneView else { return }
         pane.paneTitle = title
         refreshTitle(for: pane)
+        app.agentStatus.paneTitleChanged(pane)
     }
 
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {

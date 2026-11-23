@@ -21,10 +21,10 @@ final class AdapterRegistryTests: XCTestCase {
 
     // MARK: Registry shape
 
-    func testRegistryIsExactlyTheSixCompiledInAdapters() {
+    func testRegistryIsExactlyTheSevenCompiledInAdapters() {
         let names = Adapters.registry(claudeProjectsDir: tempDir, codexSessionsDir: tempDir)
             .map { type(of: $0).name }
-        XCTAssertEqual(names, ["claude", "codex", "ssh", "watcher", "serial", ""],
+        XCTAssertEqual(names, ["claude", "codex", "gemini", "ssh", "watcher", "serial", ""],
                        "compiled-in registry: the coding agents before the generic matchers; " +
                        "serial + plain-shell registered but never argv-detected")
     }
@@ -32,6 +32,7 @@ final class AdapterRegistryTests: XCTestCase {
     func testAdapterLookupByJournaledName() {
         XCTAssertTrue(Adapters.adapter(named: "claude") is ClaudeAdapter)
         XCTAssertTrue(Adapters.adapter(named: "codex") is CodexAdapter)
+        XCTAssertTrue(Adapters.adapter(named: "gemini") is GeminiAdapter)
         XCTAssertTrue(Adapters.adapter(named: "ssh") is SSHAdapter)
         XCTAssertTrue(Adapters.adapter(named: "watcher") is WatcherAdapter)
         XCTAssertTrue(Adapters.adapter(named: SerialAdapter.name) is SerialPaneAdapter)
@@ -123,5 +124,27 @@ final class AdapterRegistryTests: XCTestCase {
                                   adapter: "ssh", adapterState: [:])
         XCTAssertNotNil(SSHAdapter().restoreCommand(for: sshSnap, cwdUnavailable: false))
         XCTAssertNil(Adapters.resumeOffer(for: sshSnap))
+    }
+
+    // MARK: Gemini CLI (FR-61: detected for agent status; no resume offer yet)
+
+    func testGeminiDetectsBinaryAndNodeEntrypoint() {
+        XCTAssertEqual(Adapters.classify(argv: ["/opt/homebrew/bin/gemini"], cwd: "/tmp",
+                                         claudeProjectsDir: tempDir, codexSessionsDir: tempDir)?.adapter,
+                       "gemini")
+        XCTAssertEqual(Adapters.classify(argv: ["node", "/usr/local/lib/node_modules/@google/gemini-cli/dist/index.js"],
+                                         cwd: "/tmp", claudeProjectsDir: tempDir,
+                                         codexSessionsDir: tempDir)?.adapter, "gemini")
+        XCTAssertEqual(Adapters.classify(argv: ["node", "/usr/local/bin/gemini"], cwd: "/tmp",
+                                         claudeProjectsDir: tempDir, codexSessionsDir: tempDir)?.adapter,
+                       "gemini")
+        XCTAssertNil(Adapters.classify(argv: ["node", "server.js"], cwd: "/tmp",
+                                       claudeProjectsDir: tempDir, codexSessionsDir: tempDir))
+    }
+
+    func testGeminiMakesNoResumeOffer() {
+        let snap = SnapshotRow(exe: "gemini", argv: ["gemini"], adapter: "gemini", adapterState: [:])
+        XCTAssertNil(Adapters.resumeOffer(for: snap))
+        XCTAssertFalse(GeminiAdapter().restoresByReexec)
     }
 }

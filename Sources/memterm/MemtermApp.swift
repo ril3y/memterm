@@ -93,6 +93,15 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
     /// Per-workspace output marks behind the chip pulse/ring
     /// (MemtermCore.WorkspaceActivityCenter — pure decay/coalescing state).
     private var workspaceActivity = WorkspaceActivityCenter()
+
+    // -- Agent status (FR-61/62) --
+    /// Agent state per pane, the tab/chip/Dock indicators, and alerts.
+    /// Probe and smoke runs get a recording sink: no banners, sounds or Dock.
+    private(set) lazy var agentStatus: AgentStatusController = {
+        let sink: AgentAlertSink = (ProbeSupport.isUIProbe || smokeMode)
+            ? RecordingAgentAlertSink() : SystemAgentAlertSink(app: self)
+        return AgentStatusController(app: self, sink: sink)
+    }()
     private var workspaceActivityWork: DispatchWorkItem?
 
     /// The workspaces a topology capture may rewrite: everything that is (or
@@ -210,6 +219,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         rebuildWorkspaceMenu()
         engine.start()
         engine.scheduleTopologySave()
+        agentStatus.start()
 
         // ExtensionKit v0: build the Host and activate the compiled-in
         // extension list (empty until the Claude-browser stage).
@@ -440,6 +450,11 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
             else { return }
             self.switchToWorkspace(pick)
         }
+    }
+
+    /// FR-62: coming back to memterm counts as looking at the focused tab.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        agentStatus.appBecameActive()
     }
 
     // MARK: - Workspace activity (founder: "the ping command always creates
@@ -855,6 +870,7 @@ final class MemtermAppDelegate: NSObject, NSApplicationDelegate {
         refreshWorkspaceChips()  // workspace_bar visibility follows the config
         dropdown.applyConfig(config)  // hotkey + placement follow the config
         remote.applyConfig(config)  // connects, disconnects, or stays off
+        agentStatus.configChanged()  // [agents] status off clears indicators now
         config.save()
     }
 

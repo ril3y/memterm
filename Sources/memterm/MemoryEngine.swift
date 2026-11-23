@@ -217,6 +217,7 @@ final class MemoryEngine {
               ProcessInspector.startTime(of: pid) == procStart else {
             store.clearSnapshot(pane.paneId)
             pane.lastClaudeSessionId = nil
+            pane.agentKind = nil
             return
         }
         let exe = argv[0]
@@ -228,11 +229,14 @@ final class MemoryEngine {
             // binding current for ExtensionHostRuntime.claudeTabSessions().
             pane.lastClaudeSessionId = hit.adapter == ClaudeAdapter.name
                 ? hit.state["sessionId"] : nil
+            // FR-61: agent status evaluates only panes running an agent.
+            pane.agentKind = AgentKind(adapterName: hit.adapter)
         } else {
             store.upsertSnapshot(pane.paneId, exe: exe, argv: argv, pid: pid,
                                  procStart: procStart,
                                  adapter: "", adapterState: [:])
             pane.lastClaudeSessionId = nil
+            pane.agentKind = nil
         }
     }
 

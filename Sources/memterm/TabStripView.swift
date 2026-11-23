@@ -281,6 +281,16 @@ final class TabStripView: NSVisualEffectView {
         return item.convert(item.probeLabelFrame, to: self)
     }
 
+    /// FR-61: what a tab's indicator shows for agents, and the indicator
+    /// view itself (for the rendered-pixel check).
+    func probeAgentBadge(of tabId: String) -> AgentBadge? {
+        items.first { $0.tab?.tabId == tabId }?.probeAgentBadge
+    }
+
+    func probeActivityView(of tabId: String) -> NSView? {
+        items.first { $0.tab?.tabId == tabId }?.probeActivityView
+    }
+
     func probeTabIds() -> [String] {
         items.compactMap { $0.tab?.tabId }
     }
@@ -421,6 +431,8 @@ final class TabItemView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 
     var probeLabelColor: NSColor? { label.textColor }
+    var probeAgentBadge: AgentBadge { activityView.agentBadge }
+    var probeActivityView: NSView { activityView }
     var probeLabelFrame: NSRect { label.frame }
     var probeLabelFontSize: CGFloat { label.font?.pointSize ?? 0 }
     var probeLabelLineBreak: NSLineBreakMode { label.lineBreakMode }
@@ -433,7 +445,8 @@ final class TabItemView: NSView {
         toolTip = tab.displayTitle
         setAccessibilityLabel(tab.displayTitle)
         setAccessibilityValue(selected)
-        activityView.apply(state: selected ? .idle : tab.activityStateForProbe())
+        activityView.apply(state: selected ? .idle : tab.activityStateForProbe(),
+                           agent: app.agentStatus.badge(forTab: tab).shownOnTab(selected: selected))
         repaint()
     }
 

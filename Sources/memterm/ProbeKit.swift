@@ -629,3 +629,36 @@ func assertChipVisible(chipFrame: CGRect, in bmp: NSBitmapImageRep,
 // Quiet-mode windows (TESTING.md §2.5): host windows are HostWindow
 // (WindowHost.swift) with allowsOffscreenFrames set, so AppKit never drags
 // them back onto a screen.
+
+/// A view's LAYER tree rendered offscreen (CALayer.render). Unlike
+/// probeBitmap/cacheDisplay this includes layer background colors — the
+/// only paint a layer-backed dot or badge has.
+func probeLayerBitmap(_ view: NSView, scale: CGFloat = 2) -> NSBitmapImageRep? {
+    guard let layer = view.layer, view.bounds.width >= 1, view.bounds.height >= 1,
+          let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                     pixelsWide: Int(view.bounds.width * scale),
+                                     pixelsHigh: Int(view.bounds.height * scale),
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                     isPlanar: false, colorSpaceName: .deviceRGB,
+                                     bytesPerRow: 0, bitsPerPixel: 0),
+          let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+    context.cgContext.scaleBy(x: scale, y: scale)
+    view.effectiveAppearance.performAsCurrentDrawingAppearance {
+        layer.render(in: context.cgContext)
+    }
+    return rep
+}
+
+/// How many pixels of `rep` satisfy `match` (sRGB components 0...1).
+func probeCountPixels(_ rep: NSBitmapImageRep,
+                      where match: (_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> Bool) -> Int {
+    var count = 0
+    for y in 0..<rep.pixelsHigh {
+        for x in 0..<rep.pixelsWide {
+            guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
+                  c.alphaComponent > 0.5 else { continue }
+            if match(c.redComponent, c.greenComponent, c.blueComponent) { count += 1 }
+        }
+    }
+    return count
+}

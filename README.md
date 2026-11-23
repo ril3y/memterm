@@ -37,6 +37,16 @@ Requires macOS 14 or later.
 - Six built-in themes plus `.itermcolors` import, transparency and blur, Nerd Font detection, option-as-meta.
 - **Drop-down terminal:** turn it on in **Settings ▸ Appearance** and your window becomes the drop-down, with all its tabs and workspaces. A global hotkey (a key combo, or a double-tap of ⌃ ⌥ ⌘ ⇧ or Esc) slides it in from the top, left, or right edge and away again. Turn it off and it goes back to a normal window where it was.
 
+## Agents
+
+Tabs running Claude Code, Codex, or Gemini CLI show what the agent is doing:
+
+- A spinner while it works, an orange dot when it needs you (a permission prompt, a question), and a green dot when it finished while you were in another tab. The workspace chip shows orange or green too.
+- A notification when an agent needs you, or finishes while you're not looking. Click it to jump to the pane. The Dock icon counts the agents waiting on you.
+- Read-only: memterm watches the screen and never types for the agent. Notifications show the tab's name, never what's on screen.
+
+Settings ▸ Agents turns each part on or off and picks an alert sound. Detection rules are ported from [herdr](https://github.com/herdrdev/herdr) (Apache-2.0).
+
 ## Remote attach
 
 Watch and type into your Mac's panes from a phone or another computer's browser. It is off by default, and experimental.
