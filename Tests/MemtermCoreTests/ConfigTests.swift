@@ -401,3 +401,51 @@ final class RemoteConfigTests: XCTestCase {
         XCTAssertEqual(back.themeBackground, c.themeBackground)
     }
 }
+
+/// FR-61 / FR-62: the [agents] table. Status and alerts are on by default
+/// (they are local and read-only); sound is opt-in.
+final class AgentsConfigTests: XCTestCase {
+    func testDefaults() {
+        let c = Config()
+        XCTAssertTrue(c.agentsStatus)
+        XCTAssertTrue(c.agentsNotifyBlocked)
+        XCTAssertTrue(c.agentsNotifyDone)
+        XCTAssertTrue(c.agentsDockBadge)
+        XCTAssertNil(c.agentsSound)
+    }
+
+    func testParses() {
+        let c = Config.parse("""
+            [agents]
+            status = false
+            notify_blocked = false
+            notify_done = false
+            dock_badge = false
+            sound = "Glass"
+            """)
+        XCTAssertFalse(c.agentsStatus)
+        XCTAssertFalse(c.agentsNotifyBlocked)
+        XCTAssertFalse(c.agentsNotifyDone)
+        XCTAssertFalse(c.agentsDockBadge)
+        XCTAssertEqual(c.agentsSound, "Glass")
+    }
+
+    func testUnknownOrBlankSoundIsSilent() {
+        XCTAssertNil(Config.parse("[agents]\nsound = \"NotASound\"\n").agentsSound)
+        XCTAssertNil(Config.parse("[agents]\nsound = \"\"\n").agentsSound)
+    }
+
+    func testRoundTripsThroughSerialization() {
+        var c = Config()
+        c.agentsStatus = false
+        c.agentsNotifyDone = false
+        c.agentsSound = "Ping"
+        let back = Config.parse(c.serialize())
+        XCTAssertFalse(back.agentsStatus)
+        XCTAssertTrue(back.agentsNotifyBlocked)
+        XCTAssertFalse(back.agentsNotifyDone)
+        XCTAssertTrue(back.agentsDockBadge)
+        XCTAssertEqual(back.agentsSound, "Ping")
+        XCTAssertNil(Config.parse(Config().serialize()).agentsSound)
+    }
+}

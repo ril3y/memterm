@@ -155,6 +155,15 @@ public struct Config {
     /// while their config says otherwise.
     public var remoteWebURLWarning: String?
 
+    // FR-61 / FR-62 — agent status and alerts, the [agents] table. On by
+    // default: everything stays on this Mac and nothing is ever typed or run.
+    public var agentsStatus = true
+    public var agentsNotifyBlocked = true
+    public var agentsNotifyDone = true
+    public var agentsDockBadge = true
+    /// A named macOS sound from `bellSounds` played with each alert; nil = silent.
+    public var agentsSound: String?
+
     public init() {}
 
     // Nerd-font-first default chain: the founder's powerline prompt renders "?"
@@ -285,6 +294,11 @@ public struct Config {
                     "[remote] web_url \"\(s)\" ignored — \(reason). Using \(defaultRemoteWebURL)"
             }
         }
+        if let b = boolean(values["agents.status"]) { c.agentsStatus = b }
+        if let b = boolean(values["agents.notify_blocked"]) { c.agentsNotifyBlocked = b }
+        if let b = boolean(values["agents.notify_done"]) { c.agentsNotifyDone = b }
+        if let b = boolean(values["agents.dock_badge"]) { c.agentsDockBadge = b }
+        if let s = string(values["agents.sound"]), bellSounds.contains(s) { c.agentsSound = s }
         if let b = boolean(values["allow_mouse_reporting"]) { c.allowMouseReporting = b }
         if let b = boolean(values["window_blur"]) { c.windowBlur = b }
         // Numeric knobs clamp into their sane range (a hand-typed 3.0 line
@@ -413,6 +427,19 @@ public struct Config {
         lines.append("relay_url = \"\(remoteRelayURL)\"  # your own relay works too — it holds no secrets")
         lines.append("web_url = \"\(remoteWebURL)\"  # where the browser page comes from; blank = your relay serves it")
         lines.append("")
+        lines.append("# Agent status (Claude Code, Codex, Gemini): working / needs you / done")
+        lines.append("# on tabs and workspaces, with alerts when an agent needs you.")
+        lines.append("[agents]")
+        lines.append("status = \(agentsStatus)  # show agent state on tabs and workspace chips")
+        lines.append("notify_blocked = \(agentsNotifyBlocked)  # notify when an agent needs your input")
+        lines.append("notify_done = \(agentsNotifyDone)  # notify when an agent finishes while you're not looking")
+        lines.append("dock_badge = \(agentsDockBadge)  # count agents that need you on the Dock icon")
+        if let agentsSound {
+            lines.append("sound = \"\(agentsSound)\"  # macOS sound name played with each alert; unset = silent")
+        } else {
+            lines.append("# sound = \"Glass\"  # \(Self.bellSounds.joined(separator: " | ")); unset = silent")
+        }
+        lines.append("")
         // [theme] stays LAST: its ansi0…15 keys are bare (untabled) names, so
         // any table written after it would be swallowed into [theme] on the
         // next parse.
@@ -531,6 +558,15 @@ public struct Config {
         # enabled = false
         # relay_url = "wss://memterm-relay.fly.dev"       # or your own self-hosted relay
         # web_url = "https://ril3y.github.io/memterm/"    # blank = your relay serves the page too
+
+        # Agent status: Claude Code, Codex and Gemini panes show working /
+        # needs you / done on their tab and workspace chip. Read-only.
+        # [agents]
+        # status = true
+        # notify_blocked = true   # notify when an agent needs your input
+        # notify_done = true      # ...or finishes while you're not looking
+        # dock_badge = true       # count of agents that need you
+        # sound = "Glass"         # named macOS sound; unset = silent
 
         # [theme]
         # preset = "memterm-dark"  # display label set by Settings; colors win

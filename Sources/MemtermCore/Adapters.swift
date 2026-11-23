@@ -202,6 +202,33 @@ public struct CodexAdapter: PaneAdapter {
     }
 }
 
+/// FR-61 — the Gemini CLI adapter. Detected so agent status (working /
+/// blocked / idle / done) can follow it; it makes NO resume offer yet (the
+/// CLI's resume flag is unverified), so a restored Gemini pane degrades to
+/// snapshot-only like any unclaimed process. Detection recognizes the
+/// `gemini` binary and its npm node entrypoint (`node …/bin/gemini`,
+/// `node …/@google/gemini-cli/…`).
+public struct GeminiAdapter: PaneAdapter {
+    public static let name = "gemini"
+    public var fidelityClass: AdapterFidelity { .snapshotOnly }
+    public var restoresByReexec: Bool { false }
+
+    public init() {}
+
+    public func detect(_ context: AdapterDetectContext) -> AdapterState? {
+        guard let first = context.argv.first else { return nil }
+        let base = (first as NSString).lastPathComponent
+        guard base == "gemini"
+            || (base == "node" && context.argv.dropFirst().contains {
+                ($0 as NSString).lastPathComponent == "gemini" || $0.contains("/gemini-cli/")
+            })
+        else { return nil }
+        return [:]
+    }
+
+    public func restoreCommand(for snapshot: SnapshotRow, cwdUnavailable: Bool) -> RestoreCommand? { nil }
+}
+
 /// FR-37 — SSH adapter: capture exact argv; restore by identical re-exec
 /// ("reconnect" — remote session state is honestly not restored). Reconnects
 /// are cwd-independent and survive a fallback cwd (FR-25).
@@ -313,6 +340,7 @@ public enum Adapters {
         -> [any PaneAdapter] {
         [ClaudeAdapter(projectsDir: claudeProjectsDir),
          CodexAdapter(sessionsDir: codexSessionsDir),
+         GeminiAdapter(),
          SSHAdapter(),
          WatcherAdapter(),
          SerialPaneAdapter(),

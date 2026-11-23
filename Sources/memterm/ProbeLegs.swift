@@ -1321,6 +1321,7 @@ extension MemtermAppDelegate {
         addWorkspaceCloseSteps(probe, probeWorkspaceId: { probeWorkspaceId })
         addTabGestureSteps(probe)
         addClaudeBrowserSteps(probe)
+        addAgentStatusSteps(probe)
         // Task 12: real local relay + a headless Swift device client end to
         // end. Fresh-mode only — it dials a loopback relay of its own and
         // tears remote back off when it's done, which a restored/observe
@@ -3818,6 +3819,305 @@ extension MemtermAppDelegate {
     // over the actual wire protocol — nothing here is mocked. Skips loudly
     // (never a pass) when node or the built relay isn't available, so a
     // machine without Node still gets a green run rather than a false one.
+
+    // MARK: - Agent status legs (FR-61 / FR-62)
+    //
+    // A stand-in agent: a symlink named `claude` to /bin/sleep sits in the
+    // foreground of one tab (argv[0] ends in /claude — all detection reads),
+    // and the leg paints Claude Code's screens straight into that pane with
+    // feed(text:), the way the real TUI would draw them. MEMTERM_CLAUDE_DIR
+    // points at an empty fixture so the adapter never reads a real ~/.claude.
+    // Alerts land in the RecordingAgentAlertSink (no banners, sounds or Dock
+    // badge in probe runs). The leg runs in a workspace of its own, forgotten
+    // at the end, so nothing it creates reaches the journal of later legs.
+
+    private func addAgentStatusSteps(_ probe: ProbeRunner) {
+        final class AgentProbe {
+            var workspaceId: String?
+            var returnTo: String?
+            var home: TerminalWindowController?
+            var agentTab: TerminalWindowController?
+            var savedClaudeDir: String?
+            var base: URL?
+            var alertsBefore = 0
+        }
+        let state = AgentProbe()
+
+        func agentPane() -> PaneView? { state.agentTab?.allPanes().first }
+        func badge() -> AgentBadge {
+            agentPane().map { self.agentStatus.badge(forPane: $0.paneId) } ?? .none
+        }
+        func sink() -> RecordingAgentAlertSink? { self.agentStatus.sink as? RecordingAgentAlertSink }
+        func strip() -> TabStripView? { state.agentTab?.host?.tabStrip }
+        func chip() -> WorkspaceChipView? {
+            guard let id = state.workspaceId else { return nil }
+            return state.agentTab?.host?.workspaceBar?.probeChipView(id)
+        }
+        func show(_ lines: [String], title: String? = nil) {
+            guard let pane = agentPane() else { return }
+            if let title { pane.feed(text: "\u{1b}]0;\(title)\u{07}") }
+            pane.feed(text: "\u{1b}[2J\u{1b}[H" + lines.joined(separator: "\r\n"))
+        }
+        func diagnostics(_ tag: String) {
+            let pane = agentPane()
+            let shown = state.agentTab.flatMap { strip()?.probeAgentBadge(of: $0.tabId) }
+            let looking = state.agentTab.map { self.agentStatus.isLooking($0) } ?? false
+            let tail = pane?.liveScreenText().split(separator: "\n").suffix(6).map(String.init) ?? []
+            print("UIPROBE-AGENT \(tag) kind=\(pane?.agentKind?.rawValue ?? "nil") badge=\(badge()) shown=\(shown.map { "\($0)" } ?? "nil") looking=\(looking) title=\(pane?.paneTitle ?? "") alerts=\(sink()?.entries.map { "\($0.alert):\($0.looking)" } ?? []) dock=\(sink()?.dockBadge ?? -1) screen_tail=\(tail)")
+        }
+        func cleanUp() {
+            if let back = state.returnTo, activeWorkspaceId != back { switchToWorkspace(back) }
+            if let id = state.workspaceId { forgetWorkspace(id) }
+            state.workspaceId = nil
+            if let saved = state.savedClaudeDir {
+                setenv("MEMTERM_CLAUDE_DIR", saved, 1)
+            } else {
+                unsetenv("MEMTERM_CLAUDE_DIR")
+            }
+            if let base = state.base { try? FileManager.default.removeItem(at: base) }
+        }
+
+        let working = [
+            "⏺ Reading files.",
+            "",
+            "✻ Pondering… (12s · ↑ 1.2k tokens · esc to interrupt)",
+            "",
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+            "  ⏵⏵ accept edits on (shift+tab to cycle)",
+        ]
+        let permission = [
+            "⏺ I'll clean the build directory.",
+            "",
+            "────────────────────────────────────────",
+            " Bash command",
+            "",
+            "   rm -rf build",
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. Yes, and don't ask again for rm commands",
+            "   3. No, and tell Claude what to do differently (esc)",
+        ]
+        let idle = [
+            "⏺ Done.",
+            "",
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+            "  ? for shortcuts",
+        ]
+        let isOrange: (CGFloat, CGFloat, CGFloat) -> Bool = { r, g, b in
+            r > 0.85 && g > 0.35 && g < 0.78 && b < 0.35
+        }
+        let isGreen: (CGFloat, CGFloat, CGFloat) -> Bool = { r, g, b in
+            g > 0.6 && r < 0.5 && b < 0.55
+        }
+
+        probe.addStateful(ProbeStep(
+            name: "agent-status-setup", timeout: 20,
+            action: { [self] in
+                let fm = FileManager.default
+                let base = MemoryEngine.baseDir
+                    .appendingPathComponent("agent-probe-\(UUID().uuidString.prefix(8))")
+                let bin = base.appendingPathComponent("bin")
+                let claudeRoot = base.appendingPathComponent("claude-empty")
+                do {
+                    for dir in [bin, claudeRoot.appendingPathComponent("projects"),
+                                claudeRoot.appendingPathComponent("sessions")] {
+                        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                    }
+                    try fm.createSymbolicLink(atPath: bin.appendingPathComponent("claude").path,
+                                              withDestinationPath: "/bin/sleep")
+                } catch {
+                    probeFail("agent-status leg: fixture: \(error)")
+                }
+                state.base = base
+                state.savedClaudeDir = ProcessInfo.processInfo.environment["MEMTERM_CLAUDE_DIR"]
+                setenv("MEMTERM_CLAUDE_DIR", claudeRoot.path, 1)
+                sink()?.reset()
+
+                state.returnTo = activeWorkspaceId
+                guard let id = createWorkspace(named: "Agent Probe") else {
+                    probeFail("agent-status leg: could not create a workspace")
+                }
+                state.workspaceId = id
+                let holder = makeHost(frame: nil)
+                let home = TerminalWindowController(app: self, workspaceId: id,
+                                                    initialCwd: base.path)
+                let agent = TerminalWindowController(app: self, workspaceId: id,
+                                                     initialCwd: base.path)
+                for tab in [home, agent] {
+                    registerController(tab)
+                    holder.attach(tab, select: true)
+                }
+                holder.select(home)
+                state.home = home
+                state.agentTab = agent
+                materializedWorkspaceIds.insert(id)
+                switchToWorkspace(id)
+                let claudeBin = bin.appendingPathComponent("claude").path
+                agent.allPanes().first?.send(txt: "'\(claudeBin)' 600\r")
+            },
+            condition: { [self] in
+                agentPane()?.agentKind == .claude
+                    && state.workspaceId == activeWorkspaceId
+                    && state.home?.host?.selectedTab === state.home
+            },
+            assert: { diagnostics("setup") },
+            onFailure: { diagnostics("setup-failed"); cleanUp() }))
+
+        // Working: spinner on the (unselected) agent tab, no alert.
+        probe.addStateful(ProbeStep(
+            name: "agent-status-working", timeout: 10,
+            action: { show(working, title: "⠂ Claude Code") },
+            condition: { badge() == .working },
+            assert: {
+                diagnostics("working")
+                guard let tab = state.agentTab, strip()?.probeAgentBadge(of: tab.tabId) == .working else {
+                    throw ProbeFailure("the agent tab does not show the working spinner")
+                }
+                guard sink()?.entries.isEmpty == true else {
+                    throw ProbeFailure("working raised an alert: \(sink()?.entries ?? [])")
+                }
+            },
+            onFailure: { diagnostics("working-failed"); cleanUp() }))
+
+        // Blocked: orange on the tab and the chip, one alert, Dock badge 1,
+        // and the orange actually rendered.
+        probe.addStateful(ProbeStep(
+            name: "agent-status-blocked", timeout: 10,
+            action: { show(permission, title: "✳ Claude Code") },
+            condition: { badge() == .blocked },
+            assert: {
+                diagnostics("blocked")
+                guard let tab = state.agentTab, let pane = agentPane(),
+                      strip()?.probeAgentBadge(of: tab.tabId) == .blocked else {
+                    throw ProbeFailure("the agent tab does not show blocked")
+                }
+                guard let entries = sink()?.entries, entries.count == 1,
+                      entries[0].alert == .blocked, entries[0].paneId == pane.paneId,
+                      !entries[0].looking else {
+                    throw ProbeFailure("expected exactly one unlooked blocked alert, got \(sink()?.entries ?? [])")
+                }
+                guard sink()?.dockBadge == 1 else {
+                    throw ProbeFailure("Dock badge \(sink()?.dockBadge ?? -1), expected 1")
+                }
+                guard chip()?.agentBadge == .blocked else {
+                    throw ProbeFailure("the workspace chip does not show blocked (\(chip()?.agentBadge.rawValue ?? -1))")
+                }
+                guard let view = strip()?.probeActivityView(of: tab.tabId),
+                      let rep = probeLayerBitmap(view) else {
+                    throw ProbeFailure("could not render the agent tab's indicator")
+                }
+                let orange = probeCountPixels(rep, where: isOrange)
+                print("UIPROBE-AGENT blocked_orange_pixels=\(orange)")
+                guard orange >= 8 else {
+                    throw ProbeFailure("the blocked dot did not render orange (\(orange) orange pixels)")
+                }
+            },
+            onFailure: { diagnostics("blocked-failed"); cleanUp() }))
+
+        // Done while unseen: green, a done alert, still counted on the Dock.
+        probe.addStateful(ProbeStep(
+            name: "agent-status-done-unseen", timeout: 10,
+            action: { show(idle, title: "✳ Claude Code") },
+            condition: { badge() == .done },
+            assert: {
+                diagnostics("done")
+                guard let tab = state.agentTab,
+                      strip()?.probeAgentBadge(of: tab.tabId) == .done else {
+                    throw ProbeFailure("the agent tab does not show done")
+                }
+                guard let last = sink()?.entries.last, last.alert == .done, !last.looking,
+                      sink()?.entries.count == 2 else {
+                    throw ProbeFailure("expected a done alert after blocked, got \(sink()?.entries ?? [])")
+                }
+                guard sink()?.dockBadge == 1, chip()?.agentBadge == .done else {
+                    throw ProbeFailure("done: dock=\(sink()?.dockBadge ?? -1) chip=\(chip()?.agentBadge.rawValue ?? -1)")
+                }
+                guard let view = strip()?.probeActivityView(of: tab.tabId),
+                      let rep = probeLayerBitmap(view),
+                      probeCountPixels(rep, where: isGreen) >= 8 else {
+                    throw ProbeFailure("the done dot did not render green")
+                }
+            },
+            onFailure: { diagnostics("done-failed"); cleanUp() }))
+
+        // Looking at it clears done and the Dock badge.
+        probe.addStateful(ProbeStep(
+            name: "agent-status-seen", timeout: 10,
+            action: {
+                guard let tab = state.agentTab else { return }
+                tab.host?.select(tab)
+                tab.host?.focusWindow()
+            },
+            condition: { badge() == .none && sink()?.dockBadge == 0 },
+            assert: {
+                diagnostics("seen")
+                state.alertsBefore = sink()?.entries.count ?? 0
+                guard let tab = state.agentTab, self.agentStatus.isLooking(tab) else {
+                    throw ProbeFailure("the selected agent tab does not count as looked at")
+                }
+            },
+            onFailure: { diagnostics("seen-failed"); cleanUp() }))
+
+        // Finishing while you watch is not news: working → idle, no alert.
+        probe.addStateful(ProbeStep(
+            name: "agent-status-working-watched", timeout: 10,
+            action: { show(working, title: "⠂ Claude Code") },
+            condition: { badge() == .working },
+            onFailure: { diagnostics("watched-working-failed"); cleanUp() }))
+        probe.addStateful(ProbeStep(
+            name: "agent-status-finish-watched", timeout: 10,
+            action: { show(idle, title: "✳ Claude Code") },
+            condition: { badge() == .none },
+            assert: {
+                diagnostics("finish-watched")
+                guard sink()?.entries.count == state.alertsBefore else {
+                    throw ProbeFailure("finishing in view alerted: \(sink()?.entries ?? [])")
+                }
+            },
+            onFailure: { diagnostics("finish-watched-failed"); cleanUp() }))
+
+        // OSC 7501: a self-report outranks the idle screen, and shows on the
+        // selected tab (blocked always does); clearing it hands back to the
+        // screen rules.
+        probe.addStateful(ProbeStep(
+            name: "agent-status-osc7501", timeout: 10,
+            action: { agentPane()?.feed(text: "\u{1b}]7501;state=blocked:kind=permission\u{1b}\\") },
+            condition: { badge() == .blocked },
+            assert: {
+                diagnostics("osc7501")
+                guard let tab = state.agentTab,
+                      strip()?.probeAgentBadge(of: tab.tabId) == .blocked else {
+                    throw ProbeFailure("blocked must show on the selected tab too")
+                }
+                guard let last = sink()?.entries.last, last.alert == .blocked, last.looking else {
+                    throw ProbeFailure("the 7501 report did not alert: \(sink()?.entries ?? [])")
+                }
+            },
+            onFailure: { diagnostics("osc7501-failed"); cleanUp() }))
+        probe.addStateful(ProbeStep(
+            name: "agent-status-osc7501-clear", timeout: 10,
+            action: { agentPane()?.feed(text: "\u{1b}]7501;state=clear\u{1b}\\") },
+            condition: { badge() == .none && sink()?.dockBadge == 0 },
+            assert: { diagnostics("osc7501-clear") },
+            onFailure: { diagnostics("osc7501-clear-failed"); cleanUp() }))
+
+        // Leaving: the workspace is forgotten; its panes drop out of the
+        // tracker on the next tick and the Dock badge stays clear.
+        probe.addStateful(ProbeStep(
+            name: "agent-status-cleanup", timeout: 10,
+            action: { cleanUp() },
+            condition: { [self] in
+                controllers.allSatisfy { $0.workspaceId != state.workspaceId }
+                    && self.agentStatus.tracker.trackedPanes.isEmpty
+                    && sink()?.dockBadge == 0
+            },
+            onFailure: { diagnostics("cleanup-failed") }))
+    }
 
     private func addRemoteSteps(_ probe: ProbeRunner) {
         // Opt-in by environment (controller ruling, 2026-09-20): every

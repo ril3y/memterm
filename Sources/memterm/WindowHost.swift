@@ -574,6 +574,13 @@ final class WindowHostController: NSWindowController, NSWindowDelegate {
         window?.title = selectedTab?.displayTitle ?? "memterm"
     }
 
+    /// FR-61: agent badges changed somewhere — repaint the chip marks in
+    /// place (no chip-row rebuild, no remote tree broadcast). Changed tabs
+    /// are repainted individually through tabChanged.
+    func refreshAgentBadges() {
+        workspaceBar?.refreshAgentBadges()
+    }
+
     func updateWorkspaceBar(workspaces: [WorkspaceRow], activeId: String,
                             activity: [String: TabActivityState] = [:]) {
         workspaceBar?.update(workspaces: workspaces, activeId: activeId, activity: activity)

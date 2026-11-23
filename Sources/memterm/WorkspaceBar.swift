@@ -157,6 +157,11 @@ final class WorkspaceBarView: NSVisualEffectView {
     private var pendingUpdate: (workspaces: [WorkspaceRow], activeId: String,
                                 activity: [String: TabActivityState])?
 
+    /// FR-61: repaint each chip's agent mark in place.
+    func refreshAgentBadges() {
+        for chip in chipsById.values { chip.refreshAgentBadge() }
+    }
+
     func update(workspaces: [WorkspaceRow], activeId: String,
                 activity: [String: TabActivityState] = [:]) {
         let metrics = app.chromeMetrics
@@ -364,6 +369,10 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
     private let label = NSTextField(labelWithString: "")
     private let dot = NSView()
     private let ring = NSView()
+    /// FR-61: a small mark on the dot's top-right — orange when an agent in
+    /// this workspace needs you, green when one finished unseen.
+    private let agentMark = NSView()
+    private(set) var agentBadge: AgentBadge = .none
     /// Founder 2026-08-31: quick close on hover — ✕ parks a live workspace
     /// (memory kept, reversible); on an already-parked chip it forgets, with
     /// one confirmation since that deletes memory. Space is always reserved so
@@ -409,6 +418,12 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         dot.wantsLayer = true
         dot.layer?.cornerRadius = 4
         addSubview(dot)
+        agentMark.translatesAutoresizingMaskIntoConstraints = false
+        agentMark.wantsLayer = true
+        agentMark.layer?.cornerRadius = 3.5
+        agentMark.layer?.borderWidth = 1
+        agentMark.isHidden = true
+        addSubview(agentMark)
         label.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingTail
         addSubview(label)
@@ -429,6 +444,10 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         chipHeight = heightAnchor.constraint(equalToConstant: 19)
         NSLayoutConstraint.activate([
             dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            agentMark.widthAnchor.constraint(equalToConstant: 7),
+            agentMark.heightAnchor.constraint(equalToConstant: 7),
+            agentMark.centerXAnchor.constraint(equalTo: dot.trailingAnchor, constant: -1),
+            agentMark.centerYAnchor.constraint(equalTo: dot.topAnchor, constant: 1),
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
             dotSize,
             dot.heightAnchor.constraint(equalTo: dot.widthAnchor),
@@ -633,6 +652,7 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         // The active workspace's chip never indicates (the user is looking at
         // it) — belt and braces on top of the center's own guard.
         applyActivity(isActive ? .idle : activity)
+        refreshAgentBadge()
         toolTip = isParked ? "\(name) — parked. Right-click ▸ Reopen."
             : isActive ? "\(name) — double-click to rename" : "Switch to \(name)"
         closeButton.toolTip = isParked ? "Forget \(name)…" : "Park \(name) (keeps its memory)"
@@ -696,8 +716,24 @@ final class WorkspaceChipView: NSView, NSTextFieldDelegate {
         }
     }
 
+    /// FR-61: shown on every chip, active included — a waiting agent on
+    /// another tab of THIS workspace still needs pointing out.
+    func refreshAgentBadge() {
+        agentBadge = app.agentStatus.badge(forWorkspace: workspaceId)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            switch agentBadge {
+            case .blocked: agentMark.layer?.backgroundColor = NSColor.systemOrange.cgColor
+            case .done: agentMark.layer?.backgroundColor = NSColor.systemGreen.cgColor
+            default: break
+            }
+            agentMark.layer?.borderColor = NSColor.windowBackgroundColor.cgColor
+        }
+        agentMark.isHidden = agentBadge != .blocked && agentBadge != .done
+    }
+
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        refreshAgentBadge()
         layer?.backgroundColor = isActive
             ? NSColor.labelColor.withAlphaComponent(0.10).cgColor
             : NSColor.clear.cgColor

@@ -60,6 +60,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     private let cursorPopUp = NSPopUpButton()
     private let bellPopUp = NSPopUpButton()
     private let bellSoundPopUp = NSPopUpButton()
+    // FR-61 / FR-62 — the [agents] table.
+    private let agentsStatusCheck = NSButton(checkboxWithTitle: "Show agent status on tabs and workspaces", target: nil, action: nil)
+    private let agentsNotifyBlockedCheck = NSButton(checkboxWithTitle: "Notify me when an agent needs my input", target: nil, action: nil)
+    private let agentsNotifyDoneCheck = NSButton(checkboxWithTitle: "Notify me when an agent finishes while I'm not looking", target: nil, action: nil)
+    private let agentsDockBadgeCheck = NSButton(checkboxWithTitle: "Count agents that need me on the Dock icon", target: nil, action: nil)
+    private let agentsSoundPopUp = NSPopUpButton()
     private let optionMetaCheck = NSButton(checkboxWithTitle: "Option key sends Esc+ (meta)", target: nil, action: nil)
     private let mouseReportingCheck = NSButton(checkboxWithTitle: "Allow apps to use the mouse (vim, htop)", target: nil, action: nil)
     private let shellIntegrationCheck = NSButton(checkboxWithTitle: "Shell integration (zsh)", target: nil, action: nil)
@@ -241,7 +247,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     private func buildForm() {
         for check in [sameCwdCheck, copyOnSelectCheck, confirmQuitCheck, confirmCloseTabCheck, workspaceBarCheck,
                       optionMetaCheck, mouseReportingCheck, blurCheck,
-                      shellIntegrationCheck, dropdownEnableCheck, dropdownHideCheck] {
+                      shellIntegrationCheck, dropdownEnableCheck, dropdownHideCheck,
+                      agentsStatusCheck, agentsNotifyBlockedCheck, agentsNotifyDoneCheck,
+                      agentsDockBadgeCheck] {
             wire(check)
         }
         // Drop-down terminal controls.
@@ -325,6 +333,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         bellPopUp.addItems(withTitles: ["None", "Sound", "Visual", "Sound and Visual"])
         wire(bellPopUp)
         bellSoundPopUp.addItems(withTitles: ["System Beep"] + Config.bellSounds)
+        agentsSoundPopUp.addItems(withTitles: ["None"] + Config.bellSounds)
+        agentsSoundPopUp.target = self
+        agentsSoundPopUp.action = #selector(agentsSoundChanged)
         bellSoundPopUp.target = self
         bellSoundPopUp.action = #selector(bellSoundChanged)
         cursorPopUp.addItems(withTitles: ["Blinking Block", "Steady Block",
@@ -491,12 +502,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         scrollbackField.widthAnchor.constraint(equalToConstant: 90).isActive = true
         retentionField.widthAnchor.constraint(equalToConstant: 60).isActive = true
 
+        // -- Agents (FR-61 / FR-62) --
+        let agents = makeTab("Agents", rows: [
+            [NSGridCell.emptyContentView, agentsStatusCheck],
+            [NSGridCell.emptyContentView, caption("Claude Code, Codex and Gemini panes show a spinner while working, orange when they need you, and green when they finish while you're elsewhere.")],
+            [NSGridCell.emptyContentView, agentsNotifyBlockedCheck],
+            [NSGridCell.emptyContentView, agentsNotifyDoneCheck],
+            [NSGridCell.emptyContentView, caption("Notifications show the tab's name, never what's on screen. Clicking one brings that pane forward.")],
+            [NSGridCell.emptyContentView, agentsDockBadgeCheck],
+            [label("Alert sound:"), agentsSoundPopUp],
+        ])
+
         // -- Remote --
         let remote = makeTab("Remote", rows: remoteSection.rows(label: label, caption: caption))
 
         tabView.addTabViewItem(general)
         tabView.addTabViewItem(appearance)
         tabView.addTabViewItem(terminal)
+        tabView.addTabViewItem(agents)
         tabView.addTabViewItem(memory)
         tabView.addTabViewItem(remote)
         // ExtensionKit ui.settingsSection: each registered section hangs off
@@ -581,6 +604,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         copyOnSelectCheck.state = config.copyOnSelect ? .on : .off
         confirmQuitCheck.state = config.confirmQuit ? .on : .off
         confirmCloseTabCheck.state = config.confirmCloseTab ? .on : .off
+        agentsStatusCheck.state = config.agentsStatus ? .on : .off
+        agentsNotifyBlockedCheck.state = config.agentsNotifyBlocked ? .on : .off
+        agentsNotifyDoneCheck.state = config.agentsNotifyDone ? .on : .off
+        agentsDockBadgeCheck.state = config.agentsDockBadge ? .on : .off
+        if let sound = config.agentsSound, let index = Config.bellSounds.firstIndex(of: sound) {
+            agentsSoundPopUp.selectItem(at: index + 1)  // 0 = None
+        } else {
+            agentsSoundPopUp.selectItem(at: 0)
+        }
         workspaceBarCheck.state = config.workspaceBar ? .on : .off
         shellField.stringValue = config.shell ?? ""
 
@@ -720,6 +752,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         config.copyOnSelect = copyOnSelectCheck.state == .on
         config.confirmQuit = confirmQuitCheck.state == .on
         config.confirmCloseTab = confirmCloseTabCheck.state == .on
+        config.agentsStatus = agentsStatusCheck.state == .on
+        config.agentsNotifyBlocked = agentsNotifyBlockedCheck.state == .on
+        config.agentsNotifyDone = agentsNotifyDoneCheck.state == .on
+        config.agentsDockBadge = agentsDockBadgeCheck.state == .on
+        let agentSoundIndex = agentsSoundPopUp.indexOfSelectedItem
+        config.agentsSound = agentSoundIndex > 0 && Config.bellSounds.indices.contains(agentSoundIndex - 1)
+            ? Config.bellSounds[agentSoundIndex - 1] : nil
         config.workspaceBar = workspaceBarCheck.state == .on
         let shell = shellField.stringValue.trimmingCharacters(in: .whitespaces)
         config.shell = shell.isEmpty ? nil : shell
@@ -805,6 +844,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         if retentionField.integerValue >= 0 { config.archiveRetentionDays = retentionField.integerValue }
 
         app.applyConfigLive(config)
+    }
+
+    @objc private func agentsSoundChanged(_ sender: Any?) {
+        controlChanged(sender)
+        if let sound = app.config.agentsSound { NSSound(named: sound)?.play() }
     }
 
     @objc private func bellSoundChanged(_ sender: Any?) {

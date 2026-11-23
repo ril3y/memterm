@@ -34,13 +34,41 @@ final class TabActivityIndicatorView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
+    /// FR-61: an agent badge recolors the dot (orange = needs you, green =
+    /// finished unseen) or shows the spinner (working). `.none` = plain
+    /// output activity, accent-colored as before.
+    private(set) var agentBadge: AgentBadge = .none
+
     private func applyDotColor() {
-        dot.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        let color: NSColor
+        switch agentBadge {
+        case .blocked: color = .systemOrange
+        case .done: color = .systemGreen
+        default: color = .controlAccentColor
+        }
+        dot.layer?.backgroundColor = color.cgColor
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyDotColor()
+    }
+
+    /// Agent badges outrank plain output activity (FR-61 precedence:
+    /// blocked > done > working > output).
+    func apply(state: TabActivityState, agent: AgentBadge) {
+        agentBadge = agent
+        applyDotColor()
+        switch agent {
+        case .blocked, .done:
+            spinner.stopAnimation(nil)
+            dot.isHidden = false
+        case .working:
+            dot.isHidden = true
+            spinner.startAnimation(nil)
+        case .none:
+            apply(state: state)
+        }
     }
 
     func apply(state: TabActivityState) {
